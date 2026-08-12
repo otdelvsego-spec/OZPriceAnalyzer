@@ -1,0 +1,23 @@
+[
+  {"article":"БРГС16011","name":"Горшок 1 л Без ручек","material_cost":4.051644699286443,"labor_cost":24.2},
+  {"article":"БРГС16051","name":"Горшок 5 л Без ручек","material_cost":10.603636666666665,"labor_cost":24.2},
+  {"article":"БРГС16101","name":"Горшок 10 л Без ручек","material_cost":15.822674999999997,"labor_cost":24.2},
+  {"article":"БРГС16151","name":"Горшок 15 л Без ручек","material_cost":19.93084236111111,"labor_cost":24.2},
+  {"article":"БРГС16201","name":"Горшок 20 л Без ручек","material_cost":23.719875,"labor_cost":31.0},
+  {"article":"БРГС16301","name":"Горшок 30 л Без ручек","material_cost":29.497173611111112,"labor_cost":31.0},
+  {"article":"БРГС16451","name":"Горшок 45 л Без ручек","material_cost":36.52153611111111,"labor_cost":38.1},
+  {"article":"БРГС16501","name":"Горшок 50 л Без ручек","material_cost":40.344150694444444,"labor_cost":38.1},
+  {"article":"ГС16101","name":"Горшок 10 Ручки","material_cost":19.89502222222222,"labor_cost":43.9},
+  {"article":"ГС16151","name":"Горшок 15 Ручки","material_cost":24.003189583333334,"labor_cost":43.9},
+  {"article":"ГС16201","name":"Горшок 20 Ручки","material_cost":27.792222222222218,"labor_cost":50.8},
+  {"article":"ГС16301","name":"Горшок 30 Ручки","material_cost":33.622559027777775,"labor_cost":50.8},
+  {"article":"ГС16451","name":"Горшок 45 Ручки","material_cost":40.64692152777778,"labor_cost":57.8},
+  {"article":"ГС16501","name":"Горшок 50 Ручки","material_cost":44.46953611111111,"labor_cost":57.8},
+  {"article":"Бант 01 с","name":"Бантик для девочки 1шт.","material_cost":50.0,"labor_cost":50.0},
+  {"article":"Бант02","name":"Бант для волос","material_cost":50.0,"labor_cost":50.0},
+  {"article":"Бант 04","name":"Бант для волос","material_cost":50.0,"labor_cost":50.0},
+  {"article":"Бант 04 с","name":"Бант для волос 1шт.","material_cost":50.0,"labor_cost":50.0},
+  {"article":"Бант 05","name":"Бант для волос 2шт.","material_cost":50.0,"labor_cost":50.0},
+  {"article":"Бант 05 р","name":"Бант для волос 2шт.","material_cost":50.0,"labor_cost":50.0},
+  {"article":"Бант 05 с-г","name":"Бант для волос 2шт.","material_cost":50.0,"labor_cost":50.0}
+]
