@@ -64,6 +64,23 @@ class Database:
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
 
+                CREATE TABLE IF NOT EXISTS product_cost_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    article TEXT NOT NULL,
+                    old_name TEXT,
+                    new_name TEXT NOT NULL,
+                    old_material_cost REAL,
+                    new_material_cost REAL NOT NULL,
+                    old_labor_cost REAL,
+                    new_labor_cost REAL NOT NULL,
+                    old_active INTEGER,
+                    new_active INTEGER NOT NULL,
+                    change_source TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_product_cost_history_article
+                    ON product_cost_history(article, changed_at DESC);
+
                 CREATE TABLE IF NOT EXISTS runs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -226,31 +243,88 @@ class Database:
     def product_map(self, active_only: bool = False) -> dict[str, Product]:
         return {product.article: product for product in self.list_products(active_only=active_only)}
 
-    def save_product(self, product: Product) -> None:
-        if not product.article.strip():
-            raise ValueError("Артикул не может быть пустым")
-        if product.material_cost < 0 or product.labor_cost < 0:
-            raise ValueError("Себестоимость не может быть отрицательной")
+    def save_product(self, product: Product, source: str = "Ручное изменение") -> None:
+        self.save_products([product], source=source)
+
+    def save_products(self, products: list[Product], source: str) -> int:
+        if not products:
+            return 0
+        articles: set[str] = set()
+        for product in products:
+            if not product.article.strip():
+                raise ValueError("Артикул не может быть пустым")
+            if product.article.strip() in articles:
+                raise ValueError(f"Артикул {product.article} повторяется в импорте")
+            articles.add(product.article.strip())
+            if product.material_cost < 0 or product.labor_cost < 0:
+                raise ValueError("Себестоимость не может быть отрицательной")
+        changed = 0
         with self.transaction() as db:
-            db.execute(
+            for product in products:
+                article = product.article.strip()
+                name = product.name.strip() or article
+                old = db.execute(
+                    "SELECT name, material_cost, labor_cost, active FROM products WHERE article = ?",
+                    (article,),
+                ).fetchone()
+                is_changed = old is None or (
+                    old["name"] != name
+                    or abs(float(old["material_cost"]) - product.material_cost) >= 0.005
+                    or abs(float(old["labor_cost"]) - product.labor_cost) >= 0.005
+                    or bool(old["active"]) != product.active
+                )
+                if not is_changed:
+                    continue
+                changed += 1
+                db.execute(
+                    """
+                    INSERT INTO product_cost_history(
+                        article, old_name, new_name, old_material_cost, new_material_cost,
+                        old_labor_cost, new_labor_cost, old_active, new_active, change_source
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        article,
+                        old["name"] if old else None,
+                        name,
+                        float(old["material_cost"]) if old else None,
+                        product.material_cost,
+                        float(old["labor_cost"]) if old else None,
+                        product.labor_cost,
+                        int(old["active"]) if old else None,
+                        1 if product.active else 0,
+                        source,
+                    ),
+                )
+                db.execute(
+                    """
+                    INSERT INTO products(article, name, material_cost, labor_cost, active)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(article) DO UPDATE SET
+                        name = excluded.name,
+                        material_cost = excluded.material_cost,
+                        labor_cost = excluded.labor_cost,
+                        active = excluded.active,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (article, name, product.material_cost, product.labor_cost, 1 if product.active else 0),
+                )
+        return changed
+
+    def list_product_cost_history(self, limit: int = 500) -> list[dict[str, object]]:
+        with self.connect() as db:
+            rows = db.execute(
                 """
-                INSERT INTO products(article, name, material_cost, labor_cost, active)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(article) DO UPDATE SET
-                    name = excluded.name,
-                    material_cost = excluded.material_cost,
-                    labor_cost = excluded.labor_cost,
-                    active = excluded.active,
-                    updated_at = CURRENT_TIMESTAMP
+                SELECT changed_at, article, old_name, new_name,
+                       old_material_cost, new_material_cost,
+                       old_labor_cost, new_labor_cost,
+                       old_active, new_active, change_source
+                FROM product_cost_history
+                ORDER BY id DESC LIMIT ?
                 """,
-                (
-                    product.article.strip(),
-                    product.name.strip() or product.article.strip(),
-                    product.material_cost,
-                    product.labor_cost,
-                    1 if product.active else 0,
-                ),
-            )
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def find_runs_by_hash(self, file_hash: str) -> list[int]:
         with self.connect() as db:

@@ -58,7 +58,7 @@ class AppService:
         skipped_articles: set[str] | None = None,
     ) -> RunCalculation:
         for product in created_products or []:
-            self.db.save_product(product)
+            self.db.save_product(product, source="Новый артикул из отчета")
         tax_rate = float(self.db.get_setting("tax_rate", "0.04"))
         if tax_rate < 0 or tax_rate > 1:
             raise ValueError("Налоговая ставка должна быть от 0 до 100%")

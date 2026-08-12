@@ -11,6 +11,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from .calculator import calculate_scenario, discover_unknown_products
 from .comparison import ComparisonMetric, compare_calculations
+from .costs import CostChange, build_cost_changes, export_cost_catalog, read_cost_catalog
 from .excel_reader import REPORT_REALIZATION, preview_sheet, workbook_sheet_names
 from .exporter import export_run, suggested_export_name
 from .models import Product, ProductResult, RunCalculation, ScenarioRow, UnknownProduct
@@ -504,9 +505,12 @@ class OZPriceAnalyzerApp(tk.Tk):
         product_header.grid(row=2, column=0, sticky="ew", pady=(6, 8))
         product_header.columnconfigure(0, weight=1)
         ttk.Label(product_header, text="Товары и себестоимость", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Button(product_header, text="Добавить товар", command=self.add_product).grid(row=0, column=1, padx=4)
-        ttk.Button(product_header, text="Изменить", command=self.edit_product).grid(row=0, column=2, padx=4)
-        ttk.Button(product_header, text="В архив / восстановить", command=self.toggle_product).grid(row=0, column=3, padx=4)
+        ttk.Button(product_header, text="Экспорт XLSX", command=self.export_product_catalog).grid(row=0, column=1, padx=4)
+        ttk.Button(product_header, text="Импорт XLSX", command=self.import_product_catalog).grid(row=0, column=2, padx=4)
+        ttk.Button(product_header, text="Журнал изменений", command=self.show_cost_history).grid(row=0, column=3, padx=4)
+        ttk.Button(product_header, text="Добавить товар", command=self.add_product).grid(row=0, column=4, padx=4)
+        ttk.Button(product_header, text="Изменить", command=self.edit_product).grid(row=0, column=5, padx=4)
+        ttk.Button(product_header, text="В архив / восстановить", command=self.toggle_product).grid(row=0, column=6, padx=4)
         self.products_tree = self._create_tree(
             self.settings_tab,
             ["article", "name", "total", "material", "labor", "status"],
@@ -1071,6 +1075,57 @@ class OZPriceAnalyzerApp(tk.Tk):
             )
         self._configure_value_tags(self.products_tree)
 
+    def export_product_catalog(self) -> None:
+        destination = filedialog.asksaveasfilename(
+            title="Выгрузить справочник себестоимости",
+            defaultextension=".xlsx",
+            initialdir=str(self.service.paths["exports"]),
+            initialfile="Справочник_себестоимости_OZON.xlsx",
+            filetypes=[("Книга Excel", "*.xlsx")],
+            parent=self,
+        )
+        if not destination:
+            return
+        try:
+            path = export_cost_catalog(self.db.list_products(), destination)
+            messagebox.showinfo(
+                "Справочник себестоимости",
+                f"Справочник сохранен:\n{path}\n\n"
+                "Отредактируйте файл и загрузите его кнопкой «Импорт XLSX».",
+                parent=self,
+            )
+        except Exception as exc:
+            messagebox.showerror("Экспорт себестоимости", str(exc), parent=self)
+
+    def import_product_catalog(self) -> None:
+        source = filedialog.askopenfilename(
+            title="Импортировать справочник себестоимости",
+            filetypes=[("Книга Excel", "*.xlsx")],
+            parent=self,
+        )
+        if not source:
+            return
+        try:
+            products = read_cost_catalog(source)
+            changes = build_cost_changes(products, self.db.product_map(active_only=False))
+            dialog = CostImportDialog(self, changes, Path(source).name)
+            self.wait_window(dialog)
+            if dialog.cancelled:
+                return
+            changed = self.db.save_products(dialog.products_to_apply, source=f"Импорт: {Path(source).name}")
+            self.refresh_products()
+            messagebox.showinfo(
+                "Импорт себестоимости",
+                f"Применено изменений: {changed}.\n"
+                "Сохраненные ранее расчеты не изменены; новые значения используются со следующего расчета.",
+                parent=self,
+            )
+        except Exception as exc:
+            messagebox.showerror("Импорт себестоимости", str(exc), parent=self)
+
+    def show_cost_history(self) -> None:
+        CostHistoryDialog(self, self.db.list_product_cost_history())
+
     def add_product(self) -> None:
         dialog = ProductDialog(self, title="Новый товар")
         self.wait_window(dialog)
@@ -1265,6 +1320,161 @@ class OZPriceAnalyzerApp(tk.Tk):
         tree.tag_configure("warning", foreground=palette["warning"])
         tree.tag_configure("total", background=palette["surface_alt"], foreground=palette["text"])
         tree.tag_configure("muted", foreground=palette["muted"])
+
+
+class CostImportDialog(tk.Toplevel):
+    def __init__(self, parent: OZPriceAnalyzerApp, changes: list[CostChange], source_name: str):
+        super().__init__(parent)
+        self.title("Предварительная проверка себестоимости")
+        self.geometry("1260x650")
+        self.minsize(980, 520)
+        self.transient(parent)
+        self.grab_set()
+        self.cancelled = True
+        self.changes = changes
+        self.products_to_apply = [change.product for change in changes if change.changed]
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(3, weight=1)
+
+        ttk.Label(self, text="Проверьте изменения перед применением", style="Section.TLabel").grid(
+            row=0, column=0, sticky="w", padx=20, pady=(18, 2)
+        )
+        changed_count = len(self.products_to_apply)
+        new_count = sum(change.status == "Новая позиция" for change in changes)
+        ttk.Label(
+            self,
+            text=(
+                f"Файл: {source_name} · строк: {len(changes)} · изменений: {changed_count} · новых товаров: {new_count}. "
+                "Старые отчеты и их себестоимость останутся без изменений."
+            ),
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 10))
+        ttk.Label(
+            self,
+            text="Зеленым отмечены новые и измененные позиции, серым — строки без изменений.",
+            style="Muted.TLabel",
+        ).grid(row=2, column=0, sticky="w", padx=20, pady=(0, 8))
+
+        container = ttk.Frame(self)
+        container.grid(row=3, column=0, sticky="nsew", padx=20)
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(0, weight=1)
+        columns = (
+            "article", "name", "old_total", "new_total", "change",
+            "old_labor", "new_labor", "active", "status",
+        )
+        self.tree = ttk.Treeview(container, columns=columns, show="headings")
+        headings = [
+            "Артикул", "Наименование", "Старая с/с", "Новая с/с", "Изменение",
+            "Старые трудозатраты", "Новые трудозатраты", "Активен", "Действие",
+        ]
+        widths = [140, 280, 130, 130, 130, 160, 160, 90, 150]
+        for column, heading, width in zip(columns, headings, widths):
+            self.tree.heading(column, text=heading)
+            self.tree.column(column, width=width, minwidth=80, stretch=False, anchor="w" if column in {"article", "name", "status"} else "e")
+        xscroll = ttk.Scrollbar(container, orient="horizontal", command=self.tree.xview)
+        yscroll = ttk.Scrollbar(container, orient="vertical", command=self.tree.yview)
+        self.tree.configure(xscrollcommand=xscroll.set, yscrollcommand=yscroll.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        for change in changes:
+            previous = change.previous
+            tag = "changed" if change.changed else "muted"
+            self.tree.insert(
+                "",
+                "end",
+                values=(
+                    change.product.article,
+                    change.product.name,
+                    _money(previous.total_cost) if previous else "—",
+                    _money(change.product.total_cost),
+                    _signed_money(change.total_change) if change.total_change is not None else "Новая",
+                    _money(previous.labor_cost) if previous else "—",
+                    _money(change.product.labor_cost),
+                    "Да" if change.product.active else "Нет",
+                    change.status,
+                ),
+                tags=(tag,),
+            )
+        self.tree.tag_configure("changed", foreground=parent.colors["positive"])
+        self.tree.tag_configure("muted", foreground=parent.colors["muted"])
+
+        buttons = ttk.Frame(self, padding=(20, 14))
+        buttons.grid(row=4, column=0, sticky="e")
+        ttk.Button(buttons, text="Отмена", command=self.destroy).grid(row=0, column=0, padx=4)
+        apply_button = ttk.Button(buttons, text="Применить изменения", style="Accent.TButton", command=self._apply)
+        apply_button.grid(row=0, column=1, padx=4)
+        if not self.products_to_apply:
+            apply_button.configure(state="disabled")
+
+    def _apply(self) -> None:
+        if not self.products_to_apply:
+            return
+        self.cancelled = False
+        self.destroy()
+
+
+class CostHistoryDialog(tk.Toplevel):
+    def __init__(self, parent: OZPriceAnalyzerApp, rows: list[dict[str, object]]):
+        super().__init__(parent)
+        self.title("Журнал изменений себестоимости")
+        self.geometry("1320x650")
+        self.minsize(980, 500)
+        self.transient(parent)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(2, weight=1)
+        ttk.Label(self, text="Журнал изменений себестоимости", style="Section.TLabel").grid(
+            row=0, column=0, sticky="w", padx=20, pady=(18, 2)
+        )
+        ttk.Label(
+            self,
+            text="Журнал показывает ручные изменения, импорт XLSX и создание новых артикулов из отчетов.",
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 10))
+        container = ttk.Frame(self)
+        container.grid(row=2, column=0, sticky="nsew", padx=20)
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(0, weight=1)
+        columns = ("date", "article", "name", "old_total", "new_total", "change", "old_labor", "new_labor", "source")
+        tree = ttk.Treeview(container, columns=columns, show="headings")
+        headings = [
+            "Дата", "Артикул", "Наименование", "Старая с/с", "Новая с/с", "Изменение",
+            "Старые трудозатраты", "Новые трудозатраты", "Источник",
+        ]
+        widths = [145, 130, 250, 120, 120, 120, 155, 155, 260]
+        for column, heading, width in zip(columns, headings, widths):
+            tree.heading(column, text=heading)
+            tree.column(column, width=width, minwidth=80, stretch=False, anchor="w" if column in {"article", "name", "source"} else "e")
+        xscroll = ttk.Scrollbar(container, orient="horizontal", command=tree.xview)
+        yscroll = ttk.Scrollbar(container, orient="vertical", command=tree.yview)
+        tree.configure(xscrollcommand=xscroll.set, yscrollcommand=yscroll.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        for row in rows:
+            old_material = row["old_material_cost"]
+            old_labor = row["old_labor_cost"]
+            old_total = float(old_material) + float(old_labor) if old_material is not None and old_labor is not None else None
+            new_total = float(row["new_material_cost"]) + float(row["new_labor_cost"])
+            tree.insert(
+                "",
+                "end",
+                values=(
+                    str(row["changed_at"])[:16],
+                    row["article"],
+                    row["new_name"],
+                    _money(old_total) if old_total is not None else "—",
+                    _money(new_total),
+                    _signed_money(new_total - old_total) if old_total is not None else "Новая",
+                    _money(float(old_labor)) if old_labor is not None else "—",
+                    _money(float(row["new_labor_cost"])),
+                    row["change_source"],
+                ),
+            )
+        if not rows:
+            tree.insert("", "end", values=("", "", "Журнал пока пуст"))
+        ttk.Button(self, text="Закрыть", command=self.destroy).grid(row=3, column=0, sticky="e", padx=20, pady=14)
 
 
 class ProductDialog(tk.Toplevel):
