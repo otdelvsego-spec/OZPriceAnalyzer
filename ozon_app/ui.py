@@ -6,9 +6,11 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from .backup import create_backup, inspect_backup, restore_backup, suggested_backup_name
 from .calculator import calculate_scenario, discover_unknown_products
 from .comparison import ComparisonMetric, compare_calculations
 from .costs import (
@@ -19,6 +21,7 @@ from .costs import (
     export_cost_catalog,
     read_cost_catalog,
 )
+from .database import Database
 from .excel_reader import REPORT_REALIZATION, preview_sheet, workbook_sheet_names
 from .exporter import export_run, suggested_export_name
 from .models import Product, ProductResult, RunCalculation, ScenarioRow, UnknownProduct
@@ -507,6 +510,27 @@ class OZPriceAnalyzerApp(tk.Tk):
         ttk.Button(settings, text="Сохранить настройки", style="Accent.TButton", command=self.save_settings).grid(
             row=3, column=0, columnspan=4, sticky="w", pady=(10, 0)
         )
+
+        backup_box = ttk.LabelFrame(settings, text="Резервная копия и перенос на другой компьютер", padding=(12, 10))
+        backup_box.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(14, 0))
+        backup_box.columnconfigure(0, weight=1)
+        ttk.Label(
+            backup_box,
+            text="Архив содержит историю расчетов, настройки, себестоимость и сохраненные исходные отчеты.",
+            style="Muted.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        backup_actions = ttk.Frame(backup_box)
+        backup_actions.grid(row=0, column=1, sticky="e", padx=(16, 0))
+        ttk.Button(
+            backup_actions,
+            text="Создать резервную копию",
+            command=self.create_application_backup,
+        ).grid(row=0, column=0, padx=4)
+        ttk.Button(
+            backup_actions,
+            text="Восстановить / перенести",
+            command=self.restore_application_backup,
+        ).grid(row=0, column=1, padx=4)
 
         product_header = ttk.Frame(self.settings_tab)
         product_header.grid(row=2, column=0, sticky="ew", pady=(6, 8))
@@ -1153,6 +1177,103 @@ class OZPriceAnalyzerApp(tk.Tk):
             )
         except Exception as exc:
             messagebox.showerror("Себестоимость", str(exc), parent=self)
+
+    def create_application_backup(self) -> None:
+        destination = filedialog.asksaveasfilename(
+            title="Создать резервную копию OZ Price Analyzer",
+            defaultextension=".ozbackup",
+            initialdir=str(self.service.paths["backups"]),
+            initialfile=suggested_backup_name(),
+            filetypes=[("Резервная копия OZ Price Analyzer", "*.ozbackup")],
+            parent=self,
+        )
+        if not destination:
+            return
+        self.configure(cursor="watch")
+        self.status_var.set("Создание резервной копии…")
+        self.update_idletasks()
+        try:
+            info = create_backup(self.service.paths["root"], destination)
+            messagebox.showinfo(
+                "Резервная копия создана",
+                f"Файл: {info.path}\n\n"
+                f"Расчетов: {info.run_count}\n"
+                f"Товаров: {info.product_count}\n"
+                f"Исходных отчетов: {info.source_count}\n"
+                f"Размер исходников: {_file_size(info.source_size)}",
+                parent=self,
+            )
+        except Exception as exc:
+            messagebox.showerror("Резервная копия", str(exc), parent=self)
+        finally:
+            self.configure(cursor="")
+            self.status_var.set("Готово" if self.current_run_id is None else f"Открыт расчет #{self.current_run_id}")
+
+    def restore_application_backup(self) -> None:
+        source = filedialog.askopenfilename(
+            title="Выберите резервную копию OZ Price Analyzer",
+            initialdir=str(self.service.paths["backups"]),
+            filetypes=[("Резервная копия OZ Price Analyzer", "*.ozbackup")],
+            parent=self,
+        )
+        if not source:
+            return
+        self.configure(cursor="watch")
+        self.status_var.set("Проверка резервной копии…")
+        self.update_idletasks()
+        try:
+            info = inspect_backup(source)
+        except Exception as exc:
+            self.configure(cursor="")
+            self.status_var.set("Готово" if self.current_run_id is None else f"Открыт расчет #{self.current_run_id}")
+            messagebox.showerror("Восстановление", str(exc), parent=self)
+            return
+        self.configure(cursor="")
+        confirmed = messagebox.askyesno(
+            "Восстановить данные",
+            f"Резервная копия: {_backup_timestamp(info.created_at)}\n"
+            f"Расчетов: {info.run_count}\n"
+            f"Товаров: {info.product_count}\n"
+            f"Исходных отчетов: {info.source_count}\n\n"
+            "Текущая история будет заменена. Перед заменой приложение автоматически создаст "
+            "страховочную копию текущих данных. Продолжить?",
+            parent=self,
+        )
+        if not confirmed:
+            self.status_var.set("Готово" if self.current_run_id is None else f"Открыт расчет #{self.current_run_id}")
+            return
+        self.configure(cursor="watch")
+        self.status_var.set("Восстановление истории…")
+        self.update_idletasks()
+        try:
+            result = restore_backup(self.service.paths["root"], source)
+            self.service.db = Database(self.service.paths["database"])
+            self.db = self.service.db
+            self.current_run_id = None
+            self.current_calculation = None
+            self._reload_settings_after_restore()
+            self.refresh_all()
+            safety = f"\n\nСтраховочная копия прежних данных:\n{result.safety_backup}" if result.safety_backup else ""
+            messagebox.showinfo(
+                "Восстановление завершено",
+                f"История и настройки восстановлены. Расчетов: {result.info.run_count}.{safety}",
+                parent=self,
+            )
+        except Exception as exc:
+            messagebox.showerror("Восстановление", str(exc), parent=self)
+        finally:
+            self.configure(cursor="")
+            self.status_var.set("Готово" if self.current_run_id is None else f"Открыт расчет #{self.current_run_id}")
+
+    def _reload_settings_after_restore(self) -> None:
+        self.theme_var.set(THEME_VALUES.get(self.db.get_setting("theme", "system"), "Системная"))
+        self.tax_rate_var.set(_plain_number(float(self.db.get_setting("tax_rate", "0.04")) * 100))
+        self.duplicate_policy_var.set(
+            DUPLICATE_VALUES.get(self.db.get_setting("duplicate_policy", "ask"), "Спрашивать")
+        )
+        self.warn_realization_var.set(self.db.get_setting("warn_without_realization", "1") == "1")
+        self.preview_rows_var.set(self.db.get_setting("preview_rows", "500"))
+        self._preview_theme()
 
     def export_product_catalog(self) -> None:
         destination = filedialog.asksaveasfilename(
@@ -2212,6 +2333,22 @@ def _period_text(start: str | None, end: str | None) -> str:
 def _date_display(value: str) -> str:
     parts = value[:10].split("-")
     return ".".join(reversed(parts)) if len(parts) == 3 else value
+
+
+def _backup_timestamp(value: str) -> str:
+    try:
+        return datetime.fromisoformat(value).strftime("%d.%m.%Y %H:%M")
+    except ValueError:
+        return value or "дата не указана"
+
+
+def _file_size(value: int) -> str:
+    size = float(value)
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if size < 1024 or unit == "ГБ":
+            return f"{size:.0f} {unit}" if unit == "Б" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{value} Б"
 
 
 def _calculation_period(calculation: RunCalculation) -> str:

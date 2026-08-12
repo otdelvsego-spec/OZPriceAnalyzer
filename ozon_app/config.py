@@ -7,6 +7,7 @@ from pathlib import Path
 
 APP_NAME = "OZPriceAnalyzer"
 APP_TITLE = "OZ Price Analyzer"
+APP_VERSION = "0.1.0"
 DEFAULT_TAX_RATE = 0.04
 
 
@@ -35,9 +36,9 @@ def ensure_app_dirs(base: Path | None = None) -> dict[str, Path]:
         "root": root,
         "files": root / "source_files",
         "exports": root / "exports",
+        "backups": root / "backups",
         "database": root / "ozpriceanalyzer.sqlite3",
     }
-    for key in ("root", "files", "exports"):
+    for key in ("root", "files", "exports", "backups"):
         paths[key].mkdir(parents=True, exist_ok=True)
     return paths
-
