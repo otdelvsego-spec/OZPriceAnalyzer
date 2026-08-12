@@ -53,20 +53,17 @@ jobs:
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: ./scripts/sign_windows.ps1 -ExecutablePath "dist/OZPriceAnalyzer/OZPriceAnalyzer.exe"
 
-      - name: Package portable ZIP
+      - name: Prepare artifact metadata
         id: package
         shell: pwsh
         run: |
           $version = python -c "from ozon_app import __version__; print(__version__)"
-          $archiveName = "OZPriceAnalyzer-Windows-x64-v$version.zip"
-          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
-          Compress-Archive -Path "dist/OZPriceAnalyzer/*" -DestinationPath "artifacts/$archiveName" -Force
-          "archive_name=$archiveName" >> $env:GITHUB_OUTPUT
+          "artifact_name=OZPriceAnalyzer-Windows-x64-v$version" >> $env:GITHUB_OUTPUT
 
       - name: Upload Windows ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: OZPriceAnalyzer-Windows-x64
-          path: artifacts/${{ steps.package.outputs.archive_name }}
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: dist/OZPriceAnalyzer
           if-no-files-found: error
           retention-days: 30

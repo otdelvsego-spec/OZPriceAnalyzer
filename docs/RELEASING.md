@@ -21,7 +21,7 @@ Workflow `.github/workflows/windows-build.yml` запускает тесты и 
 - при создании тега `v*`;
 - вручную через `Actions` → `Windows application` → `Run workflow`.
 
-Готовый ZIP находится в артефакте `OZPriceAnalyzer-Windows-x64` соответствующего запуска GitHub Actions и хранится 30 дней.
+Готовый ZIP находится в артефакте `OZPriceAnalyzer-Windows-x64-v<версия>` соответствующего запуска GitHub Actions и хранится 30 дней. Архив сразу содержит EXE, библиотеки и инструкцию — дополнительный вложенный ZIP распаковывать не требуется.
 
 ## Локальная сборка
 
