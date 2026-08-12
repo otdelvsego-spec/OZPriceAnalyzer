@@ -33,7 +33,7 @@ def resource_path(name: str) -> Path:
 
 
 def ensure_app_dirs(base: Path | None = None) -> dict[str, Path]:
-    root = base or application_data_dir()
+    root = Path(base or application_data_dir()).expanduser().resolve()
     paths = {
         "root": root,
         "files": root / "source_files",

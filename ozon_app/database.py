@@ -33,6 +33,14 @@ class Database:
         return connection
 
     @contextmanager
+    def read(self) -> Iterator[sqlite3.Connection]:
+        connection = self.connect()
+        try:
+            yield connection
+        finally:
+            connection.close()
+
+    @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         connection = self.connect()
         try:
@@ -209,7 +217,7 @@ class Database:
                         )
 
     def get_setting(self, key: str, default: str = "") -> str:
-        with self.connect() as db:
+        with self.read() as db:
             row = db.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         return str(row[0]) if row else default
 
@@ -227,7 +235,7 @@ class Database:
         if active_only:
             sql += " WHERE active = 1"
         sql += " ORDER BY article COLLATE NOCASE"
-        with self.connect() as db:
+        with self.read() as db:
             rows = db.execute(sql, parameters).fetchall()
         return [
             Product(
@@ -312,7 +320,7 @@ class Database:
         return changed
 
     def list_product_cost_history(self, limit: int = 500) -> list[dict[str, object]]:
-        with self.connect() as db:
+        with self.read() as db:
             rows = db.execute(
                 """
                 SELECT changed_at, article, old_name, new_name,
@@ -327,7 +335,7 @@ class Database:
         return [dict(row) for row in rows]
 
     def find_runs_by_hash(self, file_hash: str) -> list[int]:
-        with self.connect() as db:
+        with self.read() as db:
             rows = db.execute(
                 "SELECT DISTINCT run_id FROM source_files WHERE file_hash = ? ORDER BY run_id DESC",
                 (file_hash,),
@@ -449,7 +457,7 @@ class Database:
         return run_id
 
     def list_runs(self) -> list[RunSummary]:
-        with self.connect() as db:
+        with self.read() as db:
             rows = db.execute(
                 """
                 SELECT id, created_at, period_start, period_end, source_count,
@@ -460,7 +468,7 @@ class Database:
         return [RunSummary(**dict(row)) for row in rows]
 
     def load_calculation(self, run_id: int) -> RunCalculation:
-        with self.connect() as db:
+        with self.read() as db:
             run = db.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
             if run is None:
                 raise KeyError(f"Расчет #{run_id} не найден")
@@ -504,7 +512,7 @@ class Database:
         )
 
     def list_source_files(self, run_id: int) -> list[dict[str, object]]:
-        with self.connect() as db:
+        with self.read() as db:
             rows = db.execute(
                 "SELECT * FROM source_files WHERE run_id = ? ORDER BY id",
                 (run_id,),
@@ -512,7 +520,7 @@ class Database:
         return [dict(row) for row in rows]
 
     def list_quality_events(self, run_id: int) -> list[dict[str, object]]:
-        with self.connect() as db:
+        with self.read() as db:
             rows = db.execute(
                 "SELECT severity, event_type, message FROM quality_events WHERE run_id = ? ORDER BY id",
                 (run_id,),
@@ -520,7 +528,7 @@ class Database:
         return [dict(row) for row in rows]
 
     def accrual_guide(self, run_id: int) -> list[dict[str, object]]:
-        with self.connect() as db:
+        with self.read() as db:
             current_rows = db.execute(
                 "SELECT normalized_type, accrual_type, with_article, without_article FROM accrual_stats WHERE run_id = ?",
                 (run_id,),
@@ -570,7 +578,7 @@ class Database:
             )
 
     def planned_prices(self, run_id: int) -> dict[str, float]:
-        with self.connect() as db:
+        with self.read() as db:
             rows = db.execute(
                 "SELECT article, planned_price FROM scenario_prices WHERE run_id = ?",
                 (run_id,),
