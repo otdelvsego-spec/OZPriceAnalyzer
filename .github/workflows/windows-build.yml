@@ -1,0 +1,72 @@
+name: Windows application
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - agent/initial-python-app
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Test and build Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-build.txt
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Build application
+        shell: pwsh
+        run: |
+          python scripts/generate_version_info.py
+          pyinstaller --noconfirm --clean OZPriceAnalyzer.spec
+          Copy-Item README_WINDOWS.txt "dist/OZPriceAnalyzer/Прочтите_перед_запуском.txt"
+
+      - name: Sign executable when certificate is configured
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: ./scripts/sign_windows.ps1 -ExecutablePath "dist/OZPriceAnalyzer/OZPriceAnalyzer.exe"
+
+      - name: Package portable ZIP
+        id: package
+        shell: pwsh
+        run: |
+          $version = python -c "from ozon_app import __version__; print(__version__)"
+          $archiveName = "OZPriceAnalyzer-Windows-x64-v$version.zip"
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Compress-Archive -Path "dist/OZPriceAnalyzer/*" -DestinationPath "artifacts/$archiveName" -Force
+          "archive_name=$archiveName" >> $env:GITHUB_OUTPUT
+
+      - name: Upload Windows ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: OZPriceAnalyzer-Windows-x64
+          path: artifacts/${{ steps.package.outputs.archive_name }}
+          if-no-files-found: error
+          retention-days: 30

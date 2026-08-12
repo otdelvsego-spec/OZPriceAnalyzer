@@ -4,10 +4,12 @@ import os
 import sys
 from pathlib import Path
 
+from . import __version__
+
 
 APP_NAME = "OZPriceAnalyzer"
 APP_TITLE = "OZ Price Analyzer"
-APP_VERSION = "0.1.0"
+APP_VERSION = __version__
 DEFAULT_TAX_RATE = 0.04
 
 

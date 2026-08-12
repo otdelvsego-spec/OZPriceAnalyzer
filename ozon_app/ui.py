@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -21,6 +22,7 @@ from .costs import (
     export_cost_catalog,
     read_cost_catalog,
 )
+from .config import APP_TITLE, APP_VERSION
 from .database import Database
 from .excel_reader import REPORT_REALIZATION, preview_sheet, workbook_sheet_names
 from .exporter import export_run, suggested_export_name
@@ -61,7 +63,7 @@ class OZPriceAnalyzerApp(tk.Tk):
         self.import_queue: queue.Queue[tuple[ImportSession | None, Exception | None]] = queue.Queue()
         self.colors = apply_theme(self, self.db.get_setting("theme", "system"))
 
-        self.title("OZ Price Analyzer")
+        self.title(f"{APP_TITLE} {APP_VERSION}")
         self.geometry("1540x920")
         self.minsize(1180, 720)
         self.option_add("*Font", "Segoe UI 10")
@@ -133,6 +135,9 @@ class OZPriceAnalyzerApp(tk.Tk):
             row=0, column=2, padx=5
         )
         ttk.Button(actions, text="Экспорт в Excel", command=self.export_current_run).grid(row=0, column=3, padx=5)
+        ttk.Button(actions, text="О программе", command=self.show_about).grid(
+            row=1, column=3, sticky="e", padx=5, pady=(6, 0)
+        )
 
     def _build_overview_tab(self) -> None:
         self.overview_tab.columnconfigure(0, weight=1)
@@ -1209,6 +1214,9 @@ class OZPriceAnalyzerApp(tk.Tk):
             self.configure(cursor="")
             self.status_var.set("Готово" if self.current_run_id is None else f"Открыт расчет #{self.current_run_id}")
 
+    def show_about(self) -> None:
+        AboutDialog(self)
+
     def restore_application_backup(self) -> None:
         source = filedialog.askopenfilename(
             title="Выберите резервную копию OZ Price Analyzer",
@@ -1521,6 +1529,70 @@ class OZPriceAnalyzerApp(tk.Tk):
         tree.tag_configure("warning", foreground=palette["warning"])
         tree.tag_configure("total", background=palette["surface_alt"], foreground=palette["text"])
         tree.tag_configure("muted", foreground=palette["muted"])
+
+
+class AboutDialog(tk.Toplevel):
+    def __init__(self, parent: OZPriceAnalyzerApp):
+        super().__init__(parent)
+        self.title("О программе")
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(False, False)
+        self.configure(background=parent.colors["window"])
+        self.columnconfigure(0, weight=1)
+
+        ttk.Label(self, text=APP_TITLE, style="Title.TLabel").grid(
+            row=0, column=0, sticky="w", padx=24, pady=(22, 2)
+        )
+        ttk.Label(self, text=f"Версия {APP_VERSION}", style="Section.TLabel").grid(
+            row=1, column=0, sticky="w", padx=24
+        )
+        ttk.Label(
+            self,
+            text="Локальный анализ отчетов Ozon, контроль начислений, история и сценарии доходности.",
+            style="Muted.TLabel",
+            wraplength=560,
+            justify="left",
+        ).grid(row=2, column=0, sticky="w", padx=24, pady=(10, 14))
+
+        details = ttk.LabelFrame(self, text="Сведения", padding=(14, 10))
+        details.grid(row=3, column=0, sticky="ew", padx=24)
+        details.columnconfigure(1, weight=1)
+        build_type = "Автономная Windows-сборка" if getattr(sys, "frozen", False) else "Запуск из Python"
+        for row, (label, value) in enumerate(
+            [
+                ("Тип запуска", build_type),
+                ("Хранилище данных", str(parent.service.paths["root"])),
+                ("Репозиторий", "github.com/otdelvsego-spec/OZPriceAnalyzer"),
+            ]
+        ):
+            ttk.Label(details, text=f"{label}:").grid(row=row, column=0, sticky="nw", padx=(0, 12), pady=3)
+            ttk.Label(details, text=value, style="Muted.TLabel", wraplength=430).grid(
+                row=row, column=1, sticky="w", pady=3
+            )
+
+        ttk.Label(
+            self,
+            text="Microsoft Excel не требуется. Все рабочие данные остаются на этом компьютере.",
+            style="Muted.TLabel",
+        ).grid(row=4, column=0, sticky="w", padx=24, pady=(12, 4))
+
+        buttons = ttk.Frame(self, padding=(20, 14))
+        buttons.grid(row=5, column=0, sticky="e")
+        ttk.Button(
+            buttons,
+            text="Открыть хранилище",
+            command=lambda: _open_path(parent.service.paths["root"]),
+        ).grid(row=0, column=0, padx=4)
+        ttk.Button(
+            buttons,
+            text="Открыть GitHub",
+            command=lambda: webbrowser.open("https://github.com/otdelvsego-spec/OZPriceAnalyzer"),
+        ).grid(row=0, column=1, padx=4)
+        ttk.Button(buttons, text="Закрыть", style="Accent.TButton", command=self.destroy).grid(
+            row=0, column=2, padx=4
+        )
+        self.bind("<Escape>", lambda _event: self.destroy())
 
 
 class CostCatalogEditorDialog(tk.Toplevel):
