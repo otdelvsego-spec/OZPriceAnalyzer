@@ -16,12 +16,19 @@ from .exporter import export_run, suggested_export_name
 from .models import Product, ProductResult, RunCalculation, ScenarioRow, UnknownProduct
 from .service import AppService, ImportSession
 from .theme import apply_theme
+from .trends import TrendPoint, build_trend_points, chart_bounds
 
 
 THEME_LABELS = {"Системная": "system", "Темная": "dark", "Светлая": "light"}
 THEME_VALUES = {value: key for key, value in THEME_LABELS.items()}
 DUPLICATE_LABELS = {"Спрашивать": "ask", "Пропускать": "skip", "Разрешать": "allow"}
 DUPLICATE_VALUES = {value: key for key, value in DUPLICATE_LABELS.items()}
+TREND_METRICS = {
+    "Выручка": "revenue",
+    "Чистая прибыль": "net_profit",
+    "Продажи, шт.": "units",
+    "Нераспределенные доходы / расходы": "unallocated",
+}
 
 
 class OZPriceAnalyzerApp(tk.Tk):
@@ -37,6 +44,8 @@ class OZPriceAnalyzerApp(tk.Tk):
         self.preview_rows: list[list[str]] = []
         self.preview_path: str | None = None
         self.scenario_rows: dict[str, ScenarioRow] = {}
+        self.trend_points: list[TrendPoint] = []
+        self.trend_canvas_points: list[tuple[float, float, TrendPoint]] = []
         self.import_in_progress = False
         self.import_queue: queue.Queue[tuple[ImportSession | None, Exception | None]] = queue.Queue()
         self.colors = apply_theme(self, self.db.get_setting("theme", "system"))
@@ -61,6 +70,7 @@ class OZPriceAnalyzerApp(tk.Tk):
         self.guide_tab = ttk.Frame(self.notebook, padding=4)
         self.scenario_tab = ttk.Frame(self.notebook, padding=4)
         self.history_tab = ttk.Frame(self.notebook, padding=4)
+        self.trend_tab = ttk.Frame(self.notebook, padding=4)
         self.comparison_tab = ttk.Frame(self.notebook, padding=4)
         self.settings_tab = ttk.Frame(self.notebook, padding=4)
         self.notebook.add(self.overview_tab, text="Обзор")
@@ -69,6 +79,7 @@ class OZPriceAnalyzerApp(tk.Tk):
         self.notebook.add(self.guide_tab, text="Справочник начислений")
         self.notebook.add(self.scenario_tab, text="Сценарий цены")
         self.notebook.add(self.history_tab, text="История отчетов")
+        self.notebook.add(self.trend_tab, text="Динамика")
         self.notebook.add(self.comparison_tab, text="Сравнение периодов")
         self.notebook.add(self.settings_tab, text="Настройки")
 
@@ -78,6 +89,7 @@ class OZPriceAnalyzerApp(tk.Tk):
         self._build_guide_tab()
         self._build_scenario_tab()
         self._build_history_tab()
+        self._build_trend_tab()
         self._build_comparison_tab()
         self._build_settings_tab()
 
@@ -314,6 +326,58 @@ class OZPriceAnalyzerApp(tk.Tk):
             widths=[140, 220, 900],
         )
 
+    def _build_trend_tab(self) -> None:
+        self.trend_tab.columnconfigure(0, weight=1)
+        self.trend_tab.rowconfigure(3, weight=3)
+        self.trend_tab.rowconfigure(5, weight=2)
+        ttk.Label(self.trend_tab, text="Динамика показателей", style="Section.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(10, 2)
+        )
+        ttk.Label(
+            self.trend_tab,
+            text="Каждая точка — сохраненный расчет. Периоды расположены по дате начала отчета.",
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(0, 10))
+        controls = ttk.Frame(self.trend_tab)
+        controls.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(controls, text="Показатель:").grid(row=0, column=0, padx=(0, 6))
+        self.trend_metric_var = tk.StringVar(value="Выручка")
+        trend_combo = ttk.Combobox(
+            controls,
+            textvariable=self.trend_metric_var,
+            state="readonly",
+            values=list(TREND_METRICS),
+            width=36,
+        )
+        trend_combo.grid(row=0, column=1, sticky="w")
+        trend_combo.bind("<<ComboboxSelected>>", lambda _event: self._draw_trend_chart())
+
+        self.trend_canvas = tk.Canvas(
+            self.trend_tab,
+            height=360,
+            highlightthickness=1,
+            bd=0,
+        )
+        self.trend_canvas.grid(row=3, column=0, sticky="nsew", pady=(0, 10))
+        self.trend_canvas.bind("<Configure>", lambda _event: self._draw_trend_chart())
+        self.trend_canvas.bind("<Motion>", self._trend_hover)
+        self.trend_canvas.bind("<Leave>", lambda _event: self.trend_canvas.delete("tooltip"))
+
+        ttk.Label(self.trend_tab, text="Таблица динамики", style="Section.TLabel").grid(
+            row=4, column=0, sticky="w", pady=(4, 8)
+        )
+        self.trend_tree = self._create_tree(
+            self.trend_tab,
+            ["run", "period", "units", "revenue", "revenue_change", "net", "net_change", "unallocated"],
+            [
+                "Расчет", "Период", "Продажи", "Выручка", "Изменение выручки",
+                "Чистая прибыль", "Изменение прибыли", "Нераспределенные",
+            ],
+            row=5,
+            widths=[80, 230, 110, 150, 170, 150, 170, 170],
+            height=8,
+        )
+
     def _build_comparison_tab(self) -> None:
         self.comparison_tab.columnconfigure(0, weight=1)
         self.comparison_tab.rowconfigure(4, weight=1)
@@ -513,6 +577,7 @@ class OZPriceAnalyzerApp(tk.Tk):
                 self.compare_second_var.set(values[0])
                 self._clear_comparison("Для сравнения загрузите как минимум два периода")
         self.refresh_history()
+        self.refresh_trends(runs)
 
     def select_run(self, run_id: int) -> None:
         self.current_run_id = run_id
@@ -781,6 +846,135 @@ class OZPriceAnalyzerApp(tk.Tk):
         if self.current_run_id and str(self.current_run_id) in self.history_tree.get_children():
             self.history_tree.selection_set(str(self.current_run_id))
 
+    def refresh_trends(self, runs=None) -> None:
+        self.trend_points = build_trend_points(list(runs) if runs is not None else self.db.list_runs())
+        self.trend_tree.delete(*self.trend_tree.get_children())
+        previous: TrendPoint | None = None
+        for point in self.trend_points:
+            revenue_change = point.revenue - previous.revenue if previous else None
+            profit_change = point.net_profit - previous.net_profit if previous else None
+            tag = "positive" if profit_change is None or profit_change >= 0 else "negative"
+            self.trend_tree.insert(
+                "",
+                "end",
+                iid=str(point.run_id),
+                values=(
+                    f"#{point.run_id}",
+                    point.label,
+                    _number(point.units),
+                    _money(point.revenue),
+                    _signed_money(revenue_change) if revenue_change is not None else "—",
+                    _money(point.net_profit),
+                    _signed_money(profit_change) if profit_change is not None else "—",
+                    _money(point.unallocated),
+                ),
+                tags=(tag,),
+            )
+            previous = point
+        self._configure_value_tags(self.trend_tree)
+        self._draw_trend_chart()
+
+    def _draw_trend_chart(self) -> None:
+        if not hasattr(self, "trend_canvas"):
+            return
+        canvas = self.trend_canvas
+        canvas.delete("all")
+        canvas.configure(background=self.colors["surface"], highlightbackground=self.colors["border"])
+        self.trend_canvas_points.clear()
+        width = max(canvas.winfo_width(), 680)
+        height = max(canvas.winfo_height(), 300)
+        left, right, top, bottom = 92, 30, 28, 62
+        plot_width = width - left - right
+        plot_height = height - top - bottom
+        metric = TREND_METRICS.get(self.trend_metric_var.get(), "revenue")
+        if not self.trend_points:
+            canvas.create_text(
+                width / 2,
+                height / 2,
+                text="Импортируйте отчеты, чтобы увидеть динамику",
+                fill=self.colors["muted"],
+                font=("Segoe UI", 12),
+            )
+            return
+        minimum, maximum = chart_bounds(self.trend_points, metric)
+        value_range = maximum - minimum
+        for index in range(6):
+            ratio = index / 5
+            y = top + plot_height * ratio
+            value = maximum - value_range * ratio
+            canvas.create_line(left, y, width - right, y, fill=self.colors["border"], dash=(2, 4))
+            canvas.create_text(
+                left - 10,
+                y,
+                text=_axis_value(value, metric),
+                anchor="e",
+                fill=self.colors["muted"],
+                font=("Segoe UI", 9),
+            )
+        zero_y = top + (maximum / value_range) * plot_height
+        if top <= zero_y <= height - bottom:
+            canvas.create_line(left, zero_y, width - right, zero_y, fill=self.colors["muted"], width=1)
+
+        denominator = max(len(self.trend_points) - 1, 1)
+        coordinates: list[float] = []
+        label_step = max(1, (len(self.trend_points) + 7) // 8)
+        for index, point in enumerate(self.trend_points):
+            x = left + plot_width * index / denominator if len(self.trend_points) > 1 else left + plot_width / 2
+            y = top + (maximum - point.value(metric)) / value_range * plot_height
+            coordinates.extend((x, y))
+            self.trend_canvas_points.append((x, y, point))
+            if index % label_step == 0 or index == len(self.trend_points) - 1:
+                canvas.create_text(
+                    x,
+                    height - bottom + 14,
+                    text=_short_period(point.label),
+                    anchor="n",
+                    fill=self.colors["muted"],
+                    font=("Segoe UI", 8),
+                    angle=18 if len(self.trend_points) > 5 else 0,
+                )
+        if len(coordinates) >= 4:
+            canvas.create_line(*coordinates, fill=self.colors["accent"], width=3, smooth=False)
+        for x, y, point in self.trend_canvas_points:
+            color = self.colors["positive"] if point.value(metric) >= 0 else self.colors["negative"]
+            canvas.create_oval(x - 5, y - 5, x + 5, y + 5, fill=color, outline=self.colors["surface"], width=2)
+
+    def _trend_hover(self, event) -> None:
+        self.trend_canvas.delete("tooltip")
+        if not self.trend_canvas_points:
+            return
+        x, y, point = min(
+            self.trend_canvas_points,
+            key=lambda item: (item[0] - event.x) ** 2 + (item[1] - event.y) ** 2,
+        )
+        if (x - event.x) ** 2 + (y - event.y) ** 2 > 225:
+            return
+        metric = TREND_METRICS.get(self.trend_metric_var.get(), "revenue")
+        text = f"Расчет #{point.run_id}\n{point.label}\n{_trend_value(point.value(metric), metric)}"
+        text_x = min(max(x + 12, 80), max(self.trend_canvas.winfo_width() - 150, 80))
+        text_y = max(y - 58, 8)
+        box = self.trend_canvas.create_text(
+            text_x,
+            text_y,
+            text=text,
+            anchor="nw",
+            fill=self.colors["text"],
+            font=("Segoe UI", 9),
+            tags="tooltip",
+        )
+        bounds = self.trend_canvas.bbox(box)
+        if bounds:
+            background = self.trend_canvas.create_rectangle(
+                bounds[0] - 8,
+                bounds[1] - 6,
+                bounds[2] + 8,
+                bounds[3] + 6,
+                fill=self.colors["surface_alt"],
+                outline=self.colors["border"],
+                tags="tooltip",
+            )
+            self.trend_canvas.tag_lower(background, box)
+
     def _open_history_run(self, _event=None) -> None:
         selection = self.history_tree.selection()
         if not selection:
@@ -938,10 +1132,12 @@ class OZPriceAnalyzerApp(tk.Tk):
             self.scenario_tree,
             self.history_tree,
             self.quality_tree,
+            self.trend_tree,
             self.comparison_tree,
             self.products_tree,
         ):
             self._configure_value_tags(tree)
+        self._draw_trend_chart()
 
     def import_reports(self) -> None:
         if self.import_in_progress:
@@ -1368,6 +1564,25 @@ def _comparison_percent(metric: ComparisonMetric) -> str:
 def _comparison_kpi(metric: ComparisonMetric, money: bool) -> str:
     absolute = _signed_money(metric.change) if money else _signed_number(metric.change)
     return f"{absolute} · {_comparison_percent(metric)}"
+
+
+def _axis_value(value: float, metric: str) -> str:
+    if metric == "units":
+        return _number(value)
+    absolute = abs(value)
+    if absolute >= 1_000_000:
+        return f"{value / 1_000_000:.1f} млн"
+    if absolute >= 1_000:
+        return f"{value / 1_000:.0f} тыс."
+    return f"{value:.0f}"
+
+
+def _trend_value(value: float, metric: str) -> str:
+    return _number(value) if metric == "units" else _money(value)
+
+
+def _short_period(value: str) -> str:
+    return value.split("–", 1)[0]
 
 
 def _optional_money(value: float | None) -> str:
