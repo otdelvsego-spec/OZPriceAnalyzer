@@ -6,7 +6,14 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
-from ozon_app.costs import CostCatalogError, build_cost_changes, export_cost_catalog, read_cost_catalog
+from ozon_app.costs import (
+    CostCatalogError,
+    CostEditorEntry,
+    build_cost_changes,
+    build_products_from_editor_entries,
+    export_cost_catalog,
+    read_cost_catalog,
+)
 from ozon_app.database import Database
 from ozon_app.models import Product
 
@@ -45,6 +52,7 @@ class CostCatalogTests(unittest.TestCase):
             ws = workbook["Себестоимость"]
             ws["A5"], ws["B5"], ws["C5"], ws["D5"] = "A", "Товар", 100, 120
             ws["A6"], ws["B6"], ws["C6"], ws["D6"] = "A", "Дубль", 100, 20
+            ws["A7"], ws["B7"], ws["C7"], ws["D7"] = "B", "Неверные трудозатраты", 100, "нет данных"
             workbook.save(path)
             workbook.close()
 
@@ -52,6 +60,34 @@ class CostCatalogTests(unittest.TestCase):
                 read_cost_catalog(path)
             self.assertIn("трудозатраты", str(context.exception))
             self.assertIn("уже указан", str(context.exception))
+            self.assertIn("неверно указаны трудозатраты", str(context.exception))
+
+    def test_builds_products_entered_inside_application(self) -> None:
+        products = build_products_from_editor_entries(
+            [
+                CostEditorEntry("A-001", "Товар A", "125,50", "25,50", True, 1),
+                CostEditorEntry("B-002", "", 80, "", False, 2),
+            ]
+        )
+
+        self.assertEqual(products[0].material_cost, 100)
+        self.assertEqual(products[0].labor_cost, 25.5)
+        self.assertEqual(products[1].name, "B-002")
+        self.assertFalse(products[1].active)
+
+    def test_rejects_invalid_application_entries_together(self) -> None:
+        entries = [
+            CostEditorEntry("A", "Товар", 100, 120, True, 1),
+            CostEditorEntry("A", "Дубль", 90, 10, True, 2),
+            CostEditorEntry("", "Без артикула", 50, 0, True, 3),
+        ]
+
+        with self.assertRaises(CostCatalogError) as context:
+            build_products_from_editor_entries(entries)
+        message = str(context.exception)
+        self.assertIn("трудозатраты", message)
+        self.assertIn("уже указан", message)
+        self.assertIn("не указан артикул", message)
 
 
 if __name__ == "__main__":

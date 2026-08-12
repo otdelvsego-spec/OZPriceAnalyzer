@@ -11,7 +11,14 @@ from tkinter import filedialog, messagebox, ttk
 
 from .calculator import calculate_scenario, discover_unknown_products
 from .comparison import ComparisonMetric, compare_calculations
-from .costs import CostChange, build_cost_changes, export_cost_catalog, read_cost_catalog
+from .costs import (
+    CostChange,
+    CostEditorEntry,
+    build_cost_changes,
+    build_products_from_editor_entries,
+    export_cost_catalog,
+    read_cost_catalog,
+)
 from .excel_reader import REPORT_REALIZATION, preview_sheet, workbook_sheet_names
 from .exporter import export_run, suggested_export_name
 from .models import Product, ProductResult, RunCalculation, ScenarioRow, UnknownProduct
@@ -505,12 +512,47 @@ class OZPriceAnalyzerApp(tk.Tk):
         product_header.grid(row=2, column=0, sticky="ew", pady=(6, 8))
         product_header.columnconfigure(0, weight=1)
         ttk.Label(product_header, text="Товары и себестоимость", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Button(product_header, text="Экспорт XLSX", command=self.export_product_catalog).grid(row=0, column=1, padx=4)
-        ttk.Button(product_header, text="Импорт XLSX", command=self.import_product_catalog).grid(row=0, column=2, padx=4)
-        ttk.Button(product_header, text="Журнал изменений", command=self.show_cost_history).grid(row=0, column=3, padx=4)
-        ttk.Button(product_header, text="Добавить товар", command=self.add_product).grid(row=0, column=4, padx=4)
-        ttk.Button(product_header, text="Изменить", command=self.edit_product).grid(row=0, column=5, padx=4)
-        ttk.Button(product_header, text="В архив / восстановить", command=self.toggle_product).grid(row=0, column=6, padx=4)
+        ttk.Button(
+            product_header,
+            text="Редактировать справочник",
+            style="Accent.TButton",
+            command=self.open_cost_catalog_editor,
+        ).grid(row=0, column=1, padx=(8, 4))
+        ttk.Button(product_header, text="Добавить товар", command=self.add_product).grid(row=0, column=2, padx=4)
+        ttk.Button(product_header, text="Изменить выбранный", command=self.edit_product).grid(row=0, column=3, padx=4)
+        ttk.Button(product_header, text="В архив / восстановить", command=self.toggle_product).grid(row=0, column=4, padx=4)
+        ttk.Button(product_header, text="Журнал изменений", command=self.show_cost_history).grid(row=0, column=5, padx=4)
+        ttk.Label(
+            product_header,
+            text="Основной способ — заполнение прямо в приложении. XLSX нужен только для обмена или резервной копии.",
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 8))
+
+        filters = ttk.Frame(product_header)
+        filters.grid(row=2, column=0, columnspan=6, sticky="ew")
+        filters.columnconfigure(5, weight=1)
+        ttk.Label(filters, text="Поиск:").grid(row=0, column=0, padx=(0, 6))
+        self.product_search_var = tk.StringVar()
+        search_entry = ttk.Entry(filters, textvariable=self.product_search_var, width=28)
+        search_entry.grid(row=0, column=1, padx=(0, 12))
+        self.product_search_var.trace_add("write", lambda *_args: self.refresh_products())
+        ttk.Label(filters, text="Показывать:").grid(row=0, column=2, padx=(0, 6))
+        self.product_status_var = tk.StringVar(value="Все")
+        status_combo = ttk.Combobox(
+            filters,
+            textvariable=self.product_status_var,
+            state="readonly",
+            values=("Все", "Активные", "Архив"),
+            width=12,
+        )
+        status_combo.grid(row=0, column=3, padx=(0, 12))
+        status_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_products())
+        self.product_count_var = tk.StringVar(value="Показано: 0")
+        ttk.Label(filters, textvariable=self.product_count_var, style="Muted.TLabel").grid(
+            row=0, column=4, sticky="w"
+        )
+        ttk.Button(filters, text="Выгрузить XLSX", command=self.export_product_catalog).grid(row=0, column=6, padx=4)
+        ttk.Button(filters, text="Загрузить XLSX", command=self.import_product_catalog).grid(row=0, column=7, padx=4)
         self.products_tree = self._create_tree(
             self.settings_tab,
             ["article", "name", "total", "material", "labor", "status"],
@@ -1062,7 +1104,16 @@ class OZPriceAnalyzerApp(tk.Tk):
         if not hasattr(self, "products_tree"):
             return
         self.products_tree.delete(*self.products_tree.get_children())
-        for product in self.db.list_products():
+        products = self.db.list_products()
+        query = self.product_search_var.get().strip().casefold() if hasattr(self, "product_search_var") else ""
+        status = self.product_status_var.get() if hasattr(self, "product_status_var") else "Все"
+        visible = [
+            product
+            for product in products
+            if (not query or query in product.article.casefold() or query in product.name.casefold())
+            and (status == "Все" or (status == "Активные" and product.active) or (status == "Архив" and not product.active))
+        ]
+        for product in visible:
             self.products_tree.insert(
                 "",
                 "end",
@@ -1073,7 +1124,35 @@ class OZPriceAnalyzerApp(tk.Tk):
                 ),
                 tags=("" if product.active else "muted",),
             )
+        if hasattr(self, "product_count_var"):
+            self.product_count_var.set(f"Показано: {len(visible)} из {len(products)}")
         self._configure_value_tags(self.products_tree)
+
+    def open_cost_catalog_editor(self) -> None:
+        dialog = CostCatalogEditorDialog(self, self.db.list_products())
+        self.wait_window(dialog)
+        if dialog.cancelled:
+            return
+        changes = build_cost_changes(dialog.products, self.db.product_map(active_only=False))
+        changed_products = [change.product for change in changes if change.changed]
+        if not changed_products:
+            messagebox.showinfo("Себестоимость", "Изменений нет", parent=self)
+            return
+        preview = CostImportDialog(self, changes, "Редактор приложения")
+        self.wait_window(preview)
+        if preview.cancelled:
+            return
+        try:
+            changed = self.db.save_products(preview.products_to_apply, source="Редактор приложения")
+            self.refresh_products()
+            messagebox.showinfo(
+                "Себестоимость сохранена",
+                f"Применено изменений: {changed}.\n"
+                "Новые значения используются со следующего расчета. Старые отчеты не изменены.",
+                parent=self,
+            )
+        except Exception as exc:
+            messagebox.showerror("Себестоимость", str(exc), parent=self)
 
     def export_product_catalog(self) -> None:
         destination = filedialog.asksaveasfilename(
@@ -1091,7 +1170,8 @@ class OZPriceAnalyzerApp(tk.Tk):
             messagebox.showinfo(
                 "Справочник себестоимости",
                 f"Справочник сохранен:\n{path}\n\n"
-                "Отредактируйте файл и загрузите его кнопкой «Импорт XLSX».",
+                "Файл можно использовать как резервную копию или для массового обмена. "
+                "Основное редактирование доступно прямо в приложении.",
                 parent=self,
             )
         except Exception as exc:
@@ -1322,6 +1402,316 @@ class OZPriceAnalyzerApp(tk.Tk):
         tree.tag_configure("muted", foreground=palette["muted"])
 
 
+class CostCatalogEditorDialog(tk.Toplevel):
+    def __init__(self, parent: OZPriceAnalyzerApp, products: list[Product]):
+        super().__init__(parent)
+        self.title("Редактор товаров и себестоимости")
+        self.geometry("1280x760")
+        self.minsize(1020, 650)
+        self.transient(parent)
+        self.grab_set()
+        self.cancelled = True
+        self.products: list[Product] = []
+        self.product_map = {
+            product.article: Product(
+                article=product.article,
+                name=product.name,
+                material_cost=product.material_cost,
+                labor_cost=product.labor_cost,
+                active=product.active,
+            )
+            for product in products
+        }
+        self.original_articles = set(self.product_map)
+        self.current_article: str | None = None
+        self.loading = False
+        self.dirty = False
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(3, weight=1)
+        ttk.Label(self, text="Товары и себестоимость", style="Section.TLabel").grid(
+            row=0, column=0, sticky="w", padx=20, pady=(18, 2)
+        )
+        ttk.Label(
+            self,
+            text=(
+                "Заполняйте справочник прямо здесь. Полная себестоимость состоит из материала и трудозатрат. "
+                "Перед окончательным сохранением приложение покажет все изменения."
+            ),
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 10))
+
+        controls = ttk.Frame(self)
+        controls.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 8))
+        controls.columnconfigure(2, weight=1)
+        ttk.Label(controls, text="Поиск:").grid(row=0, column=0, padx=(0, 6))
+        self.search_var = tk.StringVar()
+        ttk.Entry(controls, textvariable=self.search_var, width=32).grid(row=0, column=1, padx=(0, 12))
+        self.search_var.trace_add("write", lambda *_args: self._refresh_tree())
+        self.count_var = tk.StringVar()
+        ttk.Label(controls, textvariable=self.count_var, style="Muted.TLabel").grid(row=0, column=2, sticky="w")
+        ttk.Button(controls, text="Новая позиция", style="Accent.TButton", command=self._new_product).grid(
+            row=0, column=3
+        )
+
+        container = ttk.Frame(self)
+        container.grid(row=3, column=0, sticky="nsew", padx=20)
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(0, weight=1)
+        columns = ("article", "name", "total", "material", "labor", "status")
+        self.tree = ttk.Treeview(container, columns=columns, show="headings", selectmode="browse")
+        headings = ["Артикул", "Наименование", "Полная себестоимость", "Материал", "Трудозатраты", "Статус"]
+        widths = [150, 340, 170, 150, 150, 100]
+        for column, heading, width in zip(columns, headings, widths):
+            self.tree.heading(column, text=heading)
+            self.tree.column(
+                column,
+                width=width,
+                minwidth=80,
+                stretch=False,
+                anchor="w" if column in {"article", "name", "status"} else "e",
+            )
+        xscroll = ttk.Scrollbar(container, orient="horizontal", command=self.tree.xview)
+        yscroll = ttk.Scrollbar(container, orient="vertical", command=self.tree.yview)
+        self.tree.configure(xscrollcommand=xscroll.set, yscrollcommand=yscroll.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.bind("<Double-1>", lambda _event: self.name_entry.focus_set())
+        self.tree.tag_configure("muted", foreground=parent.colors["muted"])
+
+        editor = ttk.LabelFrame(self, text="Редактирование выбранной позиции", padding=(14, 10))
+        editor.grid(row=4, column=0, sticky="ew", padx=20, pady=(12, 0))
+        editor.columnconfigure(3, weight=1)
+        self.article_var = tk.StringVar()
+        self.name_var = tk.StringVar()
+        self.total_var = tk.StringVar()
+        self.labor_var = tk.StringVar(value="0")
+        self.material_var = tk.StringVar(value="—")
+        self.active_var = tk.BooleanVar(value=True)
+        ttk.Label(editor, text="Артикул:").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=4)
+        self.article_entry = ttk.Entry(editor, textvariable=self.article_var, width=22)
+        self.article_entry.grid(row=0, column=1, sticky="w", padx=(0, 18), pady=4)
+        ttk.Label(editor, text="Наименование:").grid(row=0, column=2, sticky="w", padx=(0, 6), pady=4)
+        self.name_entry = ttk.Entry(editor, textvariable=self.name_var)
+        self.name_entry.grid(row=0, column=3, sticky="ew", padx=(0, 18), pady=4)
+        ttk.Checkbutton(editor, text="Активен", variable=self.active_var).grid(row=0, column=4, sticky="w", pady=4)
+
+        ttk.Label(editor, text="Полная себестоимость, руб.:").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=4)
+        ttk.Entry(editor, textvariable=self.total_var, width=22).grid(row=1, column=1, sticky="w", padx=(0, 18), pady=4)
+        ttk.Label(editor, text="Трудозатраты, руб.:").grid(row=1, column=2, sticky="w", padx=(0, 6), pady=4)
+        ttk.Entry(editor, textvariable=self.labor_var, width=18).grid(row=1, column=3, sticky="w", pady=4)
+        ttk.Label(editor, text="Материал рассчитывается автоматически:").grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(4, 0)
+        )
+        ttk.Label(editor, textvariable=self.material_var, style="Section.TLabel").grid(
+            row=2, column=2, sticky="w", pady=(4, 0)
+        )
+        ttk.Button(editor, text="Применить в таблицу", command=self._commit_current).grid(
+            row=2, column=4, sticky="e", pady=(4, 0)
+        )
+
+        for variable in (self.article_var, self.name_var, self.total_var, self.labor_var):
+            variable.trace_add("write", self._field_changed)
+        self.active_var.trace_add("write", self._field_changed)
+
+        buttons = ttk.Frame(self, padding=(20, 14))
+        buttons.grid(row=5, column=0, sticky="e")
+        ttk.Button(buttons, text="Отмена", command=self.destroy).grid(row=0, column=0, padx=4)
+        ttk.Button(
+            buttons,
+            text="Проверить и сохранить справочник",
+            style="Accent.TButton",
+            command=self._finish,
+        ).grid(row=0, column=1, padx=4)
+        self.bind("<Control-s>", lambda _event: self._finish())
+        self.bind("<Escape>", lambda _event: self.destroy())
+
+        self._refresh_tree()
+        first = next(iter(self.product_map), None)
+        if first:
+            self._select_article(first)
+        else:
+            self._new_product()
+
+    def _field_changed(self, *_args) -> None:
+        if self.loading:
+            return
+        self.dirty = True
+        try:
+            total = _parse_number(self.total_var.get())
+            labor = _parse_number(self.labor_var.get() or "0")
+            self.material_var.set(_money(total - labor) if total >= labor >= 0 else "Проверьте значения")
+        except ValueError:
+            self.material_var.set("—")
+
+    def _refresh_tree(self) -> None:
+        if not hasattr(self, "tree"):
+            return
+        query = self.search_var.get().strip().casefold()
+        selected = self.current_article
+        self.loading = True
+        try:
+            self.tree.delete(*self.tree.get_children())
+            visible = [
+                product
+                for product in sorted(self.product_map.values(), key=lambda item: item.article.casefold())
+                if not query or query in product.article.casefold() or query in product.name.casefold()
+            ]
+            for product in visible:
+                self.tree.insert(
+                    "",
+                    "end",
+                    iid=product.article,
+                    values=(
+                        product.article,
+                        product.name,
+                        _money(product.total_cost),
+                        _money(product.material_cost),
+                        _money(product.labor_cost),
+                        "Активен" if product.active else "Архив",
+                    ),
+                    tags=("" if product.active else "muted",),
+                )
+            self.count_var.set(f"Показано: {len(visible)} из {len(self.product_map)}")
+            if selected and self.tree.exists(selected):
+                self.tree.selection_set(selected)
+                self.tree.focus(selected)
+        finally:
+            self.loading = False
+
+    def _on_select(self, _event=None) -> None:
+        if self.loading:
+            return
+        selection = self.tree.selection()
+        if not selection:
+            return
+        target = selection[0]
+        if target == self.current_article:
+            return
+        if self.dirty:
+            answer = messagebox.askyesnocancel(
+                "Несохраненная строка",
+                "Применить изменения текущей строки перед переходом к другой позиции?",
+                parent=self,
+            )
+            if answer is None:
+                self._select_article(self.current_article)
+                return
+            if answer and not self._commit_current():
+                self._select_article(self.current_article)
+                return
+        self._load_product(target)
+
+    def _select_article(self, article: str | None) -> None:
+        if not article:
+            self.loading = True
+            try:
+                self.tree.selection_remove(*self.tree.selection())
+            finally:
+                self.loading = False
+            return
+        if not self.tree.exists(article):
+            return
+        self.loading = True
+        try:
+            self.tree.selection_set(article)
+            self.tree.focus(article)
+            self.tree.see(article)
+        finally:
+            self.loading = False
+        self._load_product(article)
+
+    def _load_product(self, article: str) -> None:
+        product = self.product_map[article]
+        self.loading = True
+        try:
+            self.current_article = article
+            self.article_var.set(product.article)
+            self.name_var.set(product.name)
+            self.total_var.set(_plain_number(product.total_cost))
+            self.labor_var.set(_plain_number(product.labor_cost))
+            self.material_var.set(_money(product.material_cost))
+            self.active_var.set(product.active)
+            self.article_entry.configure(state="disabled" if article in self.original_articles else "normal")
+            self.dirty = False
+        finally:
+            self.loading = False
+
+    def _new_product(self) -> None:
+        if self.dirty:
+            if not self._commit_current():
+                return
+        self.loading = True
+        try:
+            self.tree.selection_remove(*self.tree.selection())
+            self.current_article = None
+            self.article_var.set("")
+            self.name_var.set("")
+            self.total_var.set("")
+            self.labor_var.set("0")
+            self.material_var.set("—")
+            self.active_var.set(True)
+            self.article_entry.configure(state="normal")
+            self.dirty = False
+        finally:
+            self.loading = False
+        self.article_entry.focus_set()
+
+    def _commit_current(self) -> bool:
+        entry = CostEditorEntry(
+            article=self.article_var.get(),
+            name=self.name_var.get(),
+            total_cost=self.total_var.get(),
+            labor_cost=self.labor_var.get(),
+            active=self.active_var.get(),
+            row_number=(list(sorted(self.product_map)).index(self.current_article) + 1)
+            if self.current_article in self.product_map
+            else len(self.product_map) + 1,
+        )
+        try:
+            product = build_products_from_editor_entries([entry])[0]
+            if product.article != self.current_article and product.article in self.product_map:
+                raise ValueError(f"Артикул {product.article} уже есть в справочнике")
+        except Exception as exc:
+            messagebox.showerror("Себестоимость", str(exc), parent=self)
+            return False
+        previous_article = self.current_article
+        if previous_article and previous_article != product.article and previous_article not in self.original_articles:
+            self.product_map.pop(previous_article, None)
+        self.product_map[product.article] = product
+        self.current_article = product.article
+        self.dirty = False
+        self._refresh_tree()
+        self._select_article(product.article)
+        return True
+
+    def _finish(self) -> None:
+        if self.dirty and not self._commit_current():
+            return
+        try:
+            entries = [
+                CostEditorEntry(
+                    article=product.article,
+                    name=product.name,
+                    total_cost=product.total_cost,
+                    labor_cost=product.labor_cost,
+                    active=product.active,
+                    row_number=index,
+                )
+                for index, product in enumerate(
+                    sorted(self.product_map.values(), key=lambda item: item.article.casefold()), start=1
+                )
+            ]
+            self.products = build_products_from_editor_entries(entries)
+        except Exception as exc:
+            messagebox.showerror("Себестоимость", str(exc), parent=self)
+            return
+        self.cancelled = False
+        self.destroy()
+
+
 class CostImportDialog(tk.Toplevel):
     def __init__(self, parent: OZPriceAnalyzerApp, changes: list[CostChange], source_name: str):
         super().__init__(parent)
@@ -1344,7 +1734,7 @@ class CostImportDialog(tk.Toplevel):
         ttk.Label(
             self,
             text=(
-                f"Файл: {source_name} · строк: {len(changes)} · изменений: {changed_count} · новых товаров: {new_count}. "
+                f"Источник: {source_name} · строк: {len(changes)} · изменений: {changed_count} · новых товаров: {new_count}. "
                 "Старые отчеты и их себестоимость останутся без изменений."
             ),
             style="Muted.TLabel",

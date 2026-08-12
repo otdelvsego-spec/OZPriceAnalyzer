@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Iterable
 
 from openpyxl import load_workbook
 
@@ -36,6 +37,66 @@ class CostChange:
         return self.product.total_cost - self.previous.total_cost
 
 
+@dataclass(slots=True)
+class CostEditorEntry:
+    article: object
+    name: object
+    total_cost: object
+    labor_cost: object
+    active: bool
+    row_number: int
+
+
+def build_products_from_editor_entries(entries: Iterable[CostEditorEntry]) -> list[Product]:
+    products: list[Product] = []
+    seen: dict[str, int] = {}
+    errors: list[str] = []
+    for entry in entries:
+        article = display_text(entry.article)
+        name = display_text(entry.name)
+        total_value = entry.total_cost
+        labor_value = entry.labor_cost
+        if not article and not name and total_value in (None, "") and labor_value in (None, ""):
+            continue
+        location = f"строка {entry.row_number}"
+        if not article:
+            errors.append(f"{location}: не указан артикул")
+            continue
+        if article in seen:
+            errors.append(f"{location}: артикул {article} уже указан в строке {seen[article]}")
+            continue
+        seen[article] = entry.row_number
+        if not is_numeric(total_value):
+            errors.append(f"{location}: не указана полная себестоимость для {article}")
+            continue
+        if labor_value not in (None, "") and not is_numeric(labor_value):
+            errors.append(f"{location}: неверно указаны трудозатраты для {article}")
+            continue
+        total = as_float(total_value)
+        labor = as_float(labor_value) if labor_value not in (None, "") else 0.0
+        if total < 0 or labor < 0 or labor > total:
+            errors.append(
+                f"{location}: трудозатраты должны быть от 0 до полной себестоимости для {article}"
+            )
+            continue
+        products.append(
+            Product(
+                article=article,
+                name=name or article,
+                material_cost=total - labor,
+                labor_cost=labor,
+                active=entry.active,
+            )
+        )
+    if errors:
+        detail = "\n".join(f"• {message}" for message in errors[:12])
+        suffix = f"\n…и еще {len(errors) - 12}" if len(errors) > 12 else ""
+        raise CostCatalogError(f"Справочник содержит ошибки:\n{detail}{suffix}")
+    if not products:
+        raise CostCatalogError("В справочнике нет заполненных товаров")
+    return products
+
+
 def read_cost_catalog(path: str | Path) -> list[Product]:
     source = Path(path).expanduser().resolve()
     if source.suffix.casefold() != ".xlsx":
@@ -53,9 +114,7 @@ def read_cost_catalog(path: str | Path) -> list[Product]:
             "labor": columns[normalize_text("Трудозатраты, руб.")],
         }
         active_column = columns.get(normalize_text("Активен"), 0)
-        products: list[Product] = []
-        seen: dict[str, int] = {}
-        errors: list[str] = []
+        entries: list[CostEditorEntry] = []
         for row_number in range(header_row + 1, int(ws.max_row or header_row) + 1):
             article = display_text(ws.cell(row_number, positions["article"]).value)
             name = display_text(ws.cell(row_number, positions["name"]).value)
@@ -63,40 +122,17 @@ def read_cost_catalog(path: str | Path) -> list[Product]:
             labor_value = ws.cell(row_number, positions["labor"]).value
             if not article and not name and total_value in (None, "") and labor_value in (None, ""):
                 continue
-            if not article:
-                errors.append(f"строка {row_number}: не указан артикул")
-                continue
-            if article in seen:
-                errors.append(f"строка {row_number}: артикул {article} уже указан в строке {seen[article]}")
-                continue
-            seen[article] = row_number
-            if not is_numeric(total_value):
-                errors.append(f"строка {row_number}: не указана полная себестоимость для {article}")
-                continue
-            total = as_float(total_value)
-            labor = as_float(labor_value) if labor_value not in (None, "") else 0.0
-            if total < 0 or labor < 0 or labor > total:
-                errors.append(
-                    f"строка {row_number}: трудозатраты должны быть от 0 до полной себестоимости для {article}"
-                )
-                continue
-            active = _active_value(ws.cell(row_number, active_column).value) if active_column else True
-            products.append(
-                Product(
+            entries.append(
+                CostEditorEntry(
                     article=article,
-                    name=name or article,
-                    material_cost=total - labor,
-                    labor_cost=labor,
-                    active=active,
+                    name=name,
+                    total_cost=total_value,
+                    labor_cost=labor_value,
+                    active=_active_value(ws.cell(row_number, active_column).value) if active_column else True,
+                    row_number=row_number,
                 )
             )
-        if errors:
-            detail = "\n".join(f"• {message}" for message in errors[:12])
-            suffix = f"\n…и еще {len(errors) - 12}" if len(errors) > 12 else ""
-            raise CostCatalogError(f"Справочник содержит ошибки:\n{detail}{suffix}")
-        if not products:
-            raise CostCatalogError("В справочнике нет заполненных товаров")
-        return products
+        return build_products_from_editor_entries(entries)
     finally:
         workbook.close()
 
