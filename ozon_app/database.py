@@ -203,7 +203,6 @@ class Database:
         defaults = {
             "theme": "system",
             "tax_rate": str(DEFAULT_TAX_RATE),
-            "duplicate_policy": "ask",
             "warn_without_realization": "1",
             "preview_rows": "500",
         }
@@ -416,9 +415,62 @@ class Database:
             ).fetchall()
         return [int(row[0]) for row in rows]
 
-    def save_run(self, calculation: RunCalculation, stored_paths: dict[str, Path]) -> int:
+    def find_runs_by_period(self, period_start: date, period_end: date) -> list[int]:
+        with self.read() as db:
+            rows = db.execute(
+                """
+                SELECT id
+                FROM runs
+                WHERE period_start = ? AND period_end = ?
+                ORDER BY id ASC
+                """,
+                (_date_text(period_start), _date_text(period_end)),
+            ).fetchall()
+        return [int(row[0]) for row in rows]
+
+    def save_run(
+        self,
+        calculation: RunCalculation,
+        stored_paths: dict[str, Path],
+        replace_run_ids: list[int] | None = None,
+    ) -> int:
         totals = calculation.totals()
+        replace_ids = sorted(set(replace_run_ids or []))
+        replaced_paths: list[str] = []
         with self.transaction() as db:
+            preserved_name = ""
+            if replace_ids:
+                placeholders = ",".join("?" for _ in replace_ids)
+                replaced = db.execute(
+                    f"""
+                    SELECT id, report_name, period_start, period_end
+                    FROM runs
+                    WHERE id IN ({placeholders})
+                    ORDER BY id ASC
+                    """,
+                    replace_ids,
+                ).fetchall()
+                if len(replaced) != len(replace_ids):
+                    raise KeyError("Обновляемый отчет уже удален")
+                expected_period = (
+                    _date_text(calculation.period_start),
+                    _date_text(calculation.period_end),
+                )
+                if any(
+                    (row["period_start"], row["period_end"]) != expected_period
+                    for row in replaced
+                ):
+                    raise ValueError(
+                        "Можно заменять только отчет с тем же периодом"
+                    )
+                preserved_name = str(replaced[0]["report_name"] or "").strip()
+                replaced_paths = [
+                    str(row["stored_path"])
+                    for row in db.execute(
+                        f"SELECT stored_path FROM source_files WHERE run_id IN ({placeholders})",
+                        replace_ids,
+                    ).fetchall()
+                ]
             cursor = db.execute(
                 """
                 INSERT INTO runs(
@@ -450,7 +502,8 @@ class Database:
             db.execute(
                 "UPDATE runs SET report_name = ? WHERE id = ?",
                 (
-                    _default_run_name(
+                    preserved_name
+                    or _default_run_name(
                         run_id,
                         _date_text(calculation.period_start),
                         _date_text(calculation.period_end),
@@ -532,20 +585,27 @@ class Database:
                 for row in db.execute("SELECT id, report_name FROM runs").fetchall()
             }
             for source in calculation.source_files:
-                if source.duplicate_run_ids or hash_counts[source.file_hash] > 1:
+                previous_run_ids = [
+                    value for value in source.duplicate_run_ids if value not in replace_ids
+                ]
+                if previous_run_ids or hash_counts[source.file_hash] > 1:
                     details = (
                         "ранее использовался в "
                         + ", ".join(
                             f"«{run_names[value]}»" if value in run_names else "сохраненном отчете"
-                            for value in source.duplicate_run_ids
+                            for value in previous_run_ids
                         )
-                        if source.duplicate_run_ids
+                        if previous_run_ids
                         else "повторно выбран в текущем запуске"
                     )
                     db.execute(
                         "INSERT INTO quality_events(run_id, severity, event_type, message) VALUES (?, 'Предупреждение', 'Повторный файл', ?)",
                         (run_id, f"{source.path.name}: {details}"),
                     )
+            if replace_ids:
+                placeholders = ",".join("?" for _ in replace_ids)
+                db.execute(f"DELETE FROM runs WHERE id IN ({placeholders})", replace_ids)
+        self._remove_unreferenced_source_files(replaced_paths)
         return run_id
 
     def list_runs(self) -> list[RunSummary]:
@@ -591,6 +651,11 @@ class Database:
             if cursor.rowcount == 0:
                 raise KeyError(f"Расчет #{run_id} не найден")
 
+        return self._remove_unreferenced_source_files(stored_paths)
+
+    def _remove_unreferenced_source_files(self, stored_paths: list[str]) -> int:
+        if not stored_paths:
+            return 0
         with self.read() as db:
             remaining_paths = {
                 _resolved_path(str(row["stored_path"]))
@@ -608,8 +673,8 @@ class Database:
                 candidate.unlink(missing_ok=True)
                 removed_files += int(existed)
             except OSError:
-                # The history record has already been removed. An inaccessible
-                # orphaned copy is harmless and can be cleaned up manually.
+                # Запись истории уже удалена. Недоступную файловую
+                # копию можно безопасно очистить позже.
                 continue
         return removed_files
 

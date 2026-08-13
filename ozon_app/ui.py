@@ -26,7 +26,7 @@ from .config import APP_TITLE, APP_VERSION, save_storage_location
 from .database import Database
 from .excel_reader import REPORT_REALIZATION, preview_sheet, workbook_sheet_names
 from .exporter import export_run, suggested_export_name
-from .models import Product, ProductResult, RunCalculation, ScenarioRow, UnknownProduct
+from .models import Product, ProductResult, RunCalculation, RunSummary, ScenarioRow, UnknownProduct
 from .ordering import insert_at_group_end
 from .service import AppService, ImportSession
 from .storage import migrate_storage
@@ -36,8 +36,6 @@ from .trends import TrendPoint, build_trend_points, chart_bounds
 
 THEME_LABELS = {"Системная": "system", "Темная": "dark", "Светлая": "light"}
 THEME_VALUES = {value: key for key, value in THEME_LABELS.items()}
-DUPLICATE_LABELS = {"Спрашивать": "ask", "Пропускать": "skip", "Разрешать": "allow"}
-DUPLICATE_VALUES = {value: key for key, value in DUPLICATE_LABELS.items()}
 TREND_METRICS = {
     "Выручка": "revenue",
     "Чистая прибыль": "net_profit",
@@ -501,16 +499,11 @@ class OZPriceAnalyzerApp(tk.Tk):
         self.tax_rate_var = tk.StringVar(value=_plain_number(float(self.db.get_setting("tax_rate", "0.04")) * 100))
         ttk.Entry(settings, textvariable=self.tax_rate_var, width=14).grid(row=0, column=3, sticky="w", pady=5)
 
-        ttk.Label(settings, text="Повторная загрузка файла:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=5)
-        self.duplicate_policy_var = tk.StringVar(
-            value=DUPLICATE_VALUES.get(self.db.get_setting("duplicate_policy", "ask"), "Спрашивать")
-        )
-        ttk.Combobox(
+        ttk.Label(settings, text="Повторный период:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=5)
+        ttk.Label(
             settings,
-            textvariable=self.duplicate_policy_var,
-            state="readonly",
-            values=list(DUPLICATE_LABELS),
-            width=20,
+            text="Обновить существующий отчет или прервать импорт",
+            style="Muted.TLabel",
         ).grid(row=1, column=1, sticky="w", pady=5)
 
         self.warn_realization_var = tk.BooleanVar(value=self.db.get_setting("warn_without_realization", "1") == "1")
@@ -1475,9 +1468,6 @@ class OZPriceAnalyzerApp(tk.Tk):
     def _reload_settings_after_restore(self) -> None:
         self.theme_var.set(THEME_VALUES.get(self.db.get_setting("theme", "system"), "Системная"))
         self.tax_rate_var.set(_plain_number(float(self.db.get_setting("tax_rate", "0.04")) * 100))
-        self.duplicate_policy_var.set(
-            DUPLICATE_VALUES.get(self.db.get_setting("duplicate_policy", "ask"), "Спрашивать")
-        )
         self.warn_realization_var.set(self.db.get_setting("warn_without_realization", "1") == "1")
         self.preview_rows_var.set(self.db.get_setting("preview_rows", "500"))
         if hasattr(self, "storage_path_var"):
@@ -1583,7 +1573,6 @@ class OZPriceAnalyzerApp(tk.Tk):
             return
         self.db.set_setting("theme", THEME_LABELS[self.theme_var.get()])
         self.db.set_setting("tax_rate", str(tax_percent / 100))
-        self.db.set_setting("duplicate_policy", DUPLICATE_LABELS[self.duplicate_policy_var.get()])
         self.db.set_setting("warn_without_realization", "1" if self.warn_realization_var.get() else "0")
         self.db.set_setting("preview_rows", str(preview_rows))
         self.colors = apply_theme(self, THEME_LABELS[self.theme_var.get()])
@@ -1643,10 +1632,20 @@ class OZPriceAnalyzerApp(tk.Tk):
                 raise error
             if session is None:
                 raise RuntimeError("Не удалось подготовить импорт")
-            if not self._handle_duplicates(session):
-                return
+            replace_run_ids = self.service.replacement_run_ids(session)
+            if replace_run_ids:
+                runs_by_id = {run.id: run for run in self.db.list_runs()}
+                dialog = ReplacePeriodDialog(
+                    self,
+                    period=_session_period(session),
+                    runs=[runs_by_id[run_id] for run_id in replace_run_ids if run_id in runs_by_id],
+                    run_numbers=self.run_number_by_id,
+                )
+                self.wait_window(dialog)
+                if not dialog.confirmed:
+                    return
             if not session.sources or not session.has_accrual:
-                raise ValueError("После исключения дубликатов не осталось отчета по начислениям")
+                raise ValueError("Не найден отчет по начислениям")
             if not session.has_realization and self.db.get_setting("warn_without_realization", "1") == "1":
                 if not messagebox.askyesno(
                     "Нет отчета о выкупленных товарах",
@@ -1664,14 +1663,27 @@ class OZPriceAnalyzerApp(tk.Tk):
                     return
                 created = dialog.created_products
                 skipped = dialog.skipped_articles
-            calculation = self.service.complete_import(session, created_products=created, skipped_articles=skipped)
+            calculation = self.service.complete_import(
+                session,
+                created_products=created,
+                skipped_articles=skipped,
+                replace_run_ids=replace_run_ids,
+            )
             self.current_run_id = calculation.run_id
             self.refresh_all()
+            result_intro = (
+                "Отчет за период заменен новым.\n"
+                if replace_run_ids
+                else f"Создан отчет №{self._run_number(calculation.run_id)}.\n"
+            )
+            result_message = (
+                result_intro
+                + f"Период: {_calculation_period(calculation)}\n"
+                + f"Выручка по выкупленным товарам: {_money(calculation.realization_revenue)}"
+            )
             messagebox.showinfo(
-                "Расчет готов",
-                f"Создан отчет №{self._run_number(calculation.run_id)}.\n"
-                f"Период: {_calculation_period(calculation)}\n"
-                f"Выручка по выкупленным товарам: {_money(calculation.realization_revenue)}",
+                "Отчет обновлен" if replace_run_ids else "Расчет готов",
+                result_message,
                 parent=self,
             )
         except Exception as exc:
@@ -1680,30 +1692,6 @@ class OZPriceAnalyzerApp(tk.Tk):
             self.import_in_progress = False
             self.configure(cursor="")
             self.status_var.set(self._current_run_status())
-
-    def _handle_duplicates(self, session: ImportSession) -> bool:
-        if not session.duplicate_sources:
-            return True
-        policy = self.db.get_setting("duplicate_policy", "ask")
-        names = "\n".join(
-            _duplicate_description(source, self.run_number_by_id) for source in session.duplicate_sources
-        )
-        if policy == "allow":
-            return True
-        if policy == "skip":
-            _exclude_duplicate_sources(session)
-            return True
-        answer = messagebox.askyesnocancel(
-            "Повторная загрузка файлов",
-            "Найдены файлы с уже выбранным или ранее обработанным содержимым:\n\n"
-            f"{names}\n\nДа — включить повторно; Нет — пропустить; Отмена — прервать импорт.",
-            parent=self,
-        )
-        if answer is None:
-            return False
-        if answer is False:
-            _exclude_duplicate_sources(session)
-        return True
 
     def export_current_run(self) -> None:
         if self.current_run_id is None or self.current_calculation is None:
@@ -1732,6 +1720,64 @@ class OZPriceAnalyzerApp(tk.Tk):
         tree.tag_configure("warning", foreground=palette["warning"])
         tree.tag_configure("total", background=palette["surface_alt"], foreground=palette["text"])
         tree.tag_configure("muted", foreground=palette["muted"])
+
+
+class ReplacePeriodDialog(tk.Toplevel):
+    def __init__(
+        self,
+        parent: OZPriceAnalyzerApp,
+        period: str,
+        runs: list[RunSummary],
+        run_numbers: dict[int, int],
+    ):
+        super().__init__(parent)
+        self.title("Отчет за этот период уже есть")
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(False, False)
+        self.configure(background=parent.colors["window"])
+        self.confirmed = False
+
+        ttk.Label(self, text="Обновить отчет за период?", style="Section.TLabel").grid(
+            row=0, column=0, sticky="w", padx=24, pady=(22, 4)
+        )
+        ttk.Label(
+            self,
+            text=f"Период: {period}",
+        ).grid(row=1, column=0, sticky="w", padx=24, pady=(0, 8))
+        names = "\n".join(
+            f"• №{run_numbers.get(run.id, '—')} · {run.report_name}"
+            for run in runs
+        )
+        ttk.Label(
+            self,
+            text=(
+                "В истории уже есть:\n"
+                f"{names}\n\n"
+                "При обновлении новый отчет будет сначала рассчитан и сохранен. "
+                "Только после этого прежний отчет будет удален. "
+                "Если возникнет ошибка, старый отчет останется без изменений."
+            ),
+            justify="left",
+            wraplength=650,
+        ).grid(row=2, column=0, sticky="w", padx=24, pady=(0, 18))
+
+        buttons = ttk.Frame(self)
+        buttons.grid(row=3, column=0, sticky="e", padx=20, pady=(0, 20))
+        ttk.Button(buttons, text="Прервать импорт", command=self.destroy).grid(
+            row=0, column=0, padx=4
+        )
+        ttk.Button(
+            buttons,
+            text="Обновить отчет за период",
+            style="Accent.TButton",
+            command=self._confirm,
+        ).grid(row=0, column=1, padx=4)
+        self.bind("<Escape>", lambda _event: self.destroy())
+
+    def _confirm(self) -> None:
+        self.confirmed = True
+        self.destroy()
 
 
 class HistoryYearFilterDialog(tk.Toplevel):
@@ -2753,6 +2799,12 @@ def _calculation_period(calculation: RunCalculation) -> str:
     return "не определен"
 
 
+def _session_period(session: ImportSession) -> str:
+    if session.period_start and session.period_end:
+        return f"{session.period_start:%d.%m.%Y}–{session.period_end:%d.%m.%Y}"
+    return "не определен"
+
+
 def _run_positions(runs) -> dict[int, int]:
     return {run.id: position for position, run in enumerate(runs, start=1)}
 
@@ -2792,22 +2844,6 @@ def _text_year(value: str | None) -> int | None:
         return int(value[:4])
     except (TypeError, ValueError):
         return None
-
-
-def _duplicate_description(source, run_numbers: dict[int, int] | None = None) -> str:
-    if source.duplicate_run_ids:
-        numbers = run_numbers or {}
-        runs = ", ".join(
-            f"№{numbers[value]}" if value in numbers else "сохраненном отчете"
-            for value in source.duplicate_run_ids
-        )
-        return f"• {source.path.name} — уже в расчетах {runs}"
-    return f"• {source.path.name} — совпадает с другим выбранным файлом"
-
-
-def _exclude_duplicate_sources(session: ImportSession) -> None:
-    duplicate_ids = {id(source) for source in session.duplicate_sources}
-    session.sources = [source for source in session.sources if id(source) not in duplicate_ids]
 
 
 def _open_path(path: Path) -> None:
