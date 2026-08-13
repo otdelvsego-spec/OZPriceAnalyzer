@@ -86,7 +86,7 @@ class ProductOrderingTests(unittest.TestCase):
                 ["БРГС10", "ГС2", "Бант 02"],
             )
 
-    def test_history_is_sorted_by_report_period_latest_first(self) -> None:
+    def test_history_is_sorted_by_report_period_oldest_first(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Database(Path(directory) / "app.sqlite3")
             inserted: dict[str, int] = {}
@@ -107,7 +107,7 @@ class ProductOrderingTests(unittest.TestCase):
                     )
             self.assertEqual(
                 [run.id for run in database.list_runs()],
-                [inserted["2026-07-01"], inserted["2026-05-01"], inserted["2026-03-01"]],
+                [inserted["2026-03-01"], inserted["2026-05-01"], inserted["2026-07-01"]],
             )
 
 

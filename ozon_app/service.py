@@ -84,4 +84,4 @@ class AppService:
 
     def latest_run_id(self) -> int | None:
         runs = self.db.list_runs()
-        return runs[0].id if runs else None
+        return runs[-1].id if runs else None

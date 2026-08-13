@@ -55,6 +55,9 @@ class OZPriceAnalyzerApp(tk.Tk):
         self.current_calculation: RunCalculation | None = None
         self.run_display_to_id: dict[str, int] = {}
         self.run_number_by_id: dict[int, int] = {}
+        self.history_number_by_id: dict[int, int] = {}
+        self.history_year_filter: set[int] | None = None
+        self.history_year_filter_var = tk.StringVar(value="Все годы")
         self.source_by_iid: dict[str, dict[str, object]] = {}
         self.preview_headers: list[str] = []
         self.preview_rows: list[list[str]] = []
@@ -321,20 +324,26 @@ class OZPriceAnalyzerApp(tk.Tk):
 
     def _build_history_tab(self) -> None:
         self.history_tab.columnconfigure(0, weight=1)
-        self.history_tab.rowconfigure(1, weight=3)
-        self.history_tab.rowconfigure(3, weight=2)
+        self.history_tab.rowconfigure(1, weight=0)
+        self.history_tab.rowconfigure(3, weight=1)
         header = ttk.Frame(self.history_tab)
         header.grid(row=0, column=0, sticky="ew", pady=(10, 8))
         header.columnconfigure(0, weight=1)
         ttk.Label(header, text="История расчетов", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Button(header, text="Переименовать", command=self.rename_history_run).grid(row=0, column=1, padx=(8, 0))
-        ttk.Button(header, text="Удалить", command=self.delete_history_run).grid(row=0, column=2, padx=(8, 0))
+        ttk.Label(header, text="Показывать:", style="Muted.TLabel").grid(row=0, column=1, padx=(8, 4))
+        ttk.Button(
+            header,
+            textvariable=self.history_year_filter_var,
+            command=self.choose_history_years,
+        ).grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(header, text="Переименовать", command=self.rename_history_run).grid(row=0, column=3, padx=(8, 0))
+        ttk.Button(header, text="Удалить", command=self.delete_history_run).grid(row=0, column=4, padx=(8, 0))
         self.history_tree = self._create_tree(
             self.history_tab,
             ["id", "name", "period", "created", "files", "units", "revenue", "net", "unallocated", "status"],
             ["№", "Наименование", "Период", "Дата расчета", "Файлов", "Продажи", "Выручка", "Чистая прибыль", "Нераспределенные", "Статус"],
             row=1,
-            height=10,
+            height=12,
             widths=[60, 300, 210, 160, 80, 110, 150, 150, 160, 100],
         )
         self.history_tree.bind("<<TreeviewSelect>>", self._on_history_selected)
@@ -658,15 +667,15 @@ class OZPriceAnalyzerApp(tk.Tk):
             self.run_var.set("Нет расчетов")
             self._clear_current_view()
         else:
-            target_id = self.current_run_id if self.current_run_id in {run.id for run in runs} else runs[0].id
+            target_id = self.current_run_id if self.current_run_id in {run.id for run in runs} else runs[-1].id
             display = next(key for key, value in self.run_display_to_id.items() if value == target_id)
             self.run_var.set(display)
             self.select_run(target_id)
             if len(values) >= 2:
                 if self.compare_first_var.get() not in values:
-                    self.compare_first_var.set(values[1])
+                    self.compare_first_var.set(values[-2])
                 if self.compare_second_var.get() not in values:
-                    self.compare_second_var.set(values[0])
+                    self.compare_second_var.set(values[-1])
                 self.refresh_comparison()
             else:
                 self.compare_first_var.set(values[0])
@@ -943,21 +952,31 @@ class OZPriceAnalyzerApp(tk.Tk):
     def refresh_history(self, selected_run_id: int | None = None) -> None:
         if selected_run_id is None:
             selection = self.history_tree.selection()
-            selected_run_id = int(selection[0]) if selection else self.current_run_id
+            selected_run_id = int(selection[0]) if selection else None
         self.history_tree.delete(*self.history_tree.get_children())
         runs = self.db.list_runs()
-        self.run_number_by_id = _run_positions(runs)
-        for run in runs:
+        available_years = sorted({year for run in runs for year in _run_years(run)})
+        if self.history_year_filter is not None:
+            self.history_year_filter.intersection_update(available_years)
+            if not self.history_year_filter:
+                self.history_year_filter = None
+        visible_runs = _filter_runs_by_years(runs, self.history_year_filter)
+        self.history_number_by_id = _run_positions(visible_runs)
+        self.history_year_filter_var.set(_year_filter_label(self.history_year_filter))
+        for run in visible_runs:
             self.history_tree.insert(
                 "",
                 "end",
                 iid=str(run.id),
                 values=(
-                    self.run_number_by_id[run.id], run.report_name,
+                    self.history_number_by_id[run.id], run.report_name,
                     _period_text(run.period_start, run.period_end), run.created_at[:16], run.source_count,
                     _number(run.units), _money(run.revenue), _money(run.net_profit), _money(run.unallocated_total), run.status,
                 ),
             )
+        visible_ids = {run.id for run in visible_runs}
+        if selected_run_id not in visible_ids:
+            selected_run_id = visible_runs[0].id if visible_runs else None
         selected_iid = str(selected_run_id) if selected_run_id is not None else ""
         if selected_iid and selected_iid in self.history_tree.get_children():
             self.history_tree.selection_set(selected_iid)
@@ -969,6 +988,19 @@ class OZPriceAnalyzerApp(tk.Tk):
     def _on_history_selected(self, _event=None) -> None:
         selection = self.history_tree.selection()
         self._populate_quality(int(selection[0]) if selection else None, use_current=False)
+
+    def choose_history_years(self) -> None:
+        runs = self.db.list_runs()
+        years = sorted({year for run in runs for year in _run_years(run)})
+        if not years:
+            messagebox.showinfo("История отчетов", "В истории пока нет отчетов", parent=self)
+            return
+        dialog = HistoryYearFilterDialog(self, years, self.history_year_filter)
+        self.wait_window(dialog)
+        if dialog.cancelled:
+            return
+        self.history_year_filter = dialog.selected_years
+        self.refresh_history()
 
     def rename_history_run(self) -> None:
         selection = self.history_tree.selection()
@@ -992,7 +1024,8 @@ class OZPriceAnalyzerApp(tk.Tk):
             return
         self.refresh_runs()
         self.refresh_history(run_id)
-        self.status_var.set(f"Отчет №{self._run_number(run_id)} переименован")
+        number = self.history_number_by_id.get(run_id)
+        self.status_var.set(f"Отчет №{number} переименован" if number else "Отчет переименован")
 
     def delete_history_run(self) -> None:
         selection = self.history_tree.selection()
@@ -1699,6 +1732,77 @@ class OZPriceAnalyzerApp(tk.Tk):
         tree.tag_configure("warning", foreground=palette["warning"])
         tree.tag_configure("total", background=palette["surface_alt"], foreground=palette["text"])
         tree.tag_configure("muted", foreground=palette["muted"])
+
+
+class HistoryYearFilterDialog(tk.Toplevel):
+    def __init__(
+        self,
+        parent: OZPriceAnalyzerApp,
+        years: list[int],
+        selected_years: set[int] | None,
+    ):
+        super().__init__(parent)
+        self.title("Фильтр истории по годам")
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(False, False)
+        self.configure(background=parent.colors["window"])
+        self.cancelled = True
+        self.years = years
+        self.selected_years: set[int] | None = selected_years
+        initially_selected = set(years) if selected_years is None else set(selected_years)
+        self.year_vars = {
+            year: tk.BooleanVar(value=year in initially_selected)
+            for year in years
+        }
+
+        ttk.Label(self, text="Какие годы показывать", style="Section.TLabel").grid(
+            row=0, column=0, sticky="w", padx=22, pady=(20, 2)
+        )
+        ttk.Label(
+            self,
+            text="Выберите один или несколько лет. «Все годы» включает всю историю.",
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, sticky="w", padx=22, pady=(0, 12))
+
+        years_frame = ttk.LabelFrame(self, text="Годы", padding=(14, 10))
+        years_frame.grid(row=2, column=0, sticky="ew", padx=22)
+        for index, year in enumerate(years):
+            ttk.Checkbutton(
+                years_frame,
+                text=str(year),
+                variable=self.year_vars[year],
+            ).grid(row=index // 4, column=index % 4, sticky="w", padx=(0, 24), pady=4)
+
+        selection_buttons = ttk.Frame(self)
+        selection_buttons.grid(row=3, column=0, sticky="w", padx=22, pady=(10, 0))
+        ttk.Button(selection_buttons, text="Все годы", command=lambda: self._set_all(True)).grid(
+            row=0, column=0, padx=(0, 6)
+        )
+        ttk.Button(selection_buttons, text="Снять выбор", command=lambda: self._set_all(False)).grid(
+            row=0, column=1
+        )
+
+        buttons = ttk.Frame(self, padding=(20, 14))
+        buttons.grid(row=4, column=0, sticky="e")
+        ttk.Button(buttons, text="Отмена", command=self.destroy).grid(row=0, column=0, padx=4)
+        ttk.Button(buttons, text="Применить", style="Accent.TButton", command=self._finish).grid(
+            row=0, column=1, padx=4
+        )
+        self.bind("<Escape>", lambda _event: self.destroy())
+
+    def _set_all(self, selected: bool) -> None:
+        for variable in self.year_vars.values():
+            variable.set(selected)
+
+    def _finish(self) -> None:
+        selected = {year for year, variable in self.year_vars.items() if variable.get()}
+        if not selected:
+            messagebox.showerror("Фильтр по годам", "Выберите хотя бы один год", parent=self)
+            return
+        self.selected_years = None if selected == set(self.years) else selected
+        self.cancelled = False
+        self.destroy()
 
 
 class AboutDialog(tk.Toplevel):
@@ -2651,6 +2755,43 @@ def _calculation_period(calculation: RunCalculation) -> str:
 
 def _run_positions(runs) -> dict[int, int]:
     return {run.id: position for position, run in enumerate(runs, start=1)}
+
+
+def _run_years(run) -> set[int]:
+    start_year = _text_year(run.period_start)
+    end_year = _text_year(run.period_end)
+    if start_year is not None or end_year is not None:
+        first = start_year if start_year is not None else end_year
+        last = end_year if end_year is not None else start_year
+        assert first is not None and last is not None
+        lower, upper = sorted((first, last))
+        return set(range(lower, upper + 1))
+    created_year = _text_year(run.created_at)
+    return {created_year} if created_year is not None else set()
+
+
+def _filter_runs_by_years(runs, selected_years: set[int] | None):
+    if selected_years is None:
+        return list(runs)
+    return [run for run in runs if _run_years(run) & selected_years]
+
+
+def _year_filter_label(selected_years: set[int] | None) -> str:
+    if selected_years is None:
+        return "Все годы"
+    years = sorted(selected_years)
+    if len(years) <= 3:
+        return ", ".join(str(year) for year in years)
+    return f"Выбрано лет: {len(years)}"
+
+
+def _text_year(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        return int(value[:4])
+    except (TypeError, ValueError):
+        return None
 
 
 def _duplicate_description(source, run_numbers: dict[int, int] | None = None) -> str:

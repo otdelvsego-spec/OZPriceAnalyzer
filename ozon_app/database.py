@@ -557,9 +557,9 @@ class Database:
                        , report_name
                 FROM runs
                 ORDER BY
-                    COALESCE(period_start, period_end, substr(created_at, 1, 10)) DESC,
-                    COALESCE(period_end, period_start, substr(created_at, 1, 10)) DESC,
-                    id DESC
+                    COALESCE(period_start, period_end, substr(created_at, 1, 10)) ASC,
+                    COALESCE(period_end, period_start, substr(created_at, 1, 10)) ASC,
+                    id ASC
                 """
             ).fetchall()
         return [RunSummary(**dict(row)) for row in rows]

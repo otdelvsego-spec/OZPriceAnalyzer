@@ -8,7 +8,7 @@ from pathlib import Path
 
 from ozon_app.database import Database
 from ozon_app.models import RunCalculation
-from ozon_app.ui import OZPriceAnalyzerApp, _run_positions
+from ozon_app.ui import OZPriceAnalyzerApp, _filter_runs_by_years, _run_positions, _run_years
 
 
 class HistoryManagementTests(unittest.TestCase):
@@ -20,6 +20,26 @@ class HistoryManagementTests(unittest.TestCase):
         self.assertEqual(_run_positions([RunStub(9)]), {9: 1})
         self.assertEqual(_run_positions([RunStub(12), RunStub(9), RunStub(4)]), {12: 1, 9: 2, 4: 3})
         self.assertEqual(_run_positions([RunStub(12), RunStub(4)]), {12: 1, 4: 2})
+
+    def test_history_can_filter_one_or_multiple_years(self) -> None:
+        class RunStub:
+            def __init__(self, run_id: int, start: str | None, end: str | None = None):
+                self.id = run_id
+                self.period_start = start
+                self.period_end = end or start
+                self.created_at = "2028-01-15 12:00:00"
+
+        runs = [
+            RunStub(1, "2025-03-01"),
+            RunStub(2, "2026-04-01"),
+            RunStub(3, "2027-05-01"),
+            RunStub(4, "2025-12-20", "2026-01-10"),
+        ]
+
+        self.assertEqual([run.id for run in _filter_runs_by_years(runs, {2026})], [2, 4])
+        self.assertEqual([run.id for run in _filter_runs_by_years(runs, {2025, 2027})], [1, 3, 4])
+        self.assertEqual([run.id for run in _filter_runs_by_years(runs, None)], [1, 2, 3, 4])
+        self.assertEqual(_run_years(runs[3]), {2025, 2026})
 
     def test_history_selection_requests_quality_for_highlighted_run(self) -> None:
         class SelectedTree:
