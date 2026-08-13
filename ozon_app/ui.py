@@ -199,9 +199,6 @@ class OZPriceAnalyzerApp(tk.Tk):
         ttk.Label(source_header, text="Файлы выбранного расчета", style="Section.TLabel").grid(
             row=0, column=0, sticky="w"
         )
-        ttk.Button(source_header, text="Просмотреть любой XLSX", command=self.browse_xlsx_preview).grid(
-            row=0, column=1, sticky="e"
-        )
         source_columns = ["name", "type", "rows", "amount", "period", "hash"]
         source_headings = ["Файл", "Тип", "Строк", "Сумма", "Период", "SHA-256"]
         self.source_tree = self._create_tree(
@@ -211,22 +208,39 @@ class OZPriceAnalyzerApp(tk.Tk):
 
         controls = ttk.Frame(self.sources_tab, padding=(0, 10, 0, 8))
         controls.grid(row=2, column=0, sticky="ew")
-        ttk.Label(controls, text="Лист:").grid(row=0, column=0, padx=(0, 6))
+        controls.columnconfigure(5, weight=1)
+        ttk.Button(
+            controls,
+            text="Просмотреть любой XLSX",
+            style="Accent.TButton",
+            command=self.browse_xlsx_preview,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=(0, 8))
+        self.clear_preview_button = ttk.Button(
+            controls,
+            text="Очистить просмотр",
+            command=self.clear_xlsx_preview,
+            state="disabled",
+        )
+        self.clear_preview_button.grid(row=0, column=2, columnspan=2, sticky="w")
+        ttk.Label(controls, text="Просмотр выполняется без запуска Excel", style="Muted.TLabel").grid(
+            row=0, column=5, sticky="e", padx=(18, 0)
+        )
+
+        ttk.Label(controls, text="Лист:").grid(row=1, column=0, padx=(0, 6), pady=(10, 0))
         self.sheet_var = tk.StringVar()
         self.sheet_combo = ttk.Combobox(controls, textvariable=self.sheet_var, state="readonly", width=35)
-        self.sheet_combo.grid(row=0, column=1, padx=(0, 18))
+        self.sheet_combo.grid(row=1, column=1, padx=(0, 18), pady=(10, 0))
         self.sheet_combo.bind("<<ComboboxSelected>>", lambda _event: self._load_preview())
-        ttk.Label(controls, text="Поиск в показанных строках:").grid(row=0, column=2, padx=(0, 6))
+        ttk.Label(controls, text="Поиск в показанных строках:").grid(
+            row=1, column=2, padx=(0, 6), pady=(10, 0)
+        )
         self.preview_search_var = tk.StringVar()
         search = ttk.Entry(controls, textvariable=self.preview_search_var, width=35)
-        search.grid(row=0, column=3, padx=(0, 8))
+        search.grid(row=1, column=3, padx=(0, 8), pady=(10, 0))
         search.bind("<KeyRelease>", lambda _event: self._filter_preview())
-        ttk.Label(controls, text="Просмотр выполняется без запуска Excel", style="Muted.TLabel").grid(
-            row=0, column=4, sticky="w", padx=(12, 0)
-        )
         self.preview_file_var = tk.StringVar(value="Файл не выбран")
         ttk.Label(controls, textvariable=self.preview_file_var, style="Muted.TLabel").grid(
-            row=1, column=0, columnspan=5, sticky="w", pady=(8, 0)
+            row=2, column=0, columnspan=6, sticky="w", pady=(8, 0)
         )
         self.preview_container = ttk.Frame(self.sources_tab)
         self.preview_container.grid(row=3, column=0, sticky="nsew")
@@ -711,6 +725,7 @@ class OZPriceAnalyzerApp(tk.Tk):
         self.current_calculation = None
         for tree in (self.overview_tree, self.source_tree, self.breakdown_tree, self.guide_tree, self.scenario_tree, self.quality_tree):
             tree.delete(*tree.get_children())
+        self.clear_xlsx_preview()
         for variable in self.kpi_vars.values():
             variable.set("—")
         for variable in self.scenario_kpi_vars.values():
@@ -785,6 +800,7 @@ class OZPriceAnalyzerApp(tk.Tk):
                 self.preview_path, self.sheet_var.get(), max_rows=max_rows
             )
             self._filter_preview()
+            self.clear_preview_button.configure(state="normal")
         except Exception as exc:
             messagebox.showerror("Просмотр файла", str(exc), parent=self)
 
@@ -809,6 +825,22 @@ class OZPriceAnalyzerApp(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Просмотр файла", str(exc), parent=self)
 
+    def clear_xlsx_preview(self) -> None:
+        self.preview_path = None
+        self.preview_headers = []
+        self.preview_rows = []
+        self.preview_search_var.set("")
+        self.sheet_var.set("")
+        self.sheet_combo["values"] = ()
+        self.preview_file_var.set("Файл не выбран")
+        selection = self.source_tree.selection()
+        if selection:
+            self.source_tree.selection_remove(*selection)
+        if self.preview_tree is not None:
+            self.preview_tree.master.destroy()
+            self.preview_tree = None
+        self.clear_preview_button.configure(state="disabled")
+
     def _filter_preview(self) -> None:
         query = self.preview_search_var.get().casefold().strip()
         rows = self.preview_rows
@@ -820,6 +852,7 @@ class OZPriceAnalyzerApp(tk.Tk):
         if self.preview_tree is not None:
             self.preview_tree.master.destroy()
         if not headers:
+            self.preview_tree = None
             return
         columns = [f"c{index}" for index in range(len(headers))]
         frame = ttk.Frame(self.preview_container)
