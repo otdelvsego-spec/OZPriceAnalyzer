@@ -93,12 +93,30 @@ class ImportSession:
         return warnings
 
 
+@dataclass(slots=True)
+class ImportBatch:
+    sessions: list[ImportSession]
+    unknown_products: list[UnknownProduct]
+
+    @property
+    def sources(self) -> list[ParsedSource]:
+        return [source for session in self.sessions for source in session.sources]
+
+    @property
+    def duplicate_sources(self) -> list[ParsedSource]:
+        return [
+            source
+            for session in self.sessions
+            for source in session.duplicate_sources
+        ]
+
+
 class AppService:
     def __init__(self, base_dir: Path | None = None):
         self.paths = ensure_app_dirs(base_dir)
         self.db = Database(self.paths["database"])
 
-    def prepare_import(self, file_paths: list[str | Path]) -> ImportSession:
+    def prepare_import(self, file_paths: list[str | Path]) -> ImportBatch:
         if not file_paths:
             raise ValueError("Не выбраны исходные файлы")
         sources: list[ParsedSource] = []
@@ -118,9 +136,15 @@ class AppService:
             sources.append(source)
         if not any(source.report_type == REPORT_ACCRUAL for source in sources):
             raise ValueError("Для расчета нужен хотя бы один отчет по начислениям")
+        sessions = split_import_sources(sources)
         products = self.db.product_map(active_only=False)
         unknown = discover_unknown_products(sources, products)
-        return ImportSession(sources=sources, unknown_products=unknown, duplicate_sources=duplicates)
+        duplicate_hashes = {source.file_hash for source in duplicates}
+        for session in sessions:
+            session.duplicate_sources = [
+                source for source in session.sources if source.file_hash in duplicate_hashes
+            ]
+        return ImportBatch(sessions=sessions, unknown_products=unknown)
 
     def replacement_run_ids(self, session: ImportSession) -> list[int]:
         if session.period_start is None or session.period_end is None:
@@ -153,25 +177,60 @@ class AppService:
         replace_run_ids: list[int] | None = None,
         source_period_warnings: list[str] | None = None,
     ) -> RunCalculation:
-        for product in created_products or []:
-            self.db.save_product(product, source="Новый артикул из отчета")
+        return self.complete_import_batch(
+            [session],
+            created_products=created_products,
+            skipped_articles=skipped_articles,
+            replace_run_ids_by_session=[list(replace_run_ids or [])],
+            source_period_warnings_by_session=[list(source_period_warnings or [])],
+        )[0]
+
+    def complete_import_batch(
+        self,
+        sessions: list[ImportSession],
+        created_products: list[Product] | None = None,
+        skipped_articles: set[str] | None = None,
+        replace_run_ids_by_session: list[list[int]] | None = None,
+        source_period_warnings_by_session: list[list[str]] | None = None,
+    ) -> list[RunCalculation]:
+        if not sessions:
+            raise ValueError("Нет подготовленных отчетов для сохранения")
+        replacements = replace_run_ids_by_session or [[] for _session in sessions]
+        warnings = source_period_warnings_by_session or [[] for _session in sessions]
+        if len(replacements) != len(sessions) or len(warnings) != len(sessions):
+            raise ValueError("Нарушена структура пакетного импорта")
+
         tax_rate = float(self.db.get_setting("tax_rate", "0.04"))
         if tax_rate < 0 or tax_rate > 1:
             raise ValueError("Налоговая ставка должна быть от 0 до 100%")
-        calculation = calculate_run(
-            session.sources,
-            self.db.product_map(active_only=True),
-            tax_rate=tax_rate,
-            skipped_articles=skipped_articles,
-        )
-        calculation.source_period_warnings = list(source_period_warnings or [])
-        stored_paths = self._store_source_files(session.sources)
-        calculation.run_id = self.db.save_run(
-            calculation,
-            stored_paths,
-            replace_run_ids=replace_run_ids,
-        )
-        return calculation
+        product_map = self.db.product_map(active_only=True)
+        for product in created_products or []:
+            if product.active:
+                product_map[product.article] = product
+
+        # Calculate every period before changing history. A malformed later month
+        # therefore cannot leave a normally failed batch half-created.
+        calculations: list[RunCalculation] = []
+        for session, session_warnings in zip(sessions, warnings):
+            calculation = calculate_run(
+                session.sources,
+                product_map,
+                tax_rate=tax_rate,
+                skipped_articles=skipped_articles,
+            )
+            calculation.source_period_warnings = list(session_warnings)
+            calculations.append(calculation)
+
+        for product in created_products or []:
+            self.db.save_product(product, source="Новый артикул из отчета")
+        for calculation, replace_run_ids in zip(calculations, replacements):
+            stored_paths = self._store_source_files(calculation.source_files)
+            calculation.run_id = self.db.save_run(
+                calculation,
+                stored_paths,
+                replace_run_ids=replace_run_ids,
+            )
+        return calculations
 
     def _store_source_files(self, sources: list[ParsedSource]) -> dict[str, Path]:
         result: dict[str, Path] = {}
@@ -190,3 +249,100 @@ class AppService:
 
 def _month_list(months: set[tuple[int, int]]) -> str:
     return ", ".join(f"{month:02d}.{year}" for year, month in sorted(months))
+
+
+def split_import_sources(sources: list[ParsedSource]) -> list[ImportSession]:
+    """Create one calculation session per accrual file and match realization by month."""
+    accrual_sources = [source for source in sources if source.report_type == REPORT_ACCRUAL]
+    realization_sources = [
+        source for source in sources if source.report_type == REPORT_REALIZATION
+    ]
+    if not accrual_sources:
+        raise ValueError("Для расчета нужен хотя бы один отчет по начислениям")
+
+    sessions = [ImportSession(sources=[source], unknown_products=[]) for source in accrual_sources]
+    sessions.sort(key=_session_sort_key)
+    accruals_by_month: dict[tuple[int, int], list[ImportSession]] = {}
+    for session in sessions:
+        month = _session_month(session)
+        if month is not None:
+            accruals_by_month.setdefault(month, []).append(session)
+
+    for source in sorted(realization_sources, key=_source_sort_key):
+        month = _source_month(source)
+        matches = accruals_by_month.get(month, []) if month is not None else []
+        if len(matches) == 1:
+            matches[0].sources.append(source)
+            continue
+
+        if len(sessions) == 1:
+            # Preserve the explicit confirmation flow for a single accrual report.
+            # ImportSession.realization_period_warnings() will record the mismatch.
+            sessions[0].sources.append(source)
+            continue
+
+        period = _source_period(source)
+        if month is None:
+            raise ValueError(
+                f"Не удалось определить один календарный месяц отчета по выкупам "
+                f"«{source.path.name}» ({period}). При пакетном импорте невозможно "
+                "надежно выбрать отчет по начислениям. Добавьте файл с однозначным "
+                "периодом или импортируйте этот отчет отдельно."
+            )
+        if not matches:
+            raise ValueError(
+                f"Для отчета по выкупам «{source.path.name}» ({period}) не найден "
+                f"отчет по начислениям за {month[1]:02d}.{month[0]}. "
+                "Добавьте соответствующий отчет по начислениям или исключите этот "
+                "файл из пакетного импорта."
+            )
+        names = ", ".join(f"«{session.sources[0].path.name}»" for session in matches)
+        raise ValueError(
+            f"Отчет по выкупам «{source.path.name}» ({period}) нельзя распределить "
+            f"однозначно: за {month[1]:02d}.{month[0]} выбрано несколько отчетов "
+            f"по начислениям: {names}. Импортируйте их раздельно."
+        )
+
+    return sessions
+
+
+def _session_month(session: ImportSession) -> tuple[int, int] | None:
+    if session.period_start is None or session.period_end is None:
+        return None
+    start = session.period_start
+    end = session.period_end
+    if (start.year, start.month) != (end.year, end.month):
+        return None
+    return start.year, start.month
+
+
+def _source_month(source: ParsedSource) -> tuple[int, int] | None:
+    if source.period_start is None or source.period_end is None:
+        return None
+    start = source.period_start
+    end = source.period_end
+    if (start.year, start.month) != (end.year, end.month):
+        return None
+    return start.year, start.month
+
+
+def _source_period(source: ParsedSource) -> str:
+    if source.period_start is None or source.period_end is None:
+        return "период не определен"
+    return f"{source.period_start:%d.%m.%Y}–{source.period_end:%d.%m.%Y}"
+
+
+def _session_sort_key(session: ImportSession) -> tuple[date, date, str]:
+    return (
+        session.period_start or date.max,
+        session.period_end or date.max,
+        session.sources[0].path.name.casefold(),
+    )
+
+
+def _source_sort_key(source: ParsedSource) -> tuple[date, date, str]:
+    return (
+        source.period_start or date.max,
+        source.period_end or date.max,
+        source.path.name.casefold(),
+    )

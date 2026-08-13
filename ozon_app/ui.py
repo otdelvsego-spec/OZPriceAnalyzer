@@ -28,7 +28,7 @@ from .excel_reader import REPORT_REALIZATION, preview_sheet, workbook_sheet_name
 from .exporter import export_run, suggested_export_name
 from .models import Product, ProductResult, RunCalculation, RunSummary, ScenarioRow, UnknownProduct
 from .ordering import insert_at_group_end
-from .service import AppService, ImportSession
+from .service import AppService, ImportBatch, ImportSession
 from .storage import migrate_storage
 from .theme import apply_theme
 from .trends import TrendPoint, build_trend_points, chart_bounds
@@ -76,7 +76,7 @@ class OZPriceAnalyzerApp(tk.Tk):
         self.trend_points: list[TrendPoint] = []
         self.trend_canvas_points: list[tuple[float, float, TrendPoint]] = []
         self.import_in_progress = False
-        self.import_queue: queue.Queue[tuple[ImportSession | None, Exception | None]] = queue.Queue()
+        self.import_queue: queue.Queue[tuple[ImportBatch | None, Exception | None]] = queue.Queue()
         self.colors = apply_theme(self, self.db.get_setting("theme", "system"))
 
         self.title(f"{APP_TITLE} {APP_VERSION}")
@@ -1927,33 +1927,47 @@ class OZPriceAnalyzerApp(tk.Tk):
 
     def _prepare_import_worker(self, paths: list[str]) -> None:
         try:
-            session = self.service.prepare_import(list(paths))
-            self.import_queue.put((session, None))
+            batch = self.service.prepare_import(list(paths))
+            self.import_queue.put((batch, None))
         except Exception as exc:
             self.import_queue.put((None, exc))
 
     def _poll_import_queue(self) -> None:
         try:
-            session, error = self.import_queue.get_nowait()
+            batch, error = self.import_queue.get_nowait()
         except queue.Empty:
             self.after(100, self._poll_import_queue)
             return
-        self._complete_import_ui(session, error)
+        self._complete_import_ui(batch, error)
 
-    def _complete_import_ui(self, session: ImportSession | None, error: Exception | None) -> None:
+    def _complete_import_ui(self, batch: ImportBatch | None, error: Exception | None) -> None:
         try:
             if error is not None:
                 raise error
-            if session is None:
+            if batch is None or not batch.sessions:
                 raise RuntimeError("Не удалось подготовить импорт")
-            source_period_warnings = session.realization_period_warnings()
-            if source_period_warnings:
-                dialog = RealizationPeriodDialog(self, source_period_warnings)
+            sessions = batch.sessions
+            if any(not session.sources or not session.has_accrual for session in sessions):
+                raise ValueError("Не найден отчет по начислениям")
+
+            warnings_by_session = [session.realization_period_warnings() for session in sessions]
+            all_period_warnings = [
+                f"{_session_period(session)}: {warning}"
+                for session, warnings in zip(sessions, warnings_by_session)
+                for warning in warnings
+            ]
+            if all_period_warnings:
+                dialog = RealizationPeriodDialog(self, all_period_warnings)
                 self.wait_window(dialog)
                 if not dialog.confirmed:
                     return
-            replace_run_ids = self.service.replacement_run_ids(session)
-            if replace_run_ids:
+
+            replacements_by_session = [
+                self.service.replacement_run_ids(session) for session in sessions
+            ]
+            for session, replace_run_ids in zip(sessions, replacements_by_session):
+                if not replace_run_ids:
+                    continue
                 runs_by_id = {run.id: run for run in self.db.list_runs()}
                 dialog = ReplacePeriodDialog(
                     self,
@@ -1964,46 +1978,66 @@ class OZPriceAnalyzerApp(tk.Tk):
                 self.wait_window(dialog)
                 if not dialog.confirmed:
                     return
-            if not session.sources or not session.has_accrual:
-                raise ValueError("Не найден отчет по начислениям")
-            if not session.has_realization and self.db.get_setting("warn_without_realization", "1") == "1":
+
+            sessions_without_realization = [
+                session for session in sessions if not session.has_realization
+            ]
+            if (
+                sessions_without_realization
+                and self.db.get_setting("warn_without_realization", "1") == "1"
+            ):
+                periods = "\n".join(
+                    f"• {_session_period(session)}" for session in sessions_without_realization
+                )
                 if not messagebox.askyesno(
                     "Нет отчета о выкупленных товарах",
-                    "Продолжить без RealizationReportCIS? Если такие продажи были, выручка будет неполной.",
+                    "Для следующих периодов не выбран RealizationReportCIS:\n"
+                    f"{periods}\n\n"
+                    "Продолжить без отчета по выкупам? Если такие продажи были, "
+                    "выручка этих отчетов будет неполной.",
                     parent=self,
                 ):
                     return
-            session.unknown_products = discover_unknown_products(session.sources, self.db.product_map(active_only=False))
+
+            batch.unknown_products = discover_unknown_products(
+                batch.sources,
+                self.db.product_map(active_only=False),
+            )
             created: list[Product] = []
             skipped: set[str] = set()
-            if session.unknown_products:
-                dialog = UnknownProductsDialog(self, session.unknown_products)
+            if batch.unknown_products:
+                dialog = UnknownProductsDialog(self, batch.unknown_products)
                 self.wait_window(dialog)
                 if dialog.cancelled:
                     return
                 created = dialog.created_products
                 skipped = dialog.skipped_articles
-            calculation = self.service.complete_import(
-                session,
+
+            calculations = self.service.complete_import_batch(
+                sessions,
                 created_products=created,
                 skipped_articles=skipped,
-                replace_run_ids=replace_run_ids,
-                source_period_warnings=source_period_warnings,
+                replace_run_ids_by_session=replacements_by_session,
+                source_period_warnings_by_session=warnings_by_session,
             )
-            self.current_run_id = calculation.run_id
+
+            self.current_run_id = calculations[-1].run_id
             self.refresh_all()
-            result_intro = (
-                "Отчет за период заменен новым.\n"
-                if replace_run_ids
-                else f"Создан отчет №{self._run_number(calculation.run_id)}.\n"
+            updated_count = sum(bool(run_ids) for run_ids in replacements_by_session)
+            created_count = len(calculations) - updated_count
+            details = "\n".join(
+                f"• {_calculation_period(calculation)} — "
+                f"{_realization_file_count(calculation)}; "
+                f"выручка {_money(calculation.realization_revenue)}"
+                for calculation in calculations
             )
             result_message = (
-                result_intro
-                + f"Период: {_calculation_period(calculation)}\n"
-                + f"Выручка по выкупленным товарам: {_money(calculation.realization_revenue)}"
+                f"Обработано отчетов по начислениям: {len(calculations)}.\n"
+                f"Создано новых отчетов: {created_count}. Обновлено: {updated_count}.\n\n"
+                f"{details}"
             )
             messagebox.showinfo(
-                "Отчет обновлен" if replace_run_ids else "Расчет готов",
+                "Пакет отчетов обработан" if len(calculations) > 1 else "Расчет готов",
                 result_message,
                 parent=self,
             )
@@ -2077,7 +2111,7 @@ class RealizationPeriodDialog(tk.Toplevel):
         ttk.Label(
             self,
             text=(
-                "Если продолжить, выручка из этого RealizationReportCIS войдет в расчет, "
+                "Если продолжить, выручка из указанных RealizationReportCIS войдет в расчет, "
                 "а расхождение будет записано в «Контроль качества»."
             ),
             justify="left",
@@ -3201,6 +3235,20 @@ def _russian_position_word(count: int) -> str:
     if count % 10 in {2, 3, 4} and count % 100 not in {12, 13, 14}:
         return "позиции"
     return "позиций"
+
+
+def _realization_file_count(calculation: RunCalculation) -> str:
+    count = sum(
+        source.report_type == REPORT_REALIZATION
+        for source in calculation.source_files
+    )
+    if count % 10 == 1 and count % 100 != 11:
+        word = "файл выкупов"
+    elif count % 10 in {2, 3, 4} and count % 100 not in {12, 13, 14}:
+        word = "файла выкупов"
+    else:
+        word = "файлов выкупов"
+    return f"{count} {word}"
 
 
 def _set_category_choices(combo: ttk.Combobox, variable: tk.StringVar, categories) -> None:
