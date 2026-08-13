@@ -247,6 +247,8 @@ def _parse_realization(ws, header_row: int, parsed: ParsedSource) -> None:
     if not all(required_positions):
         raise ReportFormatError(f"В отчете о выкупленных товарах изменились заголовки: {parsed.path.name}")
 
+    parsed.period_start, parsed.period_end = _realization_period(ws, header_row)
+
     detail_total = 0.0
     for row_number in range(header_row + 1, max_row + 1):
         raw_article = display_text(ws.cell(row_number, article_column).value)
@@ -284,6 +286,24 @@ def _parse_realization(ws, header_row: int, parsed: ParsedSource) -> None:
             f"Поврежден отчет {parsed.path.name}: сумма строк {detail_total:,.2f} не совпадает "
             f"с итогом отчета {stated_total:,.2f}."
         )
+
+
+def _realization_period(ws, header_row: int) -> tuple[date | None, date | None]:
+    period_pattern = re.compile(
+        r"за\s+период\s+с\s+(\d{1,2}\.\d{1,2}\.\d{4})\s+по\s+(\d{1,2}\.\d{1,2}\.\d{4})",
+        flags=re.IGNORECASE,
+    )
+    for row_number in range(1, header_row):
+        for column_number in range(1, _sheet_max_column(ws) + 1):
+            value = display_text(ws.cell(row_number, column_number).value)
+            match = period_pattern.search(value)
+            if not match:
+                continue
+            start = as_date(match.group(1))
+            end = as_date(match.group(2))
+            if start is not None and end is not None and start <= end:
+                return start, end
+    return None, None
 
 
 def _is_realization_detail(ws, row_number: int, raw_article: str, quantity_column: int, total_column: int) -> bool:

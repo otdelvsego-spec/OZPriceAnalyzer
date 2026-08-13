@@ -579,6 +579,12 @@ class Database:
                     "INSERT INTO quality_events(run_id, severity, event_type, message) VALUES (?, 'Предупреждение', 'Нет отчета о выкупах', ?)",
                     (run_id, "Расчет выполнен без RealizationReportCIS; выручка может быть неполной"),
                 )
+            for message in calculation.source_period_warnings:
+                db.execute(
+                    "INSERT INTO quality_events(run_id, severity, event_type, message) "
+                    "VALUES (?, 'Предупреждение', 'Несовпадение периодов', ?)",
+                    (run_id, message),
+                )
             hash_counts = Counter(source.file_hash for source in calculation.source_files)
             run_names = {
                 int(row["id"]): str(row["report_name"])
@@ -705,6 +711,11 @@ class Database:
             for row in events
             if row["event_type"] == "Конфликт SKU"
         }
+        source_period_warnings = [
+            str(row["message"])
+            for row in events
+            if row["event_type"] == "Несовпадение периодов"
+        ]
         return RunCalculation(
             run_id=run_id,
             period_start=_parse_date(run["period_start"]),
@@ -720,6 +731,7 @@ class Database:
             already_accrued_realization_rows=int(run["already_accrued_realization_rows"]),
             realization_revenue=float(run["realization_revenue"]),
             realization_units=float(run["realization_units"]),
+            source_period_warnings=source_period_warnings,
         )
 
     def list_source_files(self, run_id: int) -> list[dict[str, object]]:

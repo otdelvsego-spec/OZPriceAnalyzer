@@ -8,6 +8,7 @@ from pathlib import Path
 from ozon_app.calculator import calculate_run, discover_unknown_products
 from ozon_app.database import Database
 from ozon_app.excel_reader import REPORT_REALIZATION, ReportFormatError, parse_report
+from ozon_app.service import ImportSession
 
 
 @unittest.skipUnless(os.environ.get("OZON_REPORTS_DIR"), "OZON_REPORTS_DIR не задан")
@@ -20,8 +21,14 @@ class UploadedReportRegressionTests(unittest.TestCase):
         july = parse_report(self.root / "Отчет по начислениям_01.07.2026-29.07.2026.xlsx")
         valid = parse_report(self.root / "RealizationReportCIS-12439885000000.xlsx")
         self.assertEqual(valid.report_type, REPORT_REALIZATION)
+        self.assertEqual(valid.period_start.isoformat(), "2026-06-01")
+        self.assertEqual(valid.period_end.isoformat(), "2026-06-15")
         self.assertEqual(sum(row.quantity for row in valid.realization_rows), 8)
         self.assertAlmostEqual(sum(row.amount for row in valid.realization_rows), 1_613.68)
+        mismatch = ImportSession(sources=[july, valid], unknown_products=[]).realization_period_warnings()
+        self.assertEqual(len(mismatch), 1)
+        self.assertIn("01.06.2026–15.06.2026", mismatch[0])
+        self.assertIn("07.2026", mismatch[0])
 
         with tempfile.TemporaryDirectory() as directory:
             database = Database(Path(directory) / "test.sqlite3")

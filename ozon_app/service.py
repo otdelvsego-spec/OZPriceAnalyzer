@@ -47,6 +47,51 @@ class ImportSession:
         ]
         return max(dates) if dates else None
 
+    def realization_period_warnings(self) -> list[str]:
+        realization_sources = [
+            source for source in self.sources if source.report_type == REPORT_REALIZATION
+        ]
+        if not realization_sources:
+            return []
+
+        accrual_months = {
+            (row.accrual_date.year, row.accrual_date.month)
+            for source in self.sources
+            for row in source.accrual_rows
+            if row.accrual_date is not None
+        }
+        if not accrual_months:
+            return [
+                "В отчете по начислениям не удалось определить месяц, "
+                "поэтому совместимость периодов не проверена."
+            ]
+
+        expected = _month_list(accrual_months)
+        warnings: list[str] = []
+        for source in realization_sources:
+            if source.period_start is None or source.period_end is None:
+                warnings.append(
+                    f"«{source.path.name}»: период выкупов не удалось определить; "
+                    f"ожидаемый месяц: {expected}."
+                )
+                continue
+            start_month = (source.period_start.year, source.period_start.month)
+            end_month = (source.period_end.year, source.period_end.month)
+            actual_period = (
+                f"{source.period_start:%d.%m.%Y}–{source.period_end:%d.%m.%Y}"
+            )
+            if start_month != end_month:
+                warnings.append(
+                    f"«{source.path.name}»: период {actual_period} охватывает "
+                    f"несколько месяцев; ожидаемый месяц: {expected}."
+                )
+            elif start_month not in accrual_months:
+                warnings.append(
+                    f"«{source.path.name}»: период выкупов {actual_period} не относится "
+                    f"к месяцу отчета по начислениям ({expected})."
+                )
+        return warnings
+
 
 class AppService:
     def __init__(self, base_dir: Path | None = None):
@@ -106,6 +151,7 @@ class AppService:
         created_products: list[Product] | None = None,
         skipped_articles: set[str] | None = None,
         replace_run_ids: list[int] | None = None,
+        source_period_warnings: list[str] | None = None,
     ) -> RunCalculation:
         for product in created_products or []:
             self.db.save_product(product, source="Новый артикул из отчета")
@@ -118,6 +164,7 @@ class AppService:
             tax_rate=tax_rate,
             skipped_articles=skipped_articles,
         )
+        calculation.source_period_warnings = list(source_period_warnings or [])
         stored_paths = self._store_source_files(session.sources)
         calculation.run_id = self.db.save_run(
             calculation,
@@ -139,3 +186,7 @@ class AppService:
     def latest_run_id(self) -> int | None:
         runs = self.db.list_runs()
         return runs[-1].id if runs else None
+
+
+def _month_list(months: set[tuple[int, int]]) -> str:
+    return ", ".join(f"{month:02d}.{year}" for year, month in sorted(months))

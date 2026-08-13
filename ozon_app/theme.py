@@ -73,6 +73,7 @@ def apply_theme(root: tk.Misc, preference: str) -> dict[str, str]:
     style.configure("TLabel", background=colors["window"], foreground=colors["text"])
     style.configure("Card.TLabel", background=colors["surface"], foreground=colors["text"])
     style.configure("Muted.TLabel", background=colors["window"], foreground=colors["muted"])
+    style.configure("Warning.TLabel", background=colors["window"], foreground=colors["warning"])
     style.configure("CardMuted.TLabel", background=colors["surface"], foreground=colors["muted"])
     style.configure("Title.TLabel", font=title_font, background=colors["window"], foreground=colors["text"])
     style.configure("Section.TLabel", font=("Segoe UI Semibold", 13), background=colors["window"], foreground=colors["text"])
@@ -171,4 +172,3 @@ def apply_theme(root: tk.Misc, preference: str) -> dict[str, str]:
     style.configure("Horizontal.TScrollbar", background=colors["surface_alt"], troughcolor=colors["window"])
     style.configure("Vertical.TScrollbar", background=colors["surface_alt"], troughcolor=colors["window"])
     return colors
-

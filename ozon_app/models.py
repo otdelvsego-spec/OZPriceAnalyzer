@@ -165,6 +165,7 @@ class RunCalculation:
     already_accrued_realization_rows: int = 0
     realization_revenue: float = 0.0
     realization_units: float = 0.0
+    source_period_warnings: list[str] = field(default_factory=list)
 
     def totals(self) -> dict[str, float]:
         return {

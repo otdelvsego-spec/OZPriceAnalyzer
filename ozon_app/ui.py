@@ -1632,6 +1632,12 @@ class OZPriceAnalyzerApp(tk.Tk):
                 raise error
             if session is None:
                 raise RuntimeError("Не удалось подготовить импорт")
+            source_period_warnings = session.realization_period_warnings()
+            if source_period_warnings:
+                dialog = RealizationPeriodDialog(self, source_period_warnings)
+                self.wait_window(dialog)
+                if not dialog.confirmed:
+                    return
             replace_run_ids = self.service.replacement_run_ids(session)
             if replace_run_ids:
                 runs_by_id = {run.id: run for run in self.db.list_runs()}
@@ -1668,6 +1674,7 @@ class OZPriceAnalyzerApp(tk.Tk):
                 created_products=created,
                 skipped_articles=skipped,
                 replace_run_ids=replace_run_ids,
+                source_period_warnings=source_period_warnings,
             )
             self.current_run_id = calculation.run_id
             self.refresh_all()
@@ -1720,6 +1727,66 @@ class OZPriceAnalyzerApp(tk.Tk):
         tree.tag_configure("warning", foreground=palette["warning"])
         tree.tag_configure("total", background=palette["surface_alt"], foreground=palette["text"])
         tree.tag_configure("muted", foreground=palette["muted"])
+
+
+class RealizationPeriodDialog(tk.Toplevel):
+    def __init__(self, parent: OZPriceAnalyzerApp, warnings: list[str]):
+        super().__init__(parent)
+        self.title("Периоды отчетов не совпадают")
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(False, False)
+        self.configure(background=parent.colors["window"])
+        self.confirmed = False
+
+        ttk.Label(
+            self,
+            text="Проверьте период отчета о выкупленных товарах",
+            style="Section.TLabel",
+        ).grid(row=0, column=0, sticky="w", padx=24, pady=(22, 4))
+        ttk.Label(
+            self,
+            text=(
+                "Отчет по выкупам должен относиться к тому же календарному месяцу "
+                "и году, что и отчет по начислениям. Найдены расхождения:"
+            ),
+            justify="left",
+            wraplength=730,
+        ).grid(row=1, column=0, sticky="w", padx=24, pady=(0, 10))
+        ttk.Label(
+            self,
+            text="\n".join(f"• {message}" for message in warnings),
+            justify="left",
+            wraplength=730,
+            style="Warning.TLabel",
+        ).grid(row=2, column=0, sticky="w", padx=24, pady=(0, 12))
+        ttk.Label(
+            self,
+            text=(
+                "Если продолжить, выручка из этого RealizationReportCIS войдет в расчет, "
+                "а расхождение будет записано в «Контроль качества»."
+            ),
+            justify="left",
+            wraplength=730,
+            style="Muted.TLabel",
+        ).grid(row=3, column=0, sticky="w", padx=24, pady=(0, 18))
+
+        buttons = ttk.Frame(self)
+        buttons.grid(row=4, column=0, sticky="e", padx=20, pady=(0, 20))
+        ttk.Button(buttons, text="Отменить импорт", command=self.destroy).grid(
+            row=0, column=0, padx=4
+        )
+        ttk.Button(
+            buttons,
+            text="Продолжить с несовпадающим периодом",
+            style="Accent.TButton",
+            command=self._confirm,
+        ).grid(row=0, column=1, padx=4)
+        self.bind("<Escape>", lambda _event: self.destroy())
+
+    def _confirm(self) -> None:
+        self.confirmed = True
+        self.destroy()
 
 
 class ReplacePeriodDialog(tk.Toplevel):
