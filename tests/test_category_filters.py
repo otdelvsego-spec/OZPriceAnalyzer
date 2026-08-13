@@ -11,6 +11,7 @@ from ozon_app.ui import (
     CATEGORY_ALL,
     filter_product_results,
     filter_scenario_rows,
+    summarize_category,
 )
 
 
@@ -76,6 +77,27 @@ class CategoryFilterTests(unittest.TestCase):
         )
         self.assertEqual(by_profit[0].article, "B-20")
         self.assertEqual(by_profit[-1].article, "A-30")
+
+    def test_category_summary_uses_all_products_in_category_only(self) -> None:
+        summary = summarize_category(self.results, 0.04, "Горшки")
+        self.assertEqual(summary["product_count"], 1)
+        self.assertEqual(summary["units"], 2)
+        self.assertEqual(summary["revenue"], 500)
+        self.assertEqual(summary["cost_sold"], 200)
+        self.assertEqual(summary["financial_result"], 300)
+        self.assertEqual(summary["tax"], 20)
+        self.assertEqual(summary["net_profit"], 80)
+        self.assertAlmostEqual(summary["profitability"], 0.4)
+
+    def test_all_categories_summary_excludes_any_external_unallocated_amount(self) -> None:
+        summary = summarize_category(self.results, 0.04, CATEGORY_ALL)
+        self.assertEqual(summary["product_count"], 3)
+        self.assertEqual(summary["units"], 8)
+        self.assertEqual(summary["revenue"], 1500)
+        self.assertEqual(summary["cost_sold"], 480)
+        self.assertEqual(summary["financial_result"], 950)
+        self.assertEqual(summary["net_profit"], 410)
+        self.assertAlmostEqual(summary["profitability"], 410 / 480)
 
     def test_category_is_persistent_and_catalog_can_be_cleared(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

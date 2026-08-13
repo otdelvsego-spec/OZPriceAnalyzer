@@ -166,6 +166,9 @@ class OZPriceAnalyzerApp(tk.Tk):
         self.kpi_frame.grid(row=1, column=0, sticky="ew", pady=(0, 12))
         for column in range(6):
             self.kpi_frame.columnconfigure(column, weight=1)
+        ttk.Label(self.kpi_frame, text="Итоги по отчету", style="Muted.TLabel").grid(
+            row=0, column=0, columnspan=6, sticky="w", pady=(0, 6)
+        )
         self.kpi_vars: dict[str, tk.StringVar] = {}
         cards = [
             ("revenue", "Выручка"),
@@ -178,10 +181,48 @@ class OZPriceAnalyzerApp(tk.Tk):
         for index, (key, title) in enumerate(cards):
             self.kpi_vars[key] = tk.StringVar(value="—")
             card = ttk.Frame(self.kpi_frame, style="Card.TFrame", padding=(16, 14))
-            card.grid(row=0, column=index, sticky="nsew", padx=(0 if index == 0 else 5, 0 if index == 5 else 5))
+            card.grid(row=1, column=index, sticky="nsew", padx=(0 if index == 0 else 5, 0 if index == 5 else 5))
             ttk.Label(card, text=title, style="CardMuted.TLabel").grid(row=0, column=0, sticky="w")
             ttk.Label(card, textvariable=self.kpi_vars[key], style="Kpi.TLabel").grid(
                 row=1, column=0, sticky="w", pady=(5, 0)
+            )
+
+        category_header = ttk.Frame(self.kpi_frame)
+        category_header.grid(row=2, column=0, columnspan=6, sticky="ew", pady=(14, 6))
+        category_header.columnconfigure(0, weight=1)
+        self.category_summary_title_var = tk.StringVar(value="Итоги по товарам выбранной категории")
+        ttk.Label(
+            category_header,
+            textvariable=self.category_summary_title_var,
+            style="Section.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            category_header,
+            text="Нераспределенные доходы / расходы сюда не включаются",
+            style="Muted.TLabel",
+        ).grid(row=0, column=1, sticky="e")
+
+        self.category_kpi_vars: dict[str, tk.StringVar] = {}
+        category_cards = [
+            ("revenue", "Выручка"),
+            ("net_profit", "Чистая прибыль"),
+            ("profitability", "Доходность"),
+            ("units", "Продажи, шт."),
+            ("cost_sold", "С/с проданного"),
+            ("financial_result", "Финрезультат Ozon"),
+        ]
+        for index, (key, title) in enumerate(category_cards):
+            self.category_kpi_vars[key] = tk.StringVar(value="—")
+            card = ttk.Frame(self.kpi_frame, style="Card.TFrame", padding=(16, 12))
+            card.grid(
+                row=3,
+                column=index,
+                sticky="nsew",
+                padx=(0 if index == 0 else 5, 0 if index == 5 else 5),
+            )
+            ttk.Label(card, text=title, style="CardMuted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(card, textvariable=self.category_kpi_vars[key], style="Kpi.TLabel").grid(
+                row=1, column=0, sticky="w", pady=(4, 0)
             )
 
         filters = ttk.Frame(self.overview_tab)
@@ -828,6 +869,9 @@ class OZPriceAnalyzerApp(tk.Tk):
         self.clear_xlsx_preview()
         for variable in self.kpi_vars.values():
             variable.set("—")
+        for variable in self.category_kpi_vars.values():
+            variable.set("—")
+        self.category_summary_title_var.set("Итоги по товарам выбранной категории")
         for variable in self.scenario_kpi_vars.values():
             variable.set("—")
         self.overview_count_var.set("")
@@ -850,6 +894,24 @@ class OZPriceAnalyzerApp(tk.Tk):
             self.overview_category_var,
             (result.category for result in calculation.products),
         )
+        selected_category = self.overview_category_var.get()
+        category_totals = summarize_category(
+            calculation.products,
+            calculation.tax_rate,
+            selected_category,
+        )
+        category_name = "Все товары" if selected_category == CATEGORY_ALL else selected_category
+        position_word = _russian_position_word(int(category_totals["product_count"]))
+        self.category_summary_title_var.set(
+            f"Итоги по категории: {category_name} · "
+            f"{int(category_totals['product_count'])} {position_word}"
+        )
+        self.category_kpi_vars["revenue"].set(_money(category_totals["revenue"]))
+        self.category_kpi_vars["net_profit"].set(_money(category_totals["net_profit"]))
+        self.category_kpi_vars["profitability"].set(_percent(category_totals["profitability"]))
+        self.category_kpi_vars["units"].set(_number(category_totals["units"]))
+        self.category_kpi_vars["cost_sold"].set(_money(category_totals["cost_sold"]))
+        self.category_kpi_vars["financial_result"].set(_money(category_totals["financial_result"]))
         visible = filter_product_results(
             calculation.products,
             calculation.tax_rate,
@@ -3060,6 +3122,32 @@ def filter_product_results(
     return _sort_rows(visible, metrics.get(sort_metric), descending)
 
 
+def summarize_category(
+    rows: list[ProductResult],
+    tax_rate: float,
+    category: str = CATEGORY_ALL,
+) -> dict[str, float | int]:
+    """Aggregate product-only KPIs for one category; unallocated rows are not inputs."""
+    selected = [
+        row
+        for row in rows
+        if category == CATEGORY_ALL or _category_label(row.category) == category
+    ]
+    revenue = sum(row.revenue_including_points for row in selected)
+    net_profit = sum(row.net_profit(tax_rate) for row in selected)
+    cost_sold = sum(row.cost_sold for row in selected)
+    return {
+        "product_count": len(selected),
+        "units": sum(row.units for row in selected),
+        "revenue": revenue,
+        "cost_sold": cost_sold,
+        "tax": sum(row.tax(tax_rate) for row in selected),
+        "financial_result": sum(row.financial_result for row in selected),
+        "net_profit": net_profit,
+        "profitability": net_profit / cost_sold if cost_sold else 0.0,
+    }
+
+
 def filter_scenario_rows(
     rows: list[ScenarioRow],
     *,
@@ -3105,6 +3193,14 @@ def _sort_rows(rows, metric, descending: bool):
 
 def _category_label(value: str) -> str:
     return value.strip() or CATEGORY_EMPTY
+
+
+def _russian_position_word(count: int) -> str:
+    if count % 10 == 1 and count % 100 != 11:
+        return "позиция"
+    if count % 10 in {2, 3, 4} and count % 100 not in {12, 13, 14}:
+        return "позиции"
+    return "позиций"
 
 
 def _set_category_choices(combo: ttk.Combobox, variable: tk.StringVar, categories) -> None:
