@@ -7,11 +7,12 @@ import sys
 import threading
 import tkinter as tk
 import webbrowser
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from .backup import create_backup, inspect_backup, restore_backup, suggested_backup_name
+from .aggregation import aggregate_calculations
 from .calculator import calculate_scenario, discover_unknown_products
 from .comparison import ComparisonMetric, compare_calculations
 from .costs import (
@@ -25,7 +26,7 @@ from .costs import (
 from .config import APP_TITLE, APP_VERSION, save_storage_location
 from .database import Database
 from .excel_reader import REPORT_REALIZATION, preview_sheet, workbook_sheet_names
-from .exporter import export_run, suggested_export_name
+from .exporter import export_calculation, export_run, suggested_export_name
 from .models import Product, ProductResult, RunCalculation, RunSummary, ScenarioRow, UnknownProduct
 from .ordering import insert_at_group_end
 from .service import AppService, ImportBatch, ImportSession
@@ -63,6 +64,11 @@ class OZPriceAnalyzerApp(tk.Tk):
         self.db = self.service.db
         self.current_run_id: int | None = None
         self.current_calculation: RunCalculation | None = None
+        self.overview_calculation: RunCalculation | None = None
+        self.overview_run_ids: set[int] = set()
+        self.overview_selection_explicit = False
+        self.overview_runs: list[RunSummary] = []
+        self.overview_file_count = 0
         self.run_display_to_id: dict[str, int] = {}
         self.run_number_by_id: dict[int, int] = {}
         self.history_number_by_id: dict[int, int] = {}
@@ -159,14 +165,35 @@ class OZPriceAnalyzerApp(tk.Tk):
     def _build_overview_tab(self) -> None:
         self.overview_tab.columnconfigure(0, weight=1)
         self.overview_tab.rowconfigure(3, weight=1)
-        ttk.Label(self.overview_tab, text="Итоговый отчет", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w", pady=(10, 8)
+        overview_header = ttk.Frame(self.overview_tab)
+        overview_header.grid(row=0, column=0, sticky="ew", pady=(10, 8))
+        overview_header.columnconfigure(1, weight=1)
+        ttk.Label(overview_header, text="Итоговый отчет", style="Section.TLabel").grid(
+            row=0, column=0, sticky="w"
         )
+        self.overview_scope_var = tk.StringVar(value="Текущий отчет")
+        ttk.Label(
+            overview_header,
+            textvariable=self.overview_scope_var,
+            style="Muted.TLabel",
+        ).grid(row=0, column=1, sticky="e", padx=(20, 12))
+        ttk.Button(
+            overview_header,
+            text="Выбрать отчеты…",
+            style="Accent.TButton",
+            command=self.choose_overview_reports,
+        ).grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(
+            overview_header,
+            text="Только текущий",
+            command=self.use_current_report_in_overview,
+        ).grid(row=0, column=3)
         self.kpi_frame = ttk.Frame(self.overview_tab)
         self.kpi_frame.grid(row=1, column=0, sticky="ew", pady=(0, 12))
         for column in range(6):
             self.kpi_frame.columnconfigure(column, weight=1)
-        ttk.Label(self.kpi_frame, text="Итоги по отчету", style="Muted.TLabel").grid(
+        self.overview_totals_title_var = tk.StringVar(value="Итоги по отчету")
+        ttk.Label(self.kpi_frame, textvariable=self.overview_totals_title_var, style="Muted.TLabel").grid(
             row=0, column=0, columnspan=6, sticky="w", pady=(0, 6)
         )
         self.kpi_vars: dict[str, tk.StringVar] = {}
@@ -800,6 +827,24 @@ class OZPriceAnalyzerApp(tk.Tk):
 
     def refresh_runs(self) -> None:
         runs = self.db.list_runs()
+        previous_runs = {run.id: run for run in self.overview_runs}
+        missing_periods = {
+            (previous_runs[run_id].period_start, previous_runs[run_id].period_end)
+            for run_id in self.overview_run_ids
+            if run_id in previous_runs and run_id not in {item.id for item in runs}
+        }
+        self.overview_runs = runs
+        valid_ids = {run.id for run in runs}
+        self.overview_run_ids.intersection_update(valid_ids)
+        for period in missing_periods:
+            replacements = [
+                run.id for run in runs
+                if (run.period_start, run.period_end) == period
+            ]
+            if replacements:
+                self.overview_run_ids.add(replacements[-1])
+        if self.overview_selection_explicit and not self.overview_run_ids:
+            self.overview_selection_explicit = False
         self.run_display_to_id.clear()
         self.run_number_by_id = _run_positions(runs)
         values: list[str] = []
@@ -835,15 +880,18 @@ class OZPriceAnalyzerApp(tk.Tk):
     def select_run(self, run_id: int) -> None:
         self.current_run_id = run_id
         self.current_calculation = self.db.load_calculation(run_id)
-        self._populate_overview()
+        if not self.overview_selection_explicit:
+            self.overview_run_ids = {run_id}
+        self._refresh_overview_calculation()
         self._populate_sources()
         self._populate_breakdown()
         self._populate_guide()
         self._populate_scenario()
         self._populate_quality()
-        self.status_var.set(
-            f"Открыт отчет №{self._run_number(run_id)}: {_calculation_period(self.current_calculation)}"
-        )
+        status = f"Открыт отчет №{self._run_number(run_id)}: {_calculation_period(self.current_calculation)}"
+        if self.overview_selection_explicit:
+            status += f" · в обзоре отчетов: {len(self.overview_run_ids)}"
+        self.status_var.set(status)
 
     def _on_run_selected(self, _event=None) -> None:
         run_id = self.run_display_to_id.get(self.run_var.get())
@@ -864,6 +912,10 @@ class OZPriceAnalyzerApp(tk.Tk):
     def _clear_current_view(self) -> None:
         self.current_run_id = None
         self.current_calculation = None
+        self.overview_calculation = None
+        self.overview_run_ids.clear()
+        self.overview_selection_explicit = False
+        self.overview_file_count = 0
         for tree in (self.overview_tree, self.source_tree, self.breakdown_tree, self.guide_tree, self.scenario_tree, self.quality_tree):
             tree.delete(*tree.get_children())
         self.clear_xlsx_preview()
@@ -872,13 +924,15 @@ class OZPriceAnalyzerApp(tk.Tk):
         for variable in self.category_kpi_vars.values():
             variable.set("—")
         self.category_summary_title_var.set("Итоги по товарам выбранной категории")
+        self.overview_scope_var.set("Нет выбранных отчетов")
+        self.overview_totals_title_var.set("Итоги по отчету")
         for variable in self.scenario_kpi_vars.values():
             variable.set("—")
         self.overview_count_var.set("")
         self.scenario_count_var.set("")
 
     def _populate_overview(self) -> None:
-        calculation = self.current_calculation
+        calculation = self.overview_calculation
         if calculation is None:
             return
         totals = calculation.totals()
@@ -888,7 +942,7 @@ class OZPriceAnalyzerApp(tk.Tk):
         self.kpi_vars["profitability"].set(_percent(totals["net_profit"] / cost if cost else 0))
         self.kpi_vars["units"].set(_number(totals["units"]))
         self.kpi_vars["unallocated"].set(_money(totals["unallocated"]))
-        self.kpi_vars["files"].set(str(len(self.db.list_source_files(calculation.run_id or 0))))
+        self.kpi_vars["files"].set(str(self.overview_file_count))
         _set_category_choices(
             self.overview_category_combo,
             self.overview_category_var,
@@ -927,6 +981,70 @@ class OZPriceAnalyzerApp(tk.Tk):
             self.overview_tree.insert("", "end", iid=result.article, values=values, tags=(tag,))
         self.overview_count_var.set(f"Показано: {len(visible)} из {len(calculation.products)}")
         self._configure_value_tags(self.overview_tree)
+
+    def choose_overview_reports(self) -> None:
+        runs = self.db.list_runs()
+        if not runs:
+            messagebox.showinfo("Период обзора", "В истории пока нет отчетов", parent=self)
+            return
+        selected = self.overview_run_ids or ({self.current_run_id} if self.current_run_id else set())
+        dialog = OverviewReportSelectionDialog(self, runs, selected)
+        self.wait_window(dialog)
+        if not dialog.confirmed:
+            return
+        self.overview_run_ids = set(dialog.selected_run_ids)
+        self.overview_selection_explicit = True
+        self._refresh_overview_calculation()
+        self.status_var.set(
+            f"Обзор сформирован по {len(self.overview_run_ids)} отчетам: "
+            f"{_calculation_period(self.overview_calculation)}"
+        )
+
+    def use_current_report_in_overview(self) -> None:
+        if self.current_run_id is None:
+            return
+        self.overview_selection_explicit = False
+        self.overview_run_ids = {self.current_run_id}
+        self._refresh_overview_calculation()
+        self.status_var.set(
+            f"Обзор показывает текущий отчет №{self._run_number(self.current_run_id)}"
+        )
+
+    def _refresh_overview_calculation(self) -> None:
+        selected_runs = [
+            run for run in self.overview_runs if run.id in self.overview_run_ids
+        ]
+        if not selected_runs and self.current_run_id is not None:
+            selected_runs = [
+                run for run in self.overview_runs if run.id == self.current_run_id
+            ]
+            self.overview_run_ids = {self.current_run_id}
+            self.overview_selection_explicit = False
+        if not selected_runs:
+            self.overview_calculation = None
+            self.overview_file_count = 0
+            return
+
+        if (
+            len(selected_runs) == 1
+            and self.current_calculation is not None
+            and selected_runs[0].id == self.current_run_id
+        ):
+            self.overview_calculation = self.current_calculation
+        else:
+            self.overview_calculation = aggregate_calculations(
+                [self.db.load_calculation(run.id) for run in selected_runs]
+            )
+        self.overview_file_count = sum(run.source_count for run in selected_runs)
+        calculation = self.overview_calculation
+        count = len(selected_runs)
+        self.overview_scope_var.set(
+            f"Период: {_calculation_period(calculation)} · {_russian_report_count(count)}"
+        )
+        self.overview_totals_title_var.set(
+            "Итоги по выбранному периоду" if count > 1 else "Итоги по отчету"
+        )
+        self._populate_overview()
 
     def _reset_overview_filters(self) -> None:
         self.overview_category_var.set(CATEGORY_ALL)
@@ -1463,6 +1581,7 @@ class OZPriceAnalyzerApp(tk.Tk):
         display = next((key for key, value in self.run_display_to_id.items() if value == run_id), None)
         if display:
             self.run_var.set(display)
+        self.overview_selection_explicit = False
         self.select_run(run_id)
         self.notebook.select(self.overview_tab)
 
@@ -1575,7 +1694,7 @@ class OZPriceAnalyzerApp(tk.Tk):
         self.refresh_products()
         if self.current_run_id is not None:
             self.current_calculation = self.db.load_calculation(self.current_run_id)
-            self._populate_overview()
+            self._refresh_overview_calculation()
             self._populate_scenario()
 
     def open_cost_catalog_editor(self) -> None:
@@ -2052,19 +2171,30 @@ class OZPriceAnalyzerApp(tk.Tk):
         if self.current_run_id is None or self.current_calculation is None:
             messagebox.showinfo("Экспорт", "Сначала импортируйте или выберите расчет", parent=self)
             return
+        export_overview = (
+            self.notebook.select() == str(self.overview_tab)
+            and self.overview_selection_explicit
+            and self.overview_calculation is not None
+        )
+        calculation = self.overview_calculation if export_overview else self.current_calculation
         destination = filedialog.asksaveasfilename(
             title="Сохранить итоговый отчет",
             defaultextension=".xlsx",
             initialdir=str(self.service.paths["exports"]),
-            initialfile=suggested_export_name(self.current_calculation),
+            initialfile=suggested_export_name(calculation),
             filetypes=[("Книга Excel", "*.xlsx")],
             parent=self,
         )
         if not destination:
             return
         try:
-            path = export_run(self.db, self.current_run_id, destination)
-            messagebox.showinfo("Экспорт", f"Отчет сохранен:\n{path}", parent=self)
+            path = (
+                export_calculation(calculation, destination)
+                if export_overview
+                else export_run(self.db, self.current_run_id, destination)
+            )
+            description = "Сводный отчет за выбранный период" if export_overview else "Отчет"
+            messagebox.showinfo("Экспорт", f"{description} сохранен:\n{path}", parent=self)
         except Exception as exc:
             messagebox.showerror("Экспорт", str(exc), parent=self)
 
@@ -2075,6 +2205,200 @@ class OZPriceAnalyzerApp(tk.Tk):
         tree.tag_configure("warning", foreground=palette["warning"])
         tree.tag_configure("total", background=palette["surface_alt"], foreground=palette["text"])
         tree.tag_configure("muted", foreground=palette["muted"])
+
+
+class OverviewReportSelectionDialog(tk.Toplevel):
+    def __init__(
+        self,
+        parent: OZPriceAnalyzerApp,
+        runs: list[RunSummary],
+        selected_run_ids: set[int],
+    ):
+        super().__init__(parent)
+        self.title("Отчеты для итогового обзора")
+        self.geometry("1040x650")
+        self.minsize(850, 520)
+        self.transient(parent)
+        self.grab_set()
+        self.confirmed = False
+        self.runs = runs
+        self.selected_run_ids = {run.id for run in runs if run.id in selected_run_ids}
+        self.run_by_id = {run.id: run for run in runs}
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(3, weight=1)
+
+        ttk.Label(
+            self,
+            text="Сформировать обзор за несколько месяцев",
+            style="Section.TLabel",
+        ).grid(row=0, column=0, sticky="w", padx=22, pady=(20, 3))
+        ttk.Label(
+            self,
+            text=(
+                "Отметьте нужные отчеты или выберите целый год. Показатели товаров, "
+                "себестоимость, налог и нераспределенные суммы будут объединены за весь период."
+            ),
+            style="Muted.TLabel",
+            wraplength=950,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", padx=22, pady=(0, 12))
+
+        controls = ttk.Frame(self)
+        controls.grid(row=2, column=0, sticky="ew", padx=22, pady=(0, 10))
+        controls.columnconfigure(7, weight=1)
+        ttk.Label(controls, text="Год:").grid(row=0, column=0, padx=(0, 6))
+        years = sorted({_run_year(run) for run in runs if _run_year(run) is not None})
+        self.year_var = tk.StringVar(value=str(years[-1]) if years else "Все годы")
+        self.year_combo = ttk.Combobox(
+            controls,
+            textvariable=self.year_var,
+            values=["Все годы"] + [str(year) for year in years],
+            state="readonly",
+            width=14,
+        )
+        self.year_combo.grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(controls, text="Выбрать год", command=self._select_year).grid(
+            row=0, column=2, padx=(0, 12)
+        )
+        ttk.Button(controls, text="Выбрать все", command=self._select_all).grid(
+            row=0, column=3, padx=4
+        )
+        ttk.Button(controls, text="Снять все", command=self._clear).grid(
+            row=0, column=4, padx=4
+        )
+        ttk.Label(
+            controls,
+            text="Щелчок по строке включает или исключает отчет",
+            style="Muted.TLabel",
+        ).grid(row=0, column=7, sticky="e")
+
+        container = ttk.Frame(self)
+        container.grid(row=3, column=0, sticky="nsew", padx=22)
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(0, weight=1)
+        columns = ("selected", "number", "period", "name", "files", "revenue")
+        self.tree = ttk.Treeview(container, columns=columns, show="headings", height=14)
+        headings = ("Выбран", "№", "Период", "Наименование", "Файлов", "Выручка")
+        widths = (85, 55, 210, 430, 80, 150)
+        for column, heading, width in zip(columns, headings, widths):
+            self.tree.heading(column, text=heading)
+            self.tree.column(
+                column,
+                width=width,
+                minwidth=50,
+                stretch=column == "name",
+                anchor="w" if column in {"period", "name"} else "center",
+            )
+        yscroll = ttk.Scrollbar(container, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=yscroll.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        self.tree.bind("<ButtonRelease-1>", self._toggle_clicked)
+        self.tree.bind("<space>", self._toggle_focused)
+        self.tree.tag_configure("selected", foreground=parent.colors["positive"])
+
+        footer = ttk.Frame(self, padding=(22, 12, 22, 18))
+        footer.grid(row=4, column=0, sticky="ew")
+        footer.columnconfigure(0, weight=1)
+        self.summary_var = tk.StringVar()
+        ttk.Label(footer, textvariable=self.summary_var, style="Section.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Button(footer, text="Отмена", command=self.destroy).grid(
+            row=0, column=1, padx=4
+        )
+        ttk.Button(
+            footer,
+            text="Показать итоговый обзор",
+            style="Accent.TButton",
+            command=self._confirm,
+        ).grid(row=0, column=2, padx=4)
+        self.bind("<Escape>", lambda _event: self.destroy())
+        self._refresh_rows()
+
+    def _refresh_rows(self) -> None:
+        self.tree.delete(*self.tree.get_children())
+        for number, run in enumerate(self.runs, start=1):
+            selected = run.id in self.selected_run_ids
+            self.tree.insert(
+                "",
+                "end",
+                iid=str(run.id),
+                values=(
+                    "✓" if selected else "",
+                    number,
+                    _period_text(run.period_start, run.period_end),
+                    run.report_name,
+                    run.source_count,
+                    _money(run.revenue),
+                ),
+                tags=("selected",) if selected else (),
+            )
+        chosen = [run for run in self.runs if run.id in self.selected_run_ids]
+        if chosen:
+            starts = [value for run in chosen if (value := _summary_date(run.period_start))]
+            ends = [value for run in chosen if (value := _summary_date(run.period_end))]
+            period = (
+                f"{min(starts):%d.%m.%Y}–{max(ends):%d.%m.%Y}"
+                if starts and ends
+                else "не определен"
+            )
+            self.summary_var.set(
+                f"Выбрано: {_russian_report_count(len(chosen))} · итоговый период {period}"
+            )
+        else:
+            self.summary_var.set("Отчеты не выбраны")
+
+    def _toggle_clicked(self, event) -> None:
+        item_id = self.tree.identify_row(event.y)
+        if item_id:
+            self._toggle(int(item_id))
+
+    def _toggle_focused(self, _event=None) -> str:
+        item_id = self.tree.focus()
+        if item_id:
+            self._toggle(int(item_id))
+        return "break"
+
+    def _toggle(self, run_id: int) -> None:
+        if run_id in self.selected_run_ids:
+            self.selected_run_ids.remove(run_id)
+        else:
+            self.selected_run_ids.add(run_id)
+        self._refresh_rows()
+        if self.tree.exists(str(run_id)):
+            self.tree.focus(str(run_id))
+            self.tree.see(str(run_id))
+
+    def _select_year(self) -> None:
+        value = self.year_var.get()
+        if value == "Все годы":
+            self.selected_run_ids = {run.id for run in self.runs}
+        else:
+            year = int(value)
+            self.selected_run_ids = {
+                run.id for run in self.runs if _run_year(run) == year
+            }
+        self._refresh_rows()
+
+    def _select_all(self) -> None:
+        self.selected_run_ids = {run.id for run in self.runs}
+        self._refresh_rows()
+
+    def _clear(self) -> None:
+        self.selected_run_ids.clear()
+        self._refresh_rows()
+
+    def _confirm(self) -> None:
+        if not self.selected_run_ids:
+            messagebox.showwarning(
+                "Период обзора",
+                "Выберите хотя бы один отчет.",
+                parent=self,
+            )
+            return
+        self.confirmed = True
+        self.destroy()
 
 
 class RealizationPeriodDialog(tk.Toplevel):
@@ -3235,6 +3559,34 @@ def _russian_position_word(count: int) -> str:
     if count % 10 in {2, 3, 4} and count % 100 not in {12, 13, 14}:
         return "позиции"
     return "позиций"
+
+
+def _russian_report_count(count: int) -> str:
+    if count % 10 == 1 and count % 100 != 11:
+        word = "отчет"
+    elif count % 10 in {2, 3, 4} and count % 100 not in {12, 13, 14}:
+        word = "отчета"
+    else:
+        word = "отчетов"
+    return f"{count} {word}"
+
+
+def _summary_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def _run_year(run: RunSummary) -> int | None:
+    value = (
+        _summary_date(run.period_start)
+        or _summary_date(run.period_end)
+        or _summary_date(run.created_at)
+    )
+    return value.year if value is not None else None
 
 
 def _realization_file_count(calculation: RunCalculation) -> str:

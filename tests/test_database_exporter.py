@@ -7,7 +7,7 @@ from pathlib import Path
 from openpyxl import load_workbook
 
 from ozon_app.database import Database
-from ozon_app.exporter import export_run
+from ozon_app.exporter import export_calculation, export_run
 from ozon_app.models import ParsedSource, Product, ProductResult, RunCalculation
 
 
@@ -71,6 +71,45 @@ class DatabaseExporterTests(unittest.TestCase):
                 self.assertEqual(workbook["Разбивка"]["A5"].value, "Подписка Premium")
                 self.assertEqual(workbook["Разбивка"]["C5"].value, -50)
                 self.assertTrue(str(workbook["КонсОтчет"]["AO8"].value).startswith("=IF"))
+            finally:
+                workbook.close()
+
+    def test_aggregate_export_uses_exact_cost_and_tax_totals(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result = ProductResult(
+                article="A-1",
+                name="Товар",
+                material_cost=72,
+                labor_cost=28,
+                units=5,
+                revenue_no_points=1400,
+                financial_result=900,
+                material_sold_override=360,
+                labor_sold_override=140,
+                tax_override=74,
+            )
+            calculation = RunCalculation(
+                run_id=None,
+                period_start=None,
+                period_end=None,
+                tax_rate=74 / 1400,
+                products=[result],
+                unallocated_total=0,
+                unallocated={},
+                accrual_stats={},
+            )
+            destination = Path(directory) / "aggregate.xlsx"
+
+            export_calculation(calculation, destination)
+
+            workbook = load_workbook(destination, data_only=False)
+            try:
+                sheet = workbook["КонсОтчет"]
+                self.assertEqual(sheet["F8"].value, 360)
+                self.assertEqual(sheet["G8"].value, 140)
+                self.assertEqual(sheet["H8"].value, "=F8+G8")
+                self.assertEqual(sheet["O8"].value, 74)
+                self.assertAlmostEqual(sheet["P4"].value, 74 / 1400)
             finally:
                 workbook.close()
 

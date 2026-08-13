@@ -106,6 +106,9 @@ class ProductResult:
     compensation: float = 0.0
     other: float = 0.0
     financial_result: float = 0.0
+    material_sold_override: float | None = None
+    labor_sold_override: float | None = None
+    tax_override: float | None = None
 
     @property
     def total_cost(self) -> float:
@@ -113,10 +116,14 @@ class ProductResult:
 
     @property
     def material_sold(self) -> float:
+        if self.material_sold_override is not None:
+            return self.material_sold_override
         return self.material_cost * self.units
 
     @property
     def labor_sold(self) -> float:
+        if self.labor_sold_override is not None:
+            return self.labor_sold_override
         return self.labor_cost * self.units
 
     @property
@@ -132,6 +139,8 @@ class ProductResult:
         return self.revenue_no_points + self.partner_programs
 
     def tax(self, rate: float) -> float:
+        if self.tax_override is not None:
+            return self.tax_override
         return self.taxable_income * rate
 
     def net_profit(self, rate: float) -> float:
@@ -147,7 +156,7 @@ class ProductResult:
         return self.net_profit(rate) / self.units if self.units else 0.0
 
     def profitability(self, rate: float) -> float:
-        return self.net_profit_per_unit(rate) / self.total_cost if self.total_cost else 0.0
+        return self.net_profit(rate) / self.cost_sold if self.cost_sold else 0.0
 
 
 @dataclass(slots=True)

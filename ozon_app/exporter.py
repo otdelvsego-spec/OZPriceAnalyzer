@@ -35,6 +35,14 @@ RESULT_COLUMNS = {
 def export_run(database: Database, run_id: int, destination: str | Path) -> Path:
     calculation = database.load_calculation(run_id)
     planned_prices = database.planned_prices(run_id)
+    return export_calculation(calculation, destination, planned_prices)
+
+
+def export_calculation(
+    calculation: RunCalculation,
+    destination: str | Path,
+    planned_prices: dict[str, float] | None = None,
+) -> Path:
     template = resource_path("report_template.xlsx")
     if not template.exists():
         raise FileNotFoundError("Не найден шаблон итогового отчета")
@@ -42,7 +50,7 @@ def export_run(database: Database, run_id: int, destination: str | Path) -> Path
     if "Справочник начислений" in workbook.sheetnames:
         del workbook["Справочник начислений"]
     ws = workbook["КонсОтчет"]
-    _fill_report_sheet(ws, calculation, planned_prices)
+    _fill_report_sheet(ws, calculation, planned_prices or {})
     _create_breakdown_sheet(workbook, calculation)
     workbook.calculation = CalcProperties(calcMode="auto", fullCalcOnLoad=True, forceFullCalc=True)
     output = Path(destination).expanduser().resolve()
@@ -109,16 +117,28 @@ def _write_product_row(
     ws[f"D{row}"] = result.material_cost
     ws[f"E{row}"] = result.labor_cost
     ws[f"C{row}"] = f"=D{row}+E{row}"
-    ws[f"F{row}"] = f"=D{row}*Q{row}"
-    ws[f"G{row}"] = f"=E{row}*Q{row}"
-    ws[f"H{row}"] = f"=Q{row}*C{row}"
+    ws[f"F{row}"] = (
+        result.material_sold
+        if result.material_sold_override is not None
+        else f"=D{row}*Q{row}"
+    )
+    ws[f"G{row}"] = (
+        result.labor_sold
+        if result.labor_sold_override is not None
+        else f"=E{row}*Q{row}"
+    )
+    ws[f"H{row}"] = f"=F{row}+G{row}"
     ws[f"I{row}"] = f"=IFERROR(J{row}/C{row},0)"
     ws[f"J{row}"] = f"=IFERROR(L{row}/Q{row},0)"
     ws[f"K{row}"] = f"=IFERROR(M{row}/Q{row},0)"
     ws[f"L{row}"] = f"=M{row}-H{row}-O{row}"
     ws[f"M{row}"] = f"=AG{row}"
     ws[f"N{row}"] = f"=IFERROR(R{row}/Q{row},\"\")"
-    ws[f"O{row}"] = f"=P{row}*$P$4"
+    ws[f"O{row}"] = (
+        result.tax(tax_rate)
+        if result.tax_override is not None
+        else f"=P{row}*$P$4"
+    )
     ws[f"P{row}"] = f"=S{row}+T{row}"
     ws[f"Q{row}"] = result.units
     ws[f"R{row}"] = f"=SUM(S{row}:U{row})"
@@ -206,4 +226,3 @@ def _create_breakdown_sheet(workbook, calculation: RunCalculation) -> None:
         ws.cell(row, 3).number_format = "#,##0.00"
     ws.auto_filter.ref = f"A4:C{total_row}"
     ws.freeze_panes = "A5"
-
