@@ -212,6 +212,7 @@ class RunSummary:
     net_profit: float
     unallocated_total: float
     status: str
+    report_name: str = ""
 
 
 def as_serializable(value: Any) -> Any:

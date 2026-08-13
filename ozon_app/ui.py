@@ -1,2584 +1,104 @@
-from __future__ import annotations
-
-import os
-import queue
-import subprocess
-import sys
-import threading
-import tkinter as tk
-import webbrowser
-from datetime import datetime
-from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
-
-from .backup import create_backup, inspect_backup, restore_backup, suggested_backup_name
-from .calculator import calculate_scenario, discover_unknown_products
-from .comparison import ComparisonMetric, compare_calculations
-from .costs import (
-    CostChange,
-    CostEditorEntry,
-    build_cost_changes,
-    build_products_from_editor_entries,
-    export_cost_catalog,
-    read_cost_catalog,
-)
-from .config import APP_TITLE, APP_VERSION, save_storage_location
-from .database import Database
-from .excel_reader import REPORT_REALIZATION, preview_sheet, workbook_sheet_names
-from .exporter import export_run, suggested_export_name
-from .models import Product, ProductResult, RunCalculation, ScenarioRow, UnknownProduct
-from .ordering import insert_at_group_end
-from .service import AppService, ImportSession
-from .storage import migrate_storage
-from .theme import apply_theme
-from .trends import TrendPoint, build_trend_points, chart_bounds
-
-
-THEME_LABELS = {"Ğ¡Ğ¸ÑÑ‚ĞµĞ¼Ğ½Ğ°Ñ": "system", "Ğ¢ĞµĞ¼Ğ½Ğ°Ñ": "dark", "Ğ¡Ğ²ĞµÑ‚Ğ»Ğ°Ñ": "light"}
-THEME_VALUES = {value: key for key, value in THEME_LABELS.items()}
-DUPLICATE_LABELS = {"Ğ¡Ğ¿Ñ€Ğ°ÑˆĞ¸Ğ²Ğ°Ñ‚ÑŒ": "ask", "ĞŸÑ€Ğ¾Ğ¿ÑƒÑĞºĞ°Ñ‚ÑŒ": "skip", "Ğ Ğ°Ğ·Ñ€ĞµÑˆĞ°Ñ‚ÑŒ": "allow"}
-DUPLICATE_VALUES = {value: key for key, value in DUPLICATE_LABELS.items()}
-TREND_METRICS = {
-    "Ğ’Ñ‹Ñ€ÑƒÑ‡ĞºĞ°": "revenue",
-    "Ğ§Ğ¸ÑÑ‚Ğ°Ñ Ğ¿Ñ€Ğ¸Ğ±Ñ‹Ğ»ÑŒ": "net_profit",
-    "ĞŸÑ€Ğ¾Ğ´Ğ°Ğ¶Ğ¸, ÑˆÑ‚.": "units",
-    "ĞĞµÑ€Ğ°ÑĞ¿Ñ€ĞµĞ´ĞµĞ»ĞµĞ½Ğ½Ñ‹Ğµ Ğ´Ğ¾Ñ…Ğ¾Ğ´Ñ‹ / Ñ€Ğ°ÑÑ…Ğ¾Ğ´Ñ‹": "unallocated",
-}
-
-
-class OZPriceAnalyzerApp(tk.Tk):
-    def __init__(self, service: AppService | None = None):
-        super().__init__()
-        self.service = service or AppService()
-        self.db = self.service.db
-        self.current_run_id: int | None = None
-        self.current_calculation: RunCalculation | None = None
-        self.run_display_to_id: dict[str, int] = {}
-        self.source_by_iid: dict[str, dict[str, object]] = {}
-        self.preview_headers: list[str] = []
-        self.preview_rows: list[list[str]] = []
-        self.preview_path: str | None = None
-        self.scenario_rows: dict[str, ScenarioRow] = {}
-        self.trend_points: list[TrendPoint] = []
-        self.trend_canvas_points: list[tuple[float, float, TrendPoint]] = []
-        self.import_in_progress = False
-        self.import_queue: queue.Queue[tuple[ImportSession | None, Exception | None]] = queue.Queue()
-        self.colors = apply_theme(self, self.db.get_setting("theme", "system"))
-
-        self.title(f"{APP_TITLE} {APP_VERSION}")
-        self.geometry("1540x920")
-        self.minsize(1180, 720)
-        # A Tk font family containing spaces must be grouped as one Tcl list item.
-        self.option_add("*Font", "{Segoe UI} 10")
-        self._build_ui()
-        self.refresh_all()
-
-    def _build_ui(self) -> None:
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
-        self._build_header()
-        self.notebook = ttk.Notebook(self)
-        self.notebook.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 12))
-
-        self.overview_tab = ttk.Frame(self.notebook, padding=4)
-        self.sources_tab = ttk.Frame(self.notebook, padding=4)
-        self.breakdown_tab = ttk.Frame(self.notebook, padding=4)
-        self.guide_tab = ttk.Frame(self.notebook, padding=4)
-        self.scenario_tab = ttk.Frame(self.notebook, padding=4)
-        self.history_tab = ttk.Frame(self.notebook, padding=4)
-        self.trend_tab = ttk.Frame(self.notebook, padding=4)
-        self.comparison_tab = ttk.Frame(self.notebook, padding=4)
-        self.settings_tab = ttk.Frame(self.notebook, padding=4)
-        self.notebook.add(self.overview_tab, text="ĞĞ±Ğ·Ğ¾Ñ€")
-        self.notebook.add(self.sources_tab, text="Ğ˜ÑÑ…Ğ¾Ğ´Ğ½Ñ‹Ğµ Ñ„Ğ°Ğ¹Ğ»Ñ‹")
-        self.notebook.add(self.breakdown_tab, text="Ğ Ğ°Ğ·Ğ±Ğ¸Ğ²ĞºĞ°")
-        self.notebook.add(self.guide_tab, text="Ğ¡Ğ¿Ñ€Ğ°Ğ²Ğ¾Ñ‡Ğ½Ğ¸Ğº Ğ½Ğ°Ñ‡Ğ¸ÑĞ»ĞµĞ½Ğ¸Ğ¹")
-        self.notebook.add(self.scenario_tab, text="Ğ¡Ñ†ĞµĞ½Ğ°Ñ€Ğ¸Ğ¹ Ñ†ĞµĞ½Ñ‹")
-        self.notebook.add(self.history_tab, text="Ğ˜ÑÑ‚Ğ¾Ñ€Ğ¸Ñ Ğ¾Ñ‚Ñ‡ĞµÑ‚Ğ¾Ğ²")
-        self.notebook.add(self.trend_tab, text="Ğ”Ğ¸Ğ½Ğ°Ğ¼Ğ¸ĞºĞ°")
-        self.notebook.add(self.comparison_tab, text="Ğ¡Ñ€Ğ°Ğ²Ğ½ĞµĞ½Ğ¸Ğµ Ğ¿ĞµÑ€Ğ¸Ğ¾Ğ´Ğ¾Ğ²")
-        self.notebook.add(self.settings_tab, text="ĞĞ°ÑÑ‚Ñ€Ğ¾Ğ¹ĞºĞ¸")
-
-        self._build_overview_tab()
-        self._build_sources_tab()
-        self._build_breakdown_tab()
-        self._build_guide_tab()
-        self._build_scenario_tab()
-        self._build_history_tab()
-        self._build_trend_tab()
-        self._build_comparison_tab()
-        self._build_settings_tab()
-
-        self.status_var = tk.StringVar(value="Ğ“Ğ¾Ñ‚Ğ¾Ğ²Ğ¾")
-        ttk.Label(self, textvariable=self.status_var, style="Muted.TLabel").grid(
-            row=2, column=0, sticky="ew", padx=22, pady=(0, 10)
-        )
-
-    def _build_header(self) -> None:
-        header = ttk.Frame(self, padding=(22, 18, 22, 16))
-        header.grid(row=0, column=0, sticky="ew")
-        header.columnconfigure(0, weight=1)
-        title_box = ttk.Frame(header)
-        title_box.grid(row=0, column=0, sticky="w")
-        ttk.Label(title_box, text="OZ Price Analyzer", style="Title.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(
-            title_box,
-            text="ĞÑ‚Ñ‡ĞµÑ‚Ñ‹ Ozon, Ğ¸ÑÑ‚Ğ¾Ñ€Ğ¸Ñ, ĞºĞ¾Ğ½Ñ‚Ñ€Ğ¾Ğ»ÑŒ Ğ½Ğ°Ñ‡Ğ¸ÑĞ»ĞµĞ½Ğ¸Ğ¹ Ğ¸ Ğ¿Ğ»Ğ°Ğ½Ğ¾Ğ²Ğ°Ñ Ğ´Ğ¾Ñ…Ğ¾Ğ´Ğ½Ğ¾ÑÑ‚ÑŒ",
-            style="Muted.TLabel",
-        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
-
-        actions = ttk.Frame(header)
-        actions.grid(row=0, column=1, rowspan=2, sticky="e")
-        ttk.Label(actions, text="Ğ Ğ°ÑÑ‡ĞµÑ‚:", style="Muted.TLabel").grid(row=0, column=0, padx=(0, 6))
-        self.run_var = tk.StringVar()
-        self.run_combo = ttk.Combobox(actions, textvariable=self.run_var, state="readonly", width=32)
-        self.run_combo.grid(row=0, column=1, padx=(0, 12))
-        self.run_combo.bind("<<ComboboxSelected>>", self._on_run_selected)
-        ttk.Button(actions, text="Ğ˜Ğ¼Ğ¿Ğ¾Ñ€Ñ‚Ğ¸Ñ€Ğ¾Ğ²Ğ°Ñ‚ÑŒ Ğ¾Ñ‚Ñ‡ĞµÑ‚Ñ‹", style="Accent.TButton", command=self.import_reports).grid(
-            row=0, column=2, padx=5
-        )
-        ttk.Button(actions, text="Ğ­ĞºÑĞ¿Ğ¾Ñ€Ñ‚ Ğ² Excel", command=self.export_current_run).grid(row=0, column=3, padx=5)
-        ttk.Button(actions, text="Ğ Ğ¿Ñ€Ğ¾Ğ³Ñ€Ğ°Ğ¼Ğ¼Ğµ", command=self.show_about).grid(
-            row=1, column=3, sticky="e", padx=5, pady=(6, 0)
-        )
-
-    def _build_overview_tab(self) -> None:
-        self.overview_tab.columnconfigure(0, weight=1)
-        self.overview_tab.rowconfigure(2, weight=1)
-        ttk.Label(self.overview_tab, text="Ğ˜Ñ‚Ğ¾Ğ³Ğ¾Ğ²Ñ‹Ğ¹ Ğ¾Ñ‚Ñ‡ĞµÑ‚", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w", pady=(10, 8)
-        )
-        self.kpi_frame = ttk.Frame(self.overview_tab)
-        self.kpi_frame.grid(row=1, column=0, sticky="ew", pady=(0, 12))
-        for column in range(6):
-            self.kpi_frame.columnconfigure(column, weight=1)
-        self.kpi_vars: dict[str, tk.StringVar] = {}
-        cards = [
-            ("revenue", "Ğ’Ñ‹Ñ€ÑƒÑ‡ĞºĞ°"),
-            ("net_profit", "Ğ§Ğ¸ÑÑ‚Ğ°Ñ Ğ¿Ñ€Ğ¸Ğ±Ñ‹Ğ»ÑŒ"),
-            ("profitability", "Ğ”Ğ¾Ñ…Ğ¾Ğ´Ğ½Ğ¾ÑÑ‚ÑŒ"),
-            ("units", "ĞŸÑ€Ğ¾Ğ´Ğ°Ğ¶Ğ¸, ÑˆÑ‚."),
-            ("unallocated", "ĞĞµÑ€Ğ°ÑĞ¿Ñ€ĞµĞ´ĞµĞ»ĞµĞ½Ğ½Ñ‹Ğµ"),
-            ("files", "Ğ˜ÑÑ…Ğ¾Ğ´Ğ½Ñ‹Ğµ Ñ„Ğ°Ğ¹Ğ»Ñ‹"),
-        ]
-        for index, (key, title) in enumerate(cards):
-            self.kpi_vars[key] = tk.StringVar(value="â€”")
-            card = ttk.Frame(self.kpi_frame, style="Card.TFrame", padding=(16, 14))
-            card.grid(row=0, column=index, sticky="nsew", padx=(0 if index == 0 else 5, 0 if index == 5 else 5))
-            ttk.Label(card, text=title, style="CardMuted.TLabel").grid(row=0, column=0, sticky="w")
-            ttk.Label(card, textvariable=self.kpi_vars[key], style="Kpi.TLabel").grid(
-                row=1, column=0, sticky="w", pady=(5, 0)
-            )
-
-        columns = [
-            "article", "name", "unit_cost", "material", "labor", "material_sold", "labor_sold", "cost_sold",
-            "profitability", "net_unit", "profit_unit", "net_total", "profit_total", "avg_price", "tax",
-            "taxable", "units", "revenue", "revenue_no_points", "partner", "points", "commission", "processing",
-            "delivery", "logistics", "reverse", "returns", "acquiring", "stars", "packaging", "compensation",
-            "other", "financial_result",
-        ]
-        headings = [
-            "ĞÑ€Ñ‚Ğ¸ĞºÑƒĞ»", "ĞĞ°Ğ¸Ğ¼ĞµĞ½Ğ¾Ğ²Ğ°Ğ½Ğ¸Ğµ", "Ğ˜Ñ‚Ğ¾Ğ³Ğ¾ Ñ/Ñ", "ĞœĞ°Ñ‚ĞµÑ€Ğ¸Ğ°Ğ»", "Ğ¢Ñ€ÑƒĞ´Ğ¾Ğ·Ğ°Ñ‚Ñ€Ğ°Ñ‚Ñ‹", "ĞœĞ°Ñ‚ĞµÑ€Ğ¸Ğ°Ğ» Ğ¿Ñ€Ğ¾Ğ´Ğ°Ğ½Ğ½Ğ¾Ğ³Ğ¾",
-            "Ğ¢Ñ€ÑƒĞ´Ğ¾Ğ·Ğ°Ñ‚Ñ€Ğ°Ñ‚Ñ‹ Ğ¿Ñ€Ğ¾Ğ´Ğ°Ğ½Ğ½Ğ¾Ğ³Ğ¾", "Ğ¡/Ñ Ğ¿Ñ€Ğ¾Ğ´Ğ°Ğ½Ğ½Ğ¾Ğ³Ğ¾", "Ğ”Ğ¾Ñ…Ğ¾Ğ´Ğ½Ğ¾ÑÑ‚ÑŒ", "Ğ§Ğ¸ÑÑ‚Ğ°Ñ Ğ¿Ñ€Ğ¸Ğ±Ñ‹Ğ»ÑŒ Ğ½Ğ° ĞµĞ´.",
-            "ĞŸÑ€Ğ¸Ğ±Ñ‹Ğ»ÑŒ Ğ¾Ñ‚ Ğ¿Ñ€Ğ¾Ğ´Ğ°Ğ¶ Ğ½Ğ° ĞµĞ´.", "Ğ§Ğ¸ÑÑ‚Ğ°Ñ Ğ¿Ñ€Ğ¸Ğ±Ñ‹Ğ»ÑŒ Ğ²ÑĞµĞ³Ğ¾", "ĞŸÑ€Ğ¸Ğ±Ñ‹Ğ»ÑŒ Ğ¾Ñ‚ Ğ¿Ñ€Ğ¾Ğ´Ğ°Ğ¶ Ğ²ÑĞµĞ³Ğ¾", "Ğ¡Ñ€ĞµĞ´Ğ½ÑÑ Ñ†ĞµĞ½Ğ°",
-            "ĞĞ°Ğ»Ğ¾Ğ³", "ĞĞ°Ğ»Ğ¾Ğ³Ğ¾Ğ¾Ğ±Ğ»Ğ°Ğ³Ğ°ĞµĞ¼Ñ‹Ğ¹ Ğ´Ğ¾Ñ…Ğ¾Ğ´", "ĞŸÑ€Ğ¾Ğ´Ğ°Ğ¶Ğ¸", "Ğ’Ñ‹Ñ€ÑƒÑ‡ĞºĞ° Ñ Ğ±Ğ°Ğ»Ğ»Ğ°Ğ¼Ğ¸", "Ğ’Ñ‹Ñ€ÑƒÑ‡ĞºĞ° Ğ±ĞµĞ· Ğ±Ğ°Ğ»Ğ»Ğ¾Ğ²",
-            "ĞŸÑ€Ğ¾Ğ³Ñ€Ğ°Ğ¼Ğ¼Ñ‹ Ğ¿Ğ°Ñ€Ñ‚Ğ½ĞµÑ€Ğ¾Ğ²", "Ğ‘Ğ°Ğ»Ğ»Ñ‹", "ĞšĞ¾Ğ¼Ğ¸ÑÑĞ¸Ñ Ozon", "ĞĞ±Ñ€Ğ°Ğ±Ğ¾Ñ‚ĞºĞ° Ğ¾Ñ‚Ğ¿Ñ€Ğ°Ğ²Ğ»ĞµĞ½Ğ¸Ñ", "Ğ”Ğ¾ÑÑ‚Ğ°Ğ²ĞºĞ° Ğ´Ğ¾ ĞŸĞ’Ğ—",
-            "Ğ›Ğ¾Ğ³Ğ¸ÑÑ‚Ğ¸ĞºĞ°", "ĞĞ±Ñ€Ğ°Ñ‚Ğ½Ğ°Ñ Ğ»Ğ¾Ğ³Ğ¸ÑÑ‚Ğ¸ĞºĞ°", "Ğ’Ğ¾Ğ·Ğ²Ñ€Ğ°Ñ‚Ñ‹/Ğ¾Ñ‚Ğ¼ĞµĞ½Ñ‹", "Ğ­ĞºĞ²Ğ°Ğ¹Ñ€Ğ¸Ğ½Ğ³", "Ğ—Ğ²ĞµĞ·Ğ´Ğ½Ñ‹Ğµ Ñ‚Ğ¾Ğ²Ğ°Ñ€Ñ‹",
-            "Ğ£Ğ¿Ğ°ĞºĞ¾Ğ²ĞºĞ° Ğ¸ Ğ¼Ğ°Ñ‚ĞµÑ€Ğ¸Ğ°Ğ»Ñ‹", "ĞšĞ¾Ğ¼Ğ¿ĞµĞ½ÑĞ°Ñ†Ğ¸Ğ¸ Ozon", "ĞŸÑ€Ğ¾Ñ‡Ğ¸Ğµ Ğ½Ğ°Ñ‡Ğ¸ÑĞ»ĞµĞ½Ğ¸Ñ", "Ğ¤Ğ¸Ğ½Ñ€ĞµĞ·ÑƒĞ»ÑŒÑ‚Ğ°Ñ‚ Ozon",
-        ]
-        self.overview_tree = self._create_tree(self.overview_tab, columns, headings, row=2, widths=[120, 230] + [125] * 31)
-
-    def _build_sources_tab(self) -> None:
-        self.sources_tab.columnconfigure(0, weight=1)
-        self.sources_tab.rowconfigure(3, weight=1)
-        source_header = ttk.Frame(self.sources_tab)
-        source_header.grid(row=0, column=0, sticky="ew", pady=(10, 8))
-        source_header.columnconfigure(0, weight=1)
-        ttk.Label(source_header, text="Ğ¤Ğ°Ğ¹Ğ»Ñ‹ Ğ²Ñ‹Ğ±Ñ€Ğ°Ğ½Ğ½Ğ¾Ğ³Ğ¾ Ñ€Ğ°ÑÑ‡ĞµÑ‚Ğ°", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w"
-        )
-        ttk.Button(source_header, text="ĞŸÑ€Ğ¾ÑĞ¼Ğ¾Ñ‚Ñ€ĞµÑ‚ÑŒ Ğ»ÑĞ±Ğ¾Ğ¹ XLSX", command=self.browse_xlsx_preview).grid(
-            row=0, column=1, sticky="e"
-        )
-        source_columns = ["name", "type", "rows", "amount", "period", "hash"]
-        source_headings = ["Ğ¤Ğ°Ğ¹Ğ»", "Ğ¢Ğ¸Ğ¿", "Ğ¡Ñ‚Ñ€Ğ¾Ğº", "Ğ¡ÑƒĞ¼Ğ¼Ğ°", "ĞŸĞµÑ€Ğ¸Ğ¾Ğ´", "SHA-256"]
-        self.source_tree = self._create_tree(
-            self.sources_tab, source_columns, source_headings, row=1, height=6, widths=[380, 150, 80, 130, 190, 220]
-        )
-        self.source_tree.bind("<<TreeviewSelect>>", self._on_source_selected)
-
-        controls = ttk.Frame(self.sources_tab, padding=(0, 10, 0, 8))
-        controls.grid(row=2, column=0, sticky="ew")
-        ttk.Label(controls, text="Ğ›Ğ¸ÑÑ‚:").grid(row=0, column=0, padx=(0, 6))
-        self.sheet_var = tk.StringVar()
-        self.sheet_combo = ttk.Combobox(controls, textvariable=self.sheet_var, state="readonly", width=35)
-        self.sheet_combo.grid(row=0, column=1, padx=(0, 18))
-        self.sheet_combo.bind("<<ComboboxSelected>>", lambda _event: self._load_preview())
-        ttk.Label(controls, text="ĞŸĞ¾Ğ¸ÑĞº Ğ² Ğ¿Ğ¾ĞºĞ°Ğ·Ğ°Ğ½Ğ½Ñ‹Ñ… ÑÑ‚Ñ€Ğ¾ĞºĞ°Ñ…:").grid(row=0, column=2, padx=(0, 6))
-        self.preview_search_var = tk.StringVar()
-        search = ttk.Entry(controls, textvariable=self.preview_search_var, width=35)
-        search.grid(row=0, column=3, padx=(0, 8))
-        search.bind("<KeyRelease>", lambda _event: self._filter_preview())
-        ttk.Label(controls, text="ĞŸÑ€Ğ¾ÑĞ¼Ğ¾Ñ‚Ñ€ Ğ²Ñ‹Ğ¿Ğ¾Ğ»Ğ½ÑĞµÑ‚ÑÑ Ğ±ĞµĞ· Ğ·Ğ°Ğ¿ÑƒÑĞºĞ° Excel", style="Muted.TLabel").grid(
-            row=0, column=4, sticky="w", padx=(12, 0)
-        )
-        self.preview_file_var = tk.StringVar(value="Ğ¤Ğ°Ğ¹Ğ» Ğ½Ğµ Ğ²Ñ‹Ğ±Ñ€Ğ°Ğ½")
-        ttk.Label(controls, textvariable=self.preview_file_var, style="Muted.TLabel").grid(
-            row=1, column=0, columnspan=5, sticky="w", pady=(8, 0)
-        )
-        self.preview_container = ttk.Frame(self.sources_tab)
-        self.preview_container.grid(row=3, column=0, sticky="nsew")
-        self.preview_container.columnconfigure(0, weight=1)
-        self.preview_container.rowconfigure(0, weight=1)
-        self.preview_tree: ttk.Treeview | None = None
-
-    def _build_breakdown_tab(self) -> None:
-        self.breakdown_tab.columnconfigure(0, weight=1)
-        self.breakdown_tab.rowconfigure(2, weight=1)
-        ttk.Label(self.breakdown_tab, text="ĞĞµÑ€Ğ°ÑĞ¿Ñ€ĞµĞ´ĞµĞ»ĞµĞ½Ğ½Ñ‹Ğµ Ğ´Ğ¾Ñ…Ğ¾Ğ´Ñ‹ / Ñ€Ğ°ÑÑ…Ğ¾Ğ´Ñ‹", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w", pady=(10, 2)
-        )
-        ttk.Label(
-            self.breakdown_tab,
-            text="Ğ—Ğ´ĞµÑÑŒ Ğ½Ğ°Ñ…Ğ¾Ğ´ÑÑ‚ÑÑ Ğ½Ğ°Ñ‡Ğ¸ÑĞ»ĞµĞ½Ğ¸Ñ Ğ±ĞµĞ· Ğ°Ñ€Ñ‚Ğ¸ĞºÑƒĞ»Ğ°. ĞŸĞ¾Ğ»Ğ¾Ğ¶Ğ¸Ñ‚ĞµĞ»ÑŒĞ½Ñ‹Ğµ ÑÑƒĞ¼Ğ¼Ñ‹ â€” Ğ´Ğ¾Ñ…Ğ¾Ğ´Ñ‹, Ğ¾Ñ‚Ñ€Ğ¸Ñ†Ğ°Ñ‚ĞµĞ»ÑŒĞ½Ñ‹Ğµ â€” Ñ€Ğ°ÑÑ…Ğ¾Ğ´Ñ‹.",
-            style="Muted.TLabel",
-        ).grid(row=1, column=0, sticky="w", pady=(0, 10))
-        self.breakdown_tree = self._create_tree(
-            self.breakdown_tab,
-            ["type", "count", "amount", "share"],
-            ["Ğ¢Ğ¸Ğ¿ Ğ½Ğ°Ñ‡Ğ¸ÑĞ»ĞµĞ½Ğ¸Ñ", "ĞšĞ¾Ğ»Ğ¸Ñ‡ĞµÑÑ‚Ğ²Ğ¾ ÑÑ‚Ñ€Ğ¾Ğº", "Ğ¡ÑƒĞ¼Ğ¼Ğ°, Ñ€ÑƒĞ±.", "Ğ”Ğ¾Ğ»Ñ Ğ² Ğ½ĞµÑ€Ğ°ÑĞ¿Ñ€ĞµĞ´ĞµĞ»ĞµĞ½Ğ½Ñ‹Ñ…"],
-            row=2,
-            widths=[520, 150, 180, 190],
-        )
-
-    def _build_guide_tab(self) -> None:
-        self.guide_tab.columnconfigure(0, weight=1)
-        self.guide_tab.rowconfigure(2, weight=1)
-        ttk.Label(self.guide_tab, text="Ğ¡Ğ¿Ñ€Ğ°Ğ²Ğ¾Ñ‡Ğ½Ğ¸Ğº Ğ½Ğ°Ñ‡Ğ¸ÑĞ»ĞµĞ½Ğ¸Ğ¹", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w", pady=(10, 2)
-        )
-        ttk.Label(
-            self.guide_tab,
-            text="Ğ¤Ğ°ĞºÑ‚Ğ¸Ñ‡ĞµÑĞºĞ¾Ğµ Ğ½Ğ°Ğ»Ğ¸Ñ‡Ğ¸Ğµ Ğ°Ñ€Ñ‚Ğ¸ĞºÑƒĞ»Ğ° Ğ¿Ñ€Ğ¾Ğ²ĞµÑ€ÑĞµÑ‚ÑÑ Ğ´Ğ»Ñ ĞºĞ°Ğ¶Ğ´Ğ¾Ğ¹ ÑÑ‚Ñ€Ğ¾ĞºĞ¸. Ğ¡Ğ¿Ñ€Ğ°Ğ²Ğ¾Ñ‡Ğ½Ğ¸Ğº Ğ½Ğ¸Ñ‡ĞµĞ³Ğ¾ Ğ½Ğµ Ğ¿Ñ€Ğ¸Ğ½ÑƒĞ¶Ğ´Ğ°ĞµÑ‚ Ñ€Ğ°ÑĞ¿Ñ€ĞµĞ´ĞµĞ»ÑÑ‚ÑŒ.",
-            style="Muted.TLabel",
-        ).grid(row=1, column=0, sticky="w", pady=(0, 10))
-        self.guide_tree = self._create_tree(
-            self.guide_tab,
-            ["type", "category", "current_status", "current_with", "current_without", "history_status", "history_with", "history_without"],
-            ["Ğ¢Ğ¸Ğ¿ Ğ½Ğ°Ñ‡Ğ¸ÑĞ»ĞµĞ½Ğ¸Ñ", "ĞšÑƒĞ´Ğ° Ğ¾Ñ‚Ğ½Ğ¾ÑĞ¸Ñ‚ÑÑ", "Ğ¢ĞµĞºÑƒÑ‰Ğ¸Ğ¹ Ğ·Ğ°Ğ¿ÑƒÑĞº", "Ğ¡ Ğ°Ñ€Ñ‚Ğ¸ĞºÑƒĞ»Ğ¾Ğ¼", "Ğ‘ĞµĞ· Ğ°Ñ€Ñ‚Ğ¸ĞºÑƒĞ»Ğ°", "Ğ˜ÑÑ‚Ğ¾Ñ€Ğ¸Ñ", "Ğ˜ÑÑ‚Ğ¾Ñ€Ğ¸Ñ Ñ Ğ°Ñ€Ñ‚Ğ¸ĞºÑƒĞ»Ğ¾Ğ¼", "Ğ˜ÑÑ‚Ğ¾Ñ€Ğ¸Ñ Ğ±ĞµĞ· Ğ°Ñ€Ñ‚Ğ¸ĞºÑƒĞ»Ğ°"],
-            row=2,
-            widths=[320, 460, 260, 115, 115, 260, 150, 150],
-        )
-
-    def _build_scenario_tab(self) -> None:
-        self.scenario_tab.columnconfigure(0, weight=1)
-        self.scenario_tab.rowconfigure(3, weight=1)
-        ttk.Label(self.scenario_tab, text="Ğ”Ğ¾Ñ…Ğ¾Ğ´Ğ½Ğ¾ÑÑ‚ÑŒ Ğ¿Ñ€Ğ¸ Ğ¿Ğ»Ğ°Ğ½Ğ¾Ğ²Ğ¾Ğ¹ Ñ†ĞµĞ½Ğµ", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w", pady=(10, 2)
-        )
-        ttk.Label(
-            self.scenario_tab,
-            text="ĞĞ±ÑŠĞµĞ¼ Ğ¿Ñ€Ğ¾Ğ´Ğ°Ğ¶ Ğ¾ÑÑ‚Ğ°ĞµÑ‚ÑÑ Ñ‚ĞµĞºÑƒÑ‰Ğ¸Ğ¼. ĞšĞ¾Ğ¼Ğ¸ÑÑĞ¸Ñ, Ğ±Ğ°Ğ»Ğ»Ñ‹ Ğ¸ Ğ¿Ñ€Ğ¾Ñ‡Ğ¸Ğµ Ğ·Ğ°Ñ‚Ñ€Ğ°Ñ‚Ñ‹ Ğ¿ĞµÑ€ĞµÑÑ‡Ğ¸Ñ‚Ñ‹Ğ²Ğ°ÑÑ‚ÑÑ Ğ¿Ğ¾ ÑÑ€ĞµĞ´Ğ½Ğ¸Ğ¼ Ğ¿Ğ¾ĞºĞ°Ğ·Ğ°Ñ‚ĞµĞ»ÑĞ¼ Ğ²Ñ‹Ğ±Ñ€Ğ°Ğ½Ğ½Ğ¾Ğ³Ğ¾ Ğ¿ĞµÑ€Ğ¸Ğ¾Ğ´Ğ°.",
-            style="Muted.TLabel",
-        ).grid(row=1, column=0, sticky="w", pady=(0, 10))
-
-        scenario_top = ttk.Frame(self.scenario_tab)
-        scenario_top.grid(row=2, column=0, sticky="ew", pady=(0, 10))
-        scenario_top.columnconfigure(5, weight=1)
-        ttk.Label(scenario_top, text="ĞŸĞ»Ğ°Ğ½Ğ¾Ğ²Ğ°Ñ Ñ†ĞµĞ½Ğ° Ğ²Ñ‹Ğ±Ñ€Ğ°Ğ½Ğ½Ğ¾Ğ³Ğ¾ Ñ‚Ğ¾Ğ²Ğ°Ñ€Ğ°:").grid(row=0, column=0, padx=(0, 6))
-        self.planned_price_var = tk.StringVar()
-        ttk.Entry(scenario_top, textvariable=self.planned_price_var, width=16).grid(row=0, column=1, padx=(0, 6))
-        ttk.Button(scenario_top, text="ĞŸÑ€Ğ¸Ğ¼ĞµĞ½Ğ¸Ñ‚ÑŒ", command=self.apply_planned_price).grid(row=0, column=2, padx=(0, 18))
-        ttk.Label(scenario_top, text="Ğ˜Ğ·Ğ¼ĞµĞ½Ğ¸Ñ‚ÑŒ Ğ²ÑĞµ Ñ†ĞµĞ½Ñ‹ Ğ½Ğ°, %:").grid(row=0, column=3, padx=(0, 6))
-        self.batch_percent_var = tk.StringVar(value="5")
-        ttk.Entry(scenario_top, textvariable=self.batch_percent_var, width=10).grid(row=0, column=4, padx=(0, 6))
-        ttk.Button(scenario_top, text="ĞŸÑ€Ğ¸Ğ¼ĞµĞ½Ğ¸Ñ‚ÑŒ ĞºĞ¾ Ğ²ÑĞµĞ¼", command=self.apply_batch_percent).grid(row=0, column=5, sticky="w")
-        ttk.Button(scenario_top, text="Ğ¡Ğ±Ñ€Ğ¾ÑĞ¸Ñ‚ÑŒ Ñ†ĞµĞ½Ñ‹", command=self.reset_scenario).grid(row=0, column=6, padx=(12, 0))
-
-        self.scenario_tree = self._create_tree(
-            self.scenario_tab,
-            ["article", "name", "cost", "units", "current_price", "planned_price", "change", "profitability", "other_costs", "planned_revenue", "commission_rate", "commission", "points", "taxable", "tax", "profit", "profit_unit", "net_unit"],
-            ["ĞÑ€Ñ‚Ğ¸ĞºÑƒĞ»", "ĞĞ°Ğ¸Ğ¼ĞµĞ½Ğ¾Ğ²Ğ°Ğ½Ğ¸Ğµ", "Ğ¡ĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚ÑŒ", "ĞŸÑ€Ğ¾Ğ´Ğ°Ğ¶Ğ¸", "Ğ¢ĞµĞºÑƒÑ‰Ğ°Ñ Ñ†ĞµĞ½Ğ°", "ĞŸĞ»Ğ°Ğ½Ğ¾Ğ²Ğ°Ñ Ñ†ĞµĞ½Ğ°", "Ğ˜Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ğµ", "Ğ”Ğ¾Ñ…Ğ¾Ğ´Ğ½Ğ¾ÑÑ‚ÑŒ", "Ğ—Ğ°Ñ‚Ñ€Ğ°Ñ‚Ñ‹ Ozon Ğ±ĞµĞ· ĞºĞ¾Ğ¼Ğ¸ÑÑĞ¸Ğ¸", "ĞŸĞ»Ğ°Ğ½Ğ¾Ğ²Ğ°Ñ Ğ²Ñ‹Ñ€ÑƒÑ‡ĞºĞ°", "Ğ¡Ñ€ĞµĞ´Ğ½ÑÑ ĞºĞ¾Ğ¼Ğ¸ÑÑĞ¸Ñ", "ĞŸĞ»Ğ°Ğ½Ğ¾Ğ²Ğ°Ñ ĞºĞ¾Ğ¼Ğ¸ÑÑĞ¸Ñ", "ĞŸĞ»Ğ°Ğ½Ğ¾Ğ²Ñ‹Ğµ Ğ±Ğ°Ğ»Ğ»Ñ‹", "ĞĞ°Ğ»Ğ¾Ğ³Ğ¾Ğ²Ğ°Ñ Ğ±Ğ°Ğ·Ğ°", "ĞĞ°Ğ»Ğ¾Ğ³", "ĞŸÑ€Ğ¸Ğ±Ñ‹Ğ»ÑŒ Ğ¾Ñ‚ Ğ¿Ñ€Ğ¾Ğ´Ğ°Ğ¶", "ĞŸÑ€Ğ¸Ğ±Ñ‹Ğ»ÑŒ/ĞµĞ´. Ğ´Ğ¾ Ñ/Ñ", "Ğ§Ğ¸ÑÑ‚Ğ°Ñ Ğ¿Ñ€Ğ¸Ğ±Ñ‹Ğ»ÑŒ/ĞµĞ´."],
-            row=3,
-            widths=[120, 230] + [135] * 16,
-        )
-        self.scenario_tree.bind("<<TreeviewSelect>>", self._on_scenario_selected)
-
-        self.scenario_kpi_frame = ttk.Frame(self.scenario_tab)
-        self.scenario_kpi_frame.grid(row=4, column=0, sticky="ew", pady=(10, 0))
-        for column in range(4):
-            self.scenario_kpi_frame.columnconfigure(column, weight=1)
-        self.scenario_kpi_vars: dict[str, tk.StringVar] = {}
-        for index, (key, title) in enumerate(
-            [("current_revenue", "Ğ¢ĞµĞºÑƒÑ‰Ğ°Ñ Ğ²Ñ‹Ñ€ÑƒÑ‡ĞºĞ°"), ("planned_revenue", "ĞŸĞ»Ğ°Ğ½Ğ¾Ğ²Ğ°Ñ Ğ²Ñ‹Ñ€ÑƒÑ‡ĞºĞ°"), ("planned_net", "ĞŸĞ»Ğ°Ğ½Ğ¾Ğ²Ğ°Ñ Ñ‡Ğ¸ÑÑ‚Ğ°Ñ Ğ¿Ñ€Ğ¸Ğ±Ñ‹Ğ»ÑŒ"), ("planned_margin", "ĞŸĞ»Ğ°Ğ½Ğ¾Ğ²Ğ°Ñ Ğ´Ğ¾Ñ…Ğ¾Ğ´Ğ½Ğ¾ÑÑ‚ÑŒ")]
-        ):
-            self.scenario_kpi_vars[key] = tk.StringVar(value="â€”")
-            card = ttk.Frame(self.scenario_kpi_frame, style="Card.TFrame", padding=(16, 12))
-            card.grid(row=0, column=index, sticky="nsew", padx=(0 if index == 0 else 5, 0 if index == 3 else 5))
-            ttk.Label(card, text=title, style="CardMuted.TLabel").grid(row=0, column=0, sticky="w")
-            ttk.Label(card, textvariable=self.scenario_kpi_vars[key], style="Kpi.TLabel").grid(row=1, column=0, sticky="w", pady=(4, 0))
-
-    def _build_history_tab(self) -> None:
-        self.history_tab.columnconfigure(0, weight=1)
-        self.history_tab.rowconfigure(1, weight=3)
-        self.history_tab.rowconfigure(3, weight=2)
-        ttk.Label(self.history_tab, text="Ğ˜ÑÑ‚Ğ¾Ñ€Ğ¸Ñ Ñ€Ğ°ÑÑ‡ĞµÑ‚Ğ¾Ğ²", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w", pady=(10, 8)
-        )
-        self.history_tree = self._create_tree(
-            self.history_tab,
-            ["id", "period", "created", "files", "units", "revenue", "net", "unallocated", "status"],
-            ["â„–", "ĞŸĞµÑ€Ğ¸Ğ¾Ğ´", "Ğ”Ğ°Ñ‚Ğ° Ñ€Ğ°ÑÑ‡ĞµÑ‚Ğ°", "Ğ¤Ğ°Ğ¹Ğ»Ğ¾Ğ²", "ĞŸÑ€Ğ¾Ğ´Ğ°Ğ¶Ğ¸", "Ğ’Ñ‹Ñ€ÑƒÑ‡ĞºĞ°", "Ğ§Ğ¸ÑÑ‚Ğ°Ñ Ğ¿Ñ€Ğ¸Ğ±Ñ‹Ğ»ÑŒ", "ĞĞµÑ€Ğ°ÑĞ¿Ñ€ĞµĞ´ĞµĞ»ĞµĞ½Ğ½Ñ‹Ğµ", "Ğ¡Ñ‚Ğ°Ñ‚ÑƒÑ"],
-            row=1,
-            height=10,
-            widths=[60, 210, 160, 80, 110, 150, 150, 160, 100],
-        )
-        self.history_tree.bind("<Double-1>", self._open_history_run)
-        ttk.Label(self.history_tab, text="ĞšĞ¾Ğ½Ñ‚Ñ€Ğ¾Ğ»ÑŒ ĞºĞ°Ñ‡ĞµÑÑ‚Ğ²Ğ° Ğ²Ñ‹Ğ±Ñ€Ğ°Ğ½Ğ½Ğ¾Ğ³Ğ¾ Ñ€Ğ°ÑÑ‡ĞµÑ‚Ğ°", style="Section.TLabel").grid(
-            row=2, column=0, sticky="w", pady=(14, 8)
-        )
-        self.quality_tree = self._create_tree(
-            self.history_tab,
-            ["severity", "type", "message"],
-            ["Ğ£Ñ€Ğ¾Ğ²ĞµĞ½ÑŒ", "ĞŸÑ€Ğ¾Ğ²ĞµÑ€ĞºĞ°", "Ğ¡Ğ¾Ğ¾Ğ±Ñ‰ĞµĞ½Ğ¸Ğµ"],
-            row=3,
-            widths=[140, 220, 900],
-        )
-
-    def _build_trend_tab(self) -> None:
-        self.trend_tab.columnconfigure(0, weight=1)
-        self.trend_tab.rowconfigure(3, weight=3)
-        self.trend_tab.rowconfigure(5, weight=2)
-        ttk.Label(self.trend_tab, text="Ğ”Ğ¸Ğ½Ğ°Ğ¼Ğ¸ĞºĞ° Ğ¿Ğ¾ĞºĞ°Ğ·Ğ°Ñ‚ĞµĞ»ĞµĞ¹", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w", pady=(10, 2)
-        )
-        ttk.Label(
-            self.trend_tab,
-            text="ĞšĞ°Ğ¶Ğ´Ğ°Ñ Ñ‚Ğ¾Ñ‡ĞºĞ° â€” ÑĞ¾Ñ…Ñ€Ğ°Ğ½ĞµĞ½Ğ½Ñ‹Ğ¹ Ñ€Ğ°ÑÑ‡ĞµÑ‚. ĞŸĞµÑ€Ğ¸Ğ¾Ğ´Ñ‹ Ñ€Ğ°ÑĞ¿Ğ¾Ğ»Ğ¾Ğ¶ĞµĞ½Ñ‹ Ğ¿Ğ¾ Ğ´Ğ°Ñ‚Ğµ Ğ½Ğ°Ñ‡Ğ°Ğ»Ğ° Ğ¾Ñ‚Ñ‡ĞµÑ‚Ğ°.",
-            style="Muted.TLabel",
-        ).grid(row=1, column=0, sticky="w", pady=(0, 10))
-        controls = ttk.Frame(self.trend_tab)
-        controls.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        ttk.Label(controls, text="ĞŸĞ¾ĞºĞ°Ğ·Ğ°Ñ‚ĞµĞ»ÑŒ:").grid(row=0, column=0, padx=(0, 6))
-        self.trend_metric_var = tk.StringVar(value="Ğ’Ñ‹Ñ€ÑƒÑ‡ĞºĞ°")
-        trend_combo = ttk.Combobox(
-            controls,
-            textvariable=self.trend_metric_var,
-            state="readonly",
-            values=list(TREND_METRICS),
-            width=36,
-        )
-        trend_combo.grid(row=0, column=1, sticky="w")
-        trend_combo.bind("<<ComboboxSelected>>", lambda _event: self._draw_trend_chart())
-
-        self.trend_canvas = tk.Canvas(
-            self.trend_tab,
-            height=360,
-            highlightthickness=1,
-            bd=0,
-        )
-        self.trend_canvas.grid(row=3, column=0, sticky="nsew", pady=(0, 10))
-        self.trend_canvas.bind("<Configure>", lambda _event: self._draw_trend_chart())
-        self.trend_canvas.bind("<Motion>", self._trend_hover)
-        self.trend_canvas.bind("<Leave>", lambda _event: self.trend_canvas.delete("tooltip"))
-
-        ttk.Label(self.trend_tab, text="Ğ¢Ğ°Ğ±Ğ»Ğ¸Ñ†Ğ° Ğ´Ğ¸Ğ½Ğ°Ğ¼Ğ¸ĞºĞ¸", style="Section.TLabel").grid(
-            row=4, column=0, sticky="w", pady=(4, 8)
-        )
-        self.trend_tree = self._create_tree(
-            self.trend_tab,
-            ["run", "period", "units", "revenue", "revenue_change", "net", "net_change", "unallocated"],
-            [
-                "Ğ Ğ°ÑÑ‡ĞµÑ‚", "ĞŸĞµÑ€Ğ¸Ğ¾Ğ´", "ĞŸÑ€Ğ¾Ğ´Ğ°Ğ¶Ğ¸", "Ğ’Ñ‹Ñ€ÑƒÑ‡ĞºĞ°", "Ğ˜Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ğµ Ğ²Ñ‹Ñ€ÑƒÑ‡ĞºĞ¸",
-                "Ğ§Ğ¸ÑÑ‚Ğ°Ñ Ğ¿Ñ€Ğ¸Ğ±Ñ‹Ğ»ÑŒ", "Ğ˜Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ğµ Ğ¿Ñ€Ğ¸Ğ±Ñ‹Ğ»Ğ¸", "ĞĞµÑ€Ğ°ÑĞ¿Ñ€ĞµĞ´ĞµĞ»ĞµĞ½Ğ½Ñ‹Ğµ",
-            ],
-            row=5,
-            widths=[80, 230, 110, 150, 170, 150, 170, 170],
-            height=8,
-        )
-
-    def _build_comparison_tab(self) -> None:
-        self.comparison_tab.columnconfigure(0, weight=1)
-        self.comparison_tab.rowconfigure(4, weight=1)
-        ttk.Label(self.comparison_tab, text="Ğ¡Ñ€Ğ°Ğ²Ğ½ĞµĞ½Ğ¸Ğµ ÑĞ¾Ñ…Ñ€Ğ°Ğ½ĞµĞ½Ğ½Ñ‹Ñ… Ğ¿ĞµÑ€Ğ¸Ğ¾Ğ´Ğ¾Ğ²", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w", pady=(10, 2)
-        )
-        ttk.Label(
-            self.comparison_tab,
-            text="ĞŸĞµÑ€Ğ²Ñ‹Ğ¹ Ğ¿ĞµÑ€Ğ¸Ğ¾Ğ´ â€” Ğ±Ğ°Ğ·Ğ° ÑÑ€Ğ°Ğ²Ğ½ĞµĞ½Ğ¸Ñ. Ğ˜Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ğµ Ğ¿Ğ¾ĞºĞ°Ğ·Ñ‹Ğ²Ğ°ĞµÑ‚ Ğ²Ñ‚Ğ¾Ñ€Ğ¾Ğ¹ Ğ¿ĞµÑ€Ğ¸Ğ¾Ğ´ Ğ¾Ñ‚Ğ½Ğ¾ÑĞ¸Ñ‚ĞµĞ»ÑŒĞ½Ğ¾ Ğ¿ĞµÑ€Ğ²Ğ¾Ğ³Ğ¾.",
-            style="Muted.TLabel",
-        ).grid(row=1, column=0, sticky="w", pady=(0, 10))
-
-        controls = ttk.Frame(self.comparison_tab)
-        controls.grid(row=2, column=0, sticky="ew", pady=(0, 12))
-        ttk.Label(controls, text="ĞŸĞµÑ€Ğ²Ñ‹Ğ¹ Ğ¿ĞµÑ€Ğ¸Ğ¾Ğ´:").grid(row=0, column=0, padx=(0, 6))
-        self.compare_first_var = tk.StringVar()
-        self.compare_first_combo = ttk.Combobox(
-            controls, textvariable=self.compare_first_var, state="readonly", width=34
-        )
-        self.compare_first_combo.grid(row=0, column=1, padx=(0, 18))
-        ttk.Label(controls, text="Ğ’Ñ‚Ğ¾Ñ€Ğ¾Ğ¹ Ğ¿ĞµÑ€Ğ¸Ğ¾Ğ´:").grid(row=0, column=2, padx=(0, 6))
-        self.compare_second_var = tk.StringVar()
-        self.compare_second_combo = ttk.Combobox(
-            controls, textvariable=self.compare_second_var, state="readonly", width=34
-        )
-        self.compare_second_combo.grid(row=0, column=3, padx=(0, 12))
-        ttk.Button(controls, text="Ğ¡Ñ€Ğ°Ğ²Ğ½Ğ¸Ñ‚ÑŒ", style="Accent.TButton", command=self.refresh_comparison).grid(
-            row=0, column=4
-        )
-
-        self.comparison_kpi_frame = ttk.Frame(self.comparison_tab)
-        self.comparison_kpi_frame.grid(row=3, column=0, sticky="ew", pady=(0, 12))
-        for column in range(4):
-            self.comparison_kpi_frame.columnconfigure(column, weight=1)
-        self.comparison_kpi_vars: dict[str, tk.StringVar] = {}
-        for index, (key, title) in enumerate(
-            [
-                ("revenue", "Ğ˜Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ğµ Ğ²Ñ‹Ñ€ÑƒÑ‡ĞºĞ¸"),
-                ("net_profit", "Ğ˜Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ğµ Ñ‡Ğ¸ÑÑ‚Ğ¾Ğ¹ Ğ¿Ñ€Ğ¸Ğ±Ñ‹Ğ»Ğ¸"),
-                ("units", "Ğ˜Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ğµ Ğ¿Ñ€Ğ¾Ğ´Ğ°Ğ¶"),
-                ("unallocated", "Ğ˜Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ğµ Ğ½ĞµÑ€Ğ°ÑĞ¿Ñ€ĞµĞ´ĞµĞ»ĞµĞ½Ğ½Ñ‹Ñ…"),
-            ]
-        ):
-            self.comparison_kpi_vars[key] = tk.StringVar(value="â€”")
-            card = ttk.Frame(self.comparison_kpi_frame, style="Card.TFrame", padding=(16, 12))
-            card.grid(row=0, column=index, sticky="nsew", padx=(0 if index == 0 else 5, 0 if index == 3 else 5))
-            ttk.Label(card, text=title, style="CardMuted.TLabel").grid(row=0, column=0, sticky="w")
-            ttk.Label(card, textvariable=self.comparison_kpi_vars[key], style="Kpi.TLabel").grid(
-                row=1, column=0, sticky="w", pady=(4, 0)
-            )
-
-        self.comparison_tree = self._create_tree(
-            self.comparison_tab,
-            [
-                "article", "name", "units_first", "units_second", "units_change",
-                "revenue_first", "revenue_second", "revenue_change", "revenue_percent",
-                "profit_first", "profit_second", "profit_change", "profit_percent",
-                "margin_first", "margin_second", "margin_change",
-            ],
-            [
-                "ĞÑ€Ñ‚Ğ¸ĞºÑƒĞ»", "ĞĞ°Ğ¸Ğ¼ĞµĞ½Ğ¾Ğ²Ğ°Ğ½Ğ¸Ğµ", "ĞŸÑ€Ğ¾Ğ´Ğ°Ğ¶Ğ¸ 1", "ĞŸÑ€Ğ¾Ğ´Ğ°Ğ¶Ğ¸ 2", "Ğ˜Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ğµ Ğ¿Ñ€Ğ¾Ğ´Ğ°Ğ¶",
-                "Ğ’Ñ‹Ñ€ÑƒÑ‡ĞºĞ° 1", "Ğ’Ñ‹Ñ€ÑƒÑ‡ĞºĞ° 2", "Ğ˜Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ğµ Ğ²Ñ‹Ñ€ÑƒÑ‡ĞºĞ¸", "Ğ’Ñ‹Ñ€ÑƒÑ‡ĞºĞ°, %",
-                "Ğ§Ğ¸ÑÑ‚Ğ°Ñ Ğ¿Ñ€Ğ¸Ğ±Ñ‹Ğ»ÑŒ 1", "Ğ§Ğ¸ÑÑ‚Ğ°Ñ Ğ¿Ñ€Ğ¸Ğ±Ñ‹Ğ»ÑŒ 2", "Ğ˜Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ğµ Ğ¿Ñ€Ğ¸Ğ±Ñ‹Ğ»Ğ¸", "ĞŸÑ€Ğ¸Ğ±Ñ‹Ğ»ÑŒ, %",
-                "Ğ”Ğ¾Ñ…Ğ¾Ğ´Ğ½Ğ¾ÑÑ‚ÑŒ 1", "Ğ”Ğ¾Ñ…Ğ¾Ğ´Ğ½Ğ¾ÑÑ‚ÑŒ 2", "Ğ˜Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ğµ Ğ´Ğ¾Ñ…Ğ¾Ğ´Ğ½Ğ¾ÑÑ‚Ğ¸",
-            ],
-            row=4,
-            widths=[120, 230] + [135] * 14,
-        )
-
-    def _build_settings_tab(self) -> None:
-        self.settings_tab.columnconfigure(0, weight=1)
-        self.settings_tab.rowconfigure(3, weight=1)
-        ttk.Label(self.settings_tab, text="ĞĞ°ÑÑ‚Ñ€Ğ¾Ğ¹ĞºĞ¸ Ğ¿Ñ€Ğ¸Ğ»Ğ¾Ğ¶ĞµĞ½Ğ¸Ñ", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w", pady=(10, 8)
-        )
-        settings = ttk.Frame(self.settings_tab)
-        settings.grid(row=1, column=0, sticky="ew", pady=(0, 12))
-        settings.columnconfigure(1, weight=1)
-        settings.columnconfigure(3, weight=1)
-
-        ttk.Label(settings, text="Ğ¢ĞµĞ¼Ğ°:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=5)
-        self.theme_var = tk.StringVar(value=THEME_VALUES.get(self.db.get_setting("theme", "system"), "Ğ¡Ğ¸ÑÑ‚ĞµĞ¼Ğ½Ğ°Ñ"))
-        theme_combo = ttk.Combobox(settings, textvariable=self.theme_var, state="readonly", values=list(THEME_LABELS), width=20)
-        theme_combo.grid(row=0, column=1, sticky="w", pady=5)
-        theme_combo.bind("<<ComboboxSelected>>", self._preview_theme)
-
-        ttk.Label(settings, text="ĞĞ°Ğ»Ğ¾Ğ³Ğ¾Ğ²Ğ°Ñ ÑÑ‚Ğ°Ğ²ĞºĞ°, %:").grid(row=0, column=2, sticky="w", padx=(24, 8), pady=5)
-        self.tax_rate_var = tk.StringVar(value=_plain_number(float(self.db.get_setting("tax_rate", "0.04")) * 100))
-        ttk.Entry(settings, textvariable=self.tax_rate_var, width=14).grid(row=0, column=3, sticky="w", pady=5)
-
-        ttk.Label(settings, text="ĞŸĞ¾Ğ²Ñ‚Ğ¾Ñ€Ğ½Ğ°Ñ Ğ·Ğ°Ğ³Ñ€ÑƒĞ·ĞºĞ° Ñ„Ğ°Ğ¹Ğ»Ğ°:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=5)
-        self.duplicate_policy_var = tk.StringVar(
-            value=DUPLICATE_VALUES.get(self.db.get_setting("duplicate_policy", "ask"), "Ğ¡Ğ¿Ñ€Ğ°ÑˆĞ¸Ğ²Ğ°Ñ‚ÑŒ")
-        )
-        ttk.Combobox(
-            settings,
-            textvariable=self.duplicate_policy_var,
-            state="readonly",
-            values=list(DUPLICATE_LABELS),
-            width=20,
-        ).grid(row=1, column=1, sticky="w", pady=5)
-
-        self.warn_realization_var = tk.BooleanVar(value=self.db.get_setting("warn_without_realization", "1") == "1")
-        ttk.Checkbutton(
-            settings,
-            variable=self.warn_realization_var,
-            text="ĞŸÑ€ĞµĞ´ÑƒĞ¿Ñ€ĞµĞ¶Ğ´Ğ°Ñ‚ÑŒ, ĞµÑĞ»Ğ¸ Ğ½Ğµ Ğ²Ñ‹Ğ±Ñ€Ğ°Ğ½ Ğ¾Ñ‚Ñ‡ĞµÑ‚ Ğ¾ Ğ²Ñ‹ĞºÑƒĞ¿Ğ»ĞµĞ½Ğ½Ñ‹Ñ… Ñ‚Ğ¾Ğ²Ğ°Ñ€Ğ°Ñ…",
-        ).grid(row=1, column=2, columnspan=2, sticky="w", padx=(24, 0), pady=5)
-
-        ttk.Label(settings, text="Ğ¡Ñ‚Ñ€Ğ¾Ğº Ğ² Ğ¿Ñ€ĞµĞ´Ğ¿Ñ€Ğ¾ÑĞ¼Ğ¾Ñ‚Ñ€Ğµ:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=5)
-        self.preview_rows_var = tk.StringVar(value=self.db.get_setting("preview_rows", "500"))
-        ttk.Spinbox(settings, textvariable=self.preview_rows_var, from_=100, to=5000, increment=100, width=12).grid(
-            row=2, column=1, sticky="w", pady=5
-        )
-        ttk.Label(settings, text="Ğ¥Ñ€Ğ°Ğ½Ğ¸Ğ»Ğ¸Ñ‰Ğµ:").grid(row=2, column=2, sticky="w", padx=(24, 8), pady=5)
-        storage_controls = ttk.Frame(settings)
-        storage_controls.grid(row=2, column=3, sticky="ew", pady=5)
-        storage_controls.columnconfigure(0, weight=1)
-        self.storage_path_var = tk.StringVar(value=str(self.service.paths["root"]))
-        ttk.Entry(storage_controls, textvariable=self.storage_path_var, state="readonly", width=48).grid(
-            row=0, column=0, sticky="ew", padx=(0, 6)
-        )
-        ttk.Button(storage_controls, text="Ğ˜Ğ·Ğ¼ĞµĞ½Ğ¸Ñ‚ÑŒâ€¦", command=self.choose_storage_folder).grid(
-            row=0, column=1, padx=3
-        )
-        ttk.Button(
-            storage_controls,
-            text="ĞÑ‚ĞºÑ€Ñ‹Ñ‚ÑŒ",
-            command=lambda: _open_path(self.service.paths["root"]),
-        ).grid(row=0, column=2, padx=(3, 0))
-        ttk.Button(settings, text="Ğ¡Ğ¾Ñ…Ñ€Ğ°Ğ½Ğ¸Ñ‚ÑŒ Ğ½Ğ°ÑÑ‚Ñ€Ğ¾Ğ¹ĞºĞ¸", style="Accent.TButton", command=self.save_settings).grid(
-            row=3, column=0, columnspan=4, sticky="w", pady=(10, 0)
-        )
-
-        backup_box = ttk.LabelFrame(settings, text="Ğ ĞµĞ·ĞµÑ€Ğ²Ğ½Ğ°Ñ ĞºĞ¾Ğ¿Ğ¸Ñ Ğ¸ Ğ¿ĞµÑ€ĞµĞ½Ğ¾Ñ Ğ½Ğ° Ğ´Ñ€ÑƒĞ³Ğ¾Ğ¹ ĞºĞ¾Ğ¼Ğ¿ÑŒÑÑ‚ĞµÑ€", padding=(12, 10))
-        backup_box.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(14, 0))
-        backup_box.columnconfigure(0, weight=1)
-        ttk.Label(
-            backup_box,
-            text="ĞÑ€Ñ…Ğ¸Ğ² ÑĞ¾Ğ´ĞµÑ€Ğ¶Ğ¸Ñ‚ Ğ¸ÑÑ‚Ğ¾Ñ€Ğ¸Ñ Ñ€Ğ°ÑÑ‡ĞµÑ‚Ğ¾Ğ², Ğ½Ğ°ÑÑ‚Ñ€Ğ¾Ğ¹ĞºĞ¸, ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚ÑŒ Ğ¸ ÑĞ¾Ñ…Ñ€Ğ°Ğ½ĞµĞ½Ğ½Ñ‹Ğµ Ğ¸ÑÑ…Ğ¾Ğ´Ğ½Ñ‹Ğµ Ğ¾Ñ‚Ñ‡ĞµÑ‚Ñ‹.",
-            style="Muted.TLabel",
-        ).grid(row=0, column=0, sticky="w")
-        backup_actions = ttk.Frame(backup_box)
-        backup_actions.grid(row=0, column=1, sticky="e", padx=(16, 0))
-        ttk.Button(
-            backup_actions,
-            text="Ğ¡Ğ¾Ğ·Ğ´Ğ°Ñ‚ÑŒ Ñ€ĞµĞ·ĞµÑ€Ğ²Ğ½ÑƒÑ ĞºĞ¾Ğ¿Ğ¸Ñ",
-            command=self.create_application_backup,
-        ).grid(row=0, column=0, padx=4)
-        ttk.Button(
-            backup_actions,
-            text="Ğ’Ğ¾ÑÑÑ‚Ğ°Ğ½Ğ¾Ğ²Ğ¸Ñ‚ÑŒ / Ğ¿ĞµÑ€ĞµĞ½ĞµÑÑ‚Ğ¸",
-            command=self.restore_application_backup,
-        ).grid(row=0, column=1, padx=4)
-
-        product_header = ttk.Frame(self.settings_tab)
-        product_header.grid(row=2, column=0, sticky="ew", pady=(6, 8))
-        product_header.columnconfigure(0, weight=1)
-        ttk.Label(product_header, text="Ğ¢Ğ¾Ğ²Ğ°Ñ€Ñ‹ Ğ¸ ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚ÑŒ", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Button(
-            product_header,
-            text="Ğ ĞµĞ´Ğ°ĞºÑ‚Ğ¸Ñ€Ğ¾Ğ²Ğ°Ñ‚ÑŒ ÑĞ¿Ñ€Ğ°Ğ²Ğ¾Ñ‡Ğ½Ğ¸Ğº",
-            style="Accent.TButton",
-            command=self.open_cost_catalog_editor,
-        ).grid(row=0, column=1, padx=(8, 4))
-        ttk.Button(product_header, text="Ğ”Ğ¾Ğ±Ğ°Ğ²Ğ¸Ñ‚ÑŒ Ñ‚Ğ¾Ğ²Ğ°Ñ€", command=self.add_product).grid(row=0, column=2, padx=4)
-        ttk.Button(product_header, text="Ğ˜Ğ·Ğ¼ĞµĞ½Ğ¸Ñ‚ÑŒ Ğ²Ñ‹Ğ±Ñ€Ğ°Ğ½Ğ½Ñ‹Ğ¹", command=self.edit_product).grid(row=0, column=3, padx=4)
-        ttk.Button(product_header, text="Ğ’ Ğ°Ñ€Ñ…Ğ¸Ğ² / Ğ²Ğ¾ÑÑÑ‚Ğ°Ğ½Ğ¾Ğ²Ğ¸Ñ‚ÑŒ", command=self.toggle_product).grid(row=0, column=4, padx=4)
-        ttk.Button(product_header, text="Ğ–ÑƒÑ€Ğ½Ğ°Ğ» Ğ¸Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ğ¹", command=self.show_cost_history).grid(row=0, column=5, padx=4)
-        ttk.Label(
-            product_header,
-            text="ĞÑĞ½Ğ¾Ğ²Ğ½Ğ¾Ğ¹ ÑĞ¿Ğ¾ÑĞ¾Ğ± â€” Ğ·Ğ°Ğ¿Ğ¾Ğ»Ğ½ĞµĞ½Ğ¸Ğµ Ğ¿Ñ€ÑĞ¼Ğ¾ Ğ² Ğ¿Ñ€Ğ¸Ğ»Ğ¾Ğ¶ĞµĞ½Ğ¸Ğ¸. XLSX Ğ½ÑƒĞ¶ĞµĞ½ Ñ‚Ğ¾Ğ»ÑŒĞºĞ¾ Ğ´Ğ»Ñ Ğ¾Ğ±Ğ¼ĞµĞ½Ğ° Ğ¸Ğ»Ğ¸ Ñ€ĞµĞ·ĞµÑ€Ğ²Ğ½Ğ¾Ğ¹ ĞºĞ¾Ğ¿Ğ¸Ğ¸.",
-            style="Muted.TLabel",
-        ).grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 8))
-
-        filters = ttk.Frame(product_header)
-        filters.grid(row=2, column=0, columnspan=6, sticky="ew")
-        filters.columnconfigure(5, weight=1)
-        ttk.Label(filters, text="ĞŸĞ¾Ğ¸ÑĞº:").grid(row=0, column=0, padx=(0, 6))
-        self.product_search_var = tk.StringVar()
-        search_entry = ttk.Entry(filters, textvariable=self.product_search_var, width=28)
-        search_entry.grid(row=0, column=1, padx=(0, 12))
-        self.product_search_var.trace_add("write", lambda *_args: self.refresh_products())
-        ttk.Label(filters, text="ĞŸĞ¾ĞºĞ°Ğ·Ñ‹Ğ²Ğ°Ñ‚ÑŒ:").grid(row=0, column=2, padx=(0, 6))
-        self.product_status_var = tk.StringVar(value="Ğ’ÑĞµ")
-        status_combo = ttk.Combobox(
-            filters,
-            textvariable=self.product_status_var,
-            state="readonly",
-            values=("Ğ’ÑĞµ", "ĞĞºÑ‚Ğ¸Ğ²Ğ½Ñ‹Ğµ", "ĞÑ€Ñ…Ğ¸Ğ²"),
-            width=12,
-        )
-        status_combo.grid(row=0, column=3, padx=(0, 12))
-        status_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_products())
-        self.product_count_var = tk.StringVar(value="ĞŸĞ¾ĞºĞ°Ğ·Ğ°Ğ½Ğ¾: 0")
-        ttk.Label(filters, textvariable=self.product_count_var, style="Muted.TLabel").grid(
-            row=0, column=4, sticky="w"
-        )
-        ttk.Button(filters, text="Ğ’Ñ‹Ğ³Ñ€ÑƒĞ·Ğ¸Ñ‚ÑŒ XLSX", command=self.export_product_catalog).grid(row=0, column=6, padx=4)
-        ttk.Button(filters, text="Ğ—Ğ°Ğ³Ñ€ÑƒĞ·Ğ¸Ñ‚ÑŒ XLSX", command=self.import_product_catalog).grid(row=0, column=7, padx=4)
-        self.products_tree = self._create_tree(
-            self.settings_tab,
-            ["article", "name", "total", "material", "labor", "status"],
-            ["ĞÑ€Ñ‚Ğ¸ĞºÑƒĞ»", "ĞĞ°Ğ¸Ğ¼ĞµĞ½Ğ¾Ğ²Ğ°Ğ½Ğ¸Ğµ", "ĞŸĞ¾Ğ»Ğ½Ğ°Ñ ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚ÑŒ", "ĞœĞ°Ñ‚ĞµÑ€Ğ¸Ğ°Ğ»", "Ğ¢Ñ€ÑƒĞ´Ğ¾Ğ·Ğ°Ñ‚Ñ€Ğ°Ñ‚Ñ‹", "Ğ¡Ñ‚Ğ°Ñ‚ÑƒÑ"],
-            row=3,
-            widths=[150, 360, 180, 150, 150, 110],
-        )
-        self.products_tree.bind("<Double-1>", lambda _event: self.edit_product())
-
-    def _create_tree(
-        self,
-        parent,
-        columns: list[str],
-        headings: list[str],
-        row: int,
-        widths: list[int] | None = None,
-        height: int = 18,
-    ) -> ttk.Treeview:
-        container = ttk.Frame(parent)
-        container.grid(row=row, column=0, sticky="nsew")
-        container.columnconfigure(0, weight=1)
-        container.rowconfigure(0, weight=1)
-        tree = ttk.Treeview(container, columns=columns, show="headings", height=height)
-        xscroll = ttk.Scrollbar(container, orient="horizontal", command=tree.xview)
-        yscroll = ttk.Scrollbar(container, orient="vertical", command=tree.yview)
-        tree.configure(xscrollcommand=xscroll.set, yscrollcommand=yscroll.set)
-        tree.grid(row=0, column=0, sticky="nsew")
-        yscroll.grid(row=0, column=1, sticky="ns")
-        xscroll.grid(row=1, column=0, sticky="ew")
-        widths = widths or [140] * len(columns)
-        for column, heading, width in zip(columns, headings, widths):
-            tree.heading(column, text=heading)
-            tree.column(column, width=width, minwidth=70, stretch=False, anchor="w" if column in {"article", "name", "type", "category", "message"} else "e")
-        return tree
-
-    def refresh_all(self) -> None:
-        self.refresh_products()
-        self.refresh_runs()
-
-    def refresh_runs(self) -> None:
-        runs = self.db.list_runs()
-        self.run_display_to_id.clear()
-        values: list[str] = []
-        for run in runs:
-            period = _period_text(run.period_start, run.period_end)
-            display = f"#{run.id} Â· {period} Â· {run.created_at[:16]}"
-            values.append(display)
-            self.run_display_to_id[display] = run.id
-        self.run_combo["values"] = values
-        self.compare_first_combo["values"] = values
-        self.compare_second_combo["values"] = values
-        if not runs:
-            self.run_var.set("ĞĞµÑ‚ Ñ€Ğ°ÑÑ‡ĞµÑ‚Ğ¾Ğ²")
-            self._clear_current_view()
-        else:
-            target_id = self.current_run_id if self.current_run_id in {run.id for run in runs} else runs[0].id
-            display = next(key for key, value in self.run_display_to_id.items() if value == target_id)
-            self.run_var.set(display)
-            self.select_run(target_id)
-            if len(values) >= 2:
-                if self.compare_first_var.get() not in values:
-                    self.compare_first_var.set(values[1])
-                if self.compare_second_var.get() not in values:
-                    self.compare_second_var.set(values[0])
-                self.refresh_comparison()
-            else:
-                self.compare_first_var.set(values[0])
-                self.compare_second_var.set(values[0])
-                self._clear_comparison("Ğ”Ğ»Ñ ÑÑ€Ğ°Ğ²Ğ½ĞµĞ½Ğ¸Ñ Ğ·Ğ°Ğ³Ñ€ÑƒĞ·Ğ¸Ñ‚Ğµ ĞºĞ°Ğº Ğ¼Ğ¸Ğ½Ğ¸Ğ¼ÑƒĞ¼ Ğ´Ğ²Ğ° Ğ¿ĞµÑ€Ğ¸Ğ¾Ğ´Ğ°")
-        self.refresh_history()
-        self.refresh_trends(runs)
-
-    def select_run(self, run_id: int) -> None:
-        self.current_run_id = run_id
-        self.current_calculation = self.db.load_calculation(run_id)
-        self._populate_overview()
-        self._populate_sources()
-        self._populate_breakdown()
-        self._populate_guide()
-        self._populate_scenario()
-        self._populate_quality()
-        self.status_var.set(f"ĞÑ‚ĞºÑ€Ñ‹Ñ‚ Ñ€Ğ°ÑÑ‡ĞµÑ‚ #{run_id}: {_calculation_period(self.current_calculation)}")
-
-    def _on_run_selected(self, _event=None) -> None:
-        run_id = self.run_display_to_id.get(self.run_var.get())
-        if run_id is not None:
-            self.select_run(run_id)
-
-    def _clear_current_view(self) -> None:
-        self.current_run_id = None
-        self.current_calculation = None
-        for tree in (self.overview_tree, self.source_tree, self.breakdown_tree, self.guide_tree, self.scenario_tree, self.quality_tree):
-            tree.delete(*tree.get_children())
-        for variable in self.kpi_vars.values():
-            variable.set("â€”")
-        for variable in self.scenario_kpi_vars.values():
-            variable.set("â€”")
-
-    def _populate_overview(self) -> None:
-        calculation = self.current_calculation
-        if calculation is None:
-            return
-        totals = calculation.totals()
-        cost = totals["cost_sold"]
-        self.kpi_vars["revenue"].set(_money(totals["revenue"]))
-        self.kpi_vars["net_profit"].set(_money(totals["net_profit"]))
-        self.kpi_vars["profitability"].set(_percent(totals["net_profit"] / cost if cost else 0))
-        self.kpi_vars["units"].set(_number(totals["units"]))
-        self.kpi_vars["unallocated"].set(_money(totals["unallocated"]))
-        self.kpi_vars["files"].set(str(len(self.db.list_source_files(calculation.run_id or 0))))
-        self.overview_tree.delete(*self.overview_tree.get_children())
-        for result in calculation.products:
-            values = _result_values(result, calculation.tax_rate)
-            tag = "negative" if result.net_profit(calculation.tax_rate) < 0 else "positive"
-            self.overview_tree.insert("", "end", iid=result.article, values=values, tags=(tag,))
-        self._configure_value_tags(self.overview_tree)
-
-    def _populate_sources(self) -> None:
-        if self.current_run_id is None:
-            return
-        sources = self.db.list_source_files(self.current_run_id)
-        self.source_tree.delete(*self.source_tree.get_children())
-        self.source_by_iid.clear()
-        for row in sources:
-            iid = str(row["id"])
-            self.source_by_iid[iid] = row
-            report_type = "ĞĞ°Ñ‡Ğ¸ÑĞ»ĞµĞ½Ğ¸Ñ" if row["report_type"] == "ACCRUAL" else "Ğ’Ñ‹ĞºÑƒĞ¿Ğ»ĞµĞ½Ğ½Ñ‹Ğµ Ñ‚Ğ¾Ğ²Ğ°Ñ€Ñ‹"
-            period = _period_text(row.get("period_start"), row.get("period_end"))
-            self.source_tree.insert(
-                "",
-                "end",
-                iid=iid,
-                values=(row["original_name"], report_type, row["row_count"], _money(float(row["total_amount"])), period, str(row["file_hash"])[:24]),
-            )
-        if sources:
-            first = str(sources[0]["id"])
-            self.source_tree.selection_set(first)
-            self.source_tree.focus(first)
-            self._on_source_selected()
-
-    def _on_source_selected(self, _event=None) -> None:
-        selection = self.source_tree.selection()
-        if not selection:
-            return
-        source = self.source_by_iid.get(selection[0])
-        if source is None:
-            return
-        try:
-            self.preview_path = str(source["stored_path"])
-            self.preview_file_var.set(f"Ğ¤Ğ°Ğ¹Ğ»: {source['original_name']}")
-            sheets = workbook_sheet_names(self.preview_path)
-            self.sheet_combo["values"] = sheets
-            preferred = str(source["sheet_name"])
-            self.sheet_var.set(preferred if preferred in sheets else sheets[0])
-            self._load_preview()
-        except Exception as exc:
-            messagebox.showerror("ĞŸÑ€Ğ¾ÑĞ¼Ğ¾Ñ‚Ñ€ Ñ„Ğ°Ğ¹Ğ»Ğ°", str(exc), parent=self)
-
-    def _load_preview(self) -> None:
-        if not self.preview_path or not self.sheet_var.get():
-            return
-        max_rows = int(self.db.get_setting("preview_rows", "500"))
-        try:
-            self.preview_headers, self.preview_rows = preview_sheet(
-                self.preview_path, self.sheet_var.get(), max_rows=max_rows
-            )
-            self._filter_preview()
-        except Exception as exc:
-            messagebox.showerror("ĞŸÑ€Ğ¾ÑĞ¼Ğ¾Ñ‚Ñ€ Ñ„Ğ°Ğ¹Ğ»Ğ°", str(exc), parent=self)
-
-    def browse_xlsx_preview(self) -> None:
-        path = filedialog.askopenfilename(
-            title="ĞŸÑ€Ğ¾ÑĞ¼Ğ¾Ñ‚Ñ€ĞµÑ‚ÑŒ ĞºĞ½Ğ¸Ğ³Ñƒ Ğ±ĞµĞ· Excel",
-            filetypes=[("ĞšĞ½Ğ¸Ğ³Ğ¸ Excel", "*.xlsx")],
-            parent=self,
-        )
-        if not path:
-            return
-        try:
-            sheets = workbook_sheet_names(path)
-            if not sheets:
-                raise ValueError("Ğ’ ĞºĞ½Ğ¸Ğ³Ğµ Ğ½ĞµÑ‚ Ğ»Ğ¸ÑÑ‚Ğ¾Ğ²")
-            self.preview_path = path
-            self.preview_file_var.set(f"Ğ¤Ğ°Ğ¹Ğ»: {Path(path).name} Â· Ñ‚Ğ¾Ğ»ÑŒĞºĞ¾ Ğ¿Ñ€Ğ¾ÑĞ¼Ğ¾Ñ‚Ñ€")
-            self.sheet_combo["values"] = sheets
-            self.sheet_var.set(sheets[0])
-            self.source_tree.selection_remove(*self.source_tree.selection())
-            self._load_preview()
-        except Exception as exc:
-            messagebox.showerror("ĞŸÑ€Ğ¾ÑĞ¼Ğ¾Ñ‚Ñ€ Ñ„Ğ°Ğ¹Ğ»Ğ°", str(exc), parent=self)
-
-    def _filter_preview(self) -> None:
-        query = self.preview_search_var.get().casefold().strip()
-        rows = self.preview_rows
-        if query:
-            rows = [row for row in rows if query in " | ".join(row).casefold()]
-        self._render_preview_tree(self.preview_headers, rows)
-
-    def _render_preview_tree(self, headers: list[str], rows: list[list[str]]) -> None:
-        if self.preview_tree is not None:
-            self.preview_tree.master.destroy()
-        if not headers:
-            return
-        columns = [f"c{index}" for index in range(len(headers))]
-        frame = ttk.Frame(self.preview_container)
-        frame.grid(row=0, column=0, sticky="nsew")
-        frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(0, weight=1)
-        tree = ttk.Treeview(frame, columns=columns, show="headings")
-        xscroll = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
-        yscroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-        tree.configure(xscrollcommand=xscroll.set, yscrollcommand=yscroll.set)
-        tree.grid(row=0, column=0, sticky="nsew")
-        yscroll.grid(row=0, column=1, sticky="ns")
-        xscroll.grid(row=1, column=0, sticky="ew")
-        for column, heading in zip(columns, headers):
-            tree.heading(column, text=heading)
-            tree.column(column, width=75 if heading == "Ğ¡Ñ‚Ñ€Ğ¾ĞºĞ°" else 150, minwidth=55, stretch=False, anchor="w")
-        for row in rows:
-            tree.insert("", "end", values=row)
-        self.preview_tree = tree
-
-    def _populate_breakdown(self) -> None:
-        calculation = self.current_calculation
-        if calculation is None:
-            return
-        self.breakdown_tree.delete(*self.breakdown_tree.get_children())
-        total = calculation.unallocated_total
-        for accrual_type, (count, amount) in calculation.unallocated.items():
-            share = amount / total if total else 0.0
-            tag = "negative" if amount < 0 else "positive"
-            self.breakdown_tree.insert("", "end", values=(accrual_type, count, _money(amount), _percent(share)), tags=(tag,))
-        self.breakdown_tree.insert("", "end", values=("Ğ˜Ñ‚Ğ¾Ğ³Ğ¾", sum(x[0] for x in calculation.unallocated.values()), _money(total), _percent(1 if total else 0)), tags=("total",))
-        self._configure_value_tags(self.breakdown_tree)
-
-    def _populate_guide(self) -> None:
-        if self.current_run_id is None:
-            return
-        self.guide_tree.delete(*self.guide_tree.get_children())
-        for item in self.db.accrual_guide(self.current_run_id):
-            self.guide_tree.insert(
-                "",
-                "end",
-                values=(
-                    item["accrual_type"], item["category"], item["current_status"], item["current_with"],
-                    item["current_without"], item["history_status"], item["history_with"], item["history_without"],
-                ),
-            )
-
-    def _populate_scenario(self) -> None:
-        calculation = self.current_calculation
-        if calculation is None or calculation.run_id is None:
-            return
-        prices = self.db.planned_prices(calculation.run_id)
-        self.scenario_tree.delete(*self.scenario_tree.get_children())
-        self.scenario_rows.clear()
-        planned_revenue_total = 0.0
-        planned_net_total = 0.0
-        planned_cost_total = 0.0
-        for result in calculation.products:
-            scenario = calculate_scenario(result, calculation.tax_rate, prices.get(result.article))
-            self.scenario_rows[result.article] = scenario
-            tag = "negative" if (scenario.net_profit_per_unit or 0) < 0 else "positive"
-            self.scenario_tree.insert("", "end", iid=result.article, values=_scenario_values(scenario), tags=(tag,))
-            if scenario.planned_revenue is not None:
-                planned_revenue_total += scenario.planned_revenue
-            if scenario.net_profit_per_unit is not None:
-                planned_net_total += scenario.net_profit_per_unit * scenario.units
-                planned_cost_total += scenario.unit_cost * scenario.units
-        totals = calculation.totals()
-        self.scenario_kpi_vars["current_revenue"].set(_money(totals["revenue"]))
-        self.scenario_kpi_vars["planned_revenue"].set(_money(planned_revenue_total))
-        self.scenario_kpi_vars["planned_net"].set(_money(planned_net_total))
-        self.scenario_kpi_vars["planned_margin"].set(_percent(planned_net_total / planned_cost_total if planned_cost_total else 0))
-        self._configure_value_tags(self.scenario_tree)
-
-    def _on_scenario_selected(self, _event=None) -> None:
-        selection = self.scenario_tree.selection()
-        if not selection:
-            return
-        row = self.scenario_rows.get(selection[0])
-        self.planned_price_var.set(_plain_number(row.planned_price) if row and row.planned_price is not None else "")
-
-    def apply_planned_price(self) -> None:
-        if self.current_run_id is None:
-            return
-        selection = self.scenario_tree.selection()
-        if not selection:
-            messagebox.showinfo("ĞŸĞ»Ğ°Ğ½Ğ¾Ğ²Ğ°Ñ Ñ†ĞµĞ½Ğ°", "Ğ¡Ğ½Ğ°Ñ‡Ğ°Ğ»Ğ° Ğ²Ñ‹Ğ±ĞµÑ€Ğ¸Ñ‚Ğµ Ñ‚Ğ¾Ğ²Ğ°Ñ€ Ğ² Ñ‚Ğ°Ğ±Ğ»Ğ¸Ñ†Ğµ", parent=self)
-            return
-        try:
-            value = _parse_number(self.planned_price_var.get())
-            if value < 0:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("ĞŸĞ»Ğ°Ğ½Ğ¾Ğ²Ğ°Ñ Ñ†ĞµĞ½Ğ°", "Ğ’Ğ²ĞµĞ´Ğ¸Ñ‚Ğµ Ğ½ĞµĞ¾Ñ‚Ñ€Ğ¸Ñ†Ğ°Ñ‚ĞµĞ»ÑŒĞ½ÑƒÑ Ñ†ĞµĞ½Ñƒ", parent=self)
-            return
-        self.db.save_planned_price(self.current_run_id, selection[0], value)
-        self._populate_scenario()
-        self.scenario_tree.selection_set(selection[0])
-
-    def apply_batch_percent(self) -> None:
-        if self.current_run_id is None or self.current_calculation is None:
-            return
-        try:
-            percent = _parse_number(self.batch_percent_var.get()) / 100
-            if percent <= -1:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("Ğ˜Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ğµ Ñ†ĞµĞ½", "Ğ’Ğ²ĞµĞ´Ğ¸Ñ‚Ğµ Ğ¿Ñ€Ğ¾Ñ†ĞµĞ½Ñ‚ Ğ±Ğ¾Ğ»ÑŒÑˆĞµ -100", parent=self)
-            return
-        for result in self.current_calculation.products:
-            current = result.average_price()
-            if current is not None:
-                self.db.save_planned_price(self.current_run_id, result.article, current * (1 + percent))
-        self._populate_scenario()
-
-    def reset_scenario(self) -> None:
-        if self.current_run_id is None:
-            return
-        if messagebox.askyesno("Ğ¡Ğ±Ñ€Ğ¾ÑĞ¸Ñ‚ÑŒ ÑÑ†ĞµĞ½Ğ°Ñ€Ğ¸Ğ¹", "Ğ’ĞµÑ€Ğ½ÑƒÑ‚ÑŒ Ğ¿Ğ»Ğ°Ğ½Ğ¾Ğ²Ñ‹Ğµ Ñ†ĞµĞ½Ñ‹ Ğº Ñ‚ĞµĞºÑƒÑ‰Ğ¸Ğ¼ ÑÑ€ĞµĞ´Ğ½Ğ¸Ğ¼?", parent=self):
-            self.db.clear_planned_prices(self.current_run_id)
-            self._populate_scenario()
-
-    def refresh_history(self) -> None:
-        self.history_tree.delete(*self.history_tree.get_children())
-        for run in self.db.list_runs():
-            self.history_tree.insert(
-                "",
-                "end",
-                iid=str(run.id),
-                values=(
-                    run.id, _period_text(run.period_start, run.period_end), run.created_at[:16], run.source_count,
-                    _number(run.units), _money(run.revenue), _money(run.net_profit), _money(run.unallocated_total), run.status,
-                ),
-            )
-        if self.current_run_id and str(self.current_run_id) in self.history_tree.get_children():
-            self.history_tree.selection_set(str(self.current_run_id))
-
-    def refresh_trends(self, runs=None) -> None:
-        self.trend_points = build_trend_points(list(runs) if runs is not None else self.db.list_runs())
-        self.trend_tree.delete(*self.trend_tree.get_children())
-        previous: TrendPoint | None = None
-        for point in self.trend_points:
-            revenue_change = point.revenue - previous.revenue if previous else None
-            profit_change = point.net_profit - previous.net_profit if previous else None
-            tag = "positive" if profit_change is None or profit_change >= 0 else "negative"
-            self.trend_tree.insert(
-                "",
-                "end",
-                iid=str(point.run_id),
-                values=(
-                    f"#{point.run_id}",
-                    point.label,
-                    _number(point.units),
-                    _money(point.revenue),
-                    _signed_money(revenue_change) if revenue_change is not None else "â€”",
-                    _money(point.net_profit),
-                    _signed_money(profit_change) if profit_change is not None else "â€”",
-                    _money(point.unallocated),
-                ),
-                tags=(tag,),
-            )
-            previous = point
-        self._configure_value_tags(self.trend_tree)
-        self._draw_trend_chart()
-
-    def _draw_trend_chart(self) -> None:
-        if not hasattr(self, "trend_canvas"):
-            return
-        canvas = self.trend_canvas
-        canvas.delete("all")
-        canvas.configure(background=self.colors["surface"], highlightbackground=self.colors["border"])
-        self.trend_canvas_points.clear()
-        width = max(canvas.winfo_width(), 680)
-        height = max(canvas.winfo_height(), 300)
-        left, right, top, bottom = 92, 30, 28, 62
-        plot_width = width - left - right
-        plot_height = height - top - bottom
-        metric = TREND_METRICS.get(self.trend_metric_var.get(), "revenue")
-        if not self.trend_points:
-            canvas.create_text(
-                width / 2,
-                height / 2,
-                text="Ğ˜Ğ¼Ğ¿Ğ¾Ñ€Ñ‚Ğ¸Ñ€ÑƒĞ¹Ñ‚Ğµ Ğ¾Ñ‚Ñ‡ĞµÑ‚Ñ‹, Ñ‡Ñ‚Ğ¾Ğ±Ñ‹ ÑƒĞ²Ğ¸Ğ´ĞµÑ‚ÑŒ Ğ´Ğ¸Ğ½Ğ°Ğ¼Ğ¸ĞºÑƒ",
-                fill=self.colors["muted"],
-                font=("Segoe UI", 12),
-            )
-            return
-        minimum, maximum = chart_bounds(self.trend_points, metric)
-        value_range = maximum - minimum
-        for index in range(6):
-            ratio = index / 5
-            y = top + plot_height * ratio
-            value = maximum - value_range * ratio
-            canvas.create_line(left, y, width - right, y, fill=self.colors["border"], dash=(2, 4))
-            canvas.create_text(
-                left - 10,
-                y,
-                text=_axis_value(value, metric),
-                anchor="e",
-                fill=self.colors["muted"],
-                font=("Segoe UI", 9),
-            )
-        zero_y = top + (maximum / value_range) * plot_height
-        if top <= zero_y <= height - bottom:
-            canvas.create_line(left, zero_y, width - right, zero_y, fill=self.colors["muted"], width=1)
-
-        denominator = max(len(self.trend_points) - 1, 1)
-        coordinates: list[float] = []
-        label_step = max(1, (len(self.trend_points) + 7) // 8)
-        for index, point in enumerate(self.trend_points):
-            x = left + plot_width * index / denominator if len(self.trend_points) > 1 else left + plot_width / 2
-            y = top + (maximum - point.value(metric)) / value_range * plot_height
-            coordinates.extend((x, y))
-            self.trend_canvas_points.append((x, y, point))
-            if index % label_step == 0 or index == len(self.trend_points) - 1:
-                canvas.create_text(
-                    x,
-                    height - bottom + 14,
-                    text=_short_period(point.label),
-                    anchor="n",
-                    fill=self.colors["muted"],
-                    font=("Segoe UI", 8),
-                    angle=18 if len(self.trend_points) > 5 else 0,
-                )
-        if len(coordinates) >= 4:
-            canvas.create_line(*coordinates, fill=self.colors["accent"], width=3, smooth=False)
-        for x, y, point in self.trend_canvas_points:
-            color = self.colors["positive"] if point.value(metric) >= 0 else self.colors["negative"]
-            canvas.create_oval(x - 5, y - 5, x + 5, y + 5, fill=color, outline=self.colors["surface"], width=2)
-
-    def _trend_hover(self, event) -> None:
-        self.trend_canvas.delete("tooltip")
-        if not self.trend_canvas_points:
-            return
-        x, y, point = min(
-            self.trend_canvas_points,
-            key=lambda item: (item[0] - event.x) ** 2 + (item[1] - event.y) ** 2,
-        )
-        if (x - event.x) ** 2 + (y - event.y) ** 2 > 225:
-            return
-        metric = TREND_METRICS.get(self.trend_metric_var.get(), "revenue")
-        text = f"Ğ Ğ°ÑÑ‡ĞµÑ‚ #{point.run_id}\n{point.label}\n{_trend_value(point.value(metric), metric)}"
-        text_x = min(max(x + 12, 80), max(self.trend_canvas.winfo_width() - 150, 80))
-        text_y = max(y - 58, 8)
-        box = self.trend_canvas.create_text(
-            text_x,
-            text_y,
-            text=text,
-            anchor="nw",
-            fill=self.colors["text"],
-            font=("Segoe UI", 9),
-            tags="tooltip",
-        )
-        bounds = self.trend_canvas.bbox(box)
-        if bounds:
-            background = self.trend_canvas.create_rectangle(
-                bounds[0] - 8,
-                bounds[1] - 6,
-                bounds[2] + 8,
-                bounds[3] + 6,
-                fill=self.colors["surface_alt"],
-                outline=self.colors["border"],
-                tags="tooltip",
-            )
-            self.trend_canvas.tag_lower(background, box)
-
-    def _open_history_run(self, _event=None) -> None:
-        selection = self.history_tree.selection()
-        if not selection:
-            return
-        run_id = int(selection[0])
-        display = next((key for key, value in self.run_display_to_id.items() if value == run_id), None)
-        if display:
-            self.run_var.set(display)
-        self.select_run(run_id)
-        self.notebook.select(self.overview_tab)
-
-    def refresh_comparison(self) -> None:
-        first_id = self.run_display_to_id.get(self.compare_first_var.get())
-        second_id = self.run_display_to_id.get(self.compare_second_var.get())
-        if first_id is None or second_id is None:
-            self._clear_comparison("Ğ’Ñ‹Ğ±ĞµÑ€Ğ¸Ñ‚Ğµ Ğ´Ğ²Ğ° ÑĞ¾Ñ…Ñ€Ğ°Ğ½ĞµĞ½Ğ½Ñ‹Ñ… Ğ¿ĞµÑ€Ğ¸Ğ¾Ğ´Ğ°")
-            return
-        if first_id == second_id:
-            self._clear_comparison("Ğ’Ñ‹Ğ±ĞµÑ€Ğ¸Ñ‚Ğµ Ñ€Ğ°Ğ·Ğ½Ñ‹Ğµ Ğ¿ĞµÑ€Ğ¸Ğ¾Ğ´Ñ‹")
-            return
-        comparison = compare_calculations(
-            self.db.load_calculation(first_id),
-            self.db.load_calculation(second_id),
-        )
-        self.comparison_kpi_vars["revenue"].set(_comparison_kpi(comparison.revenue, money=True))
-        self.comparison_kpi_vars["net_profit"].set(_comparison_kpi(comparison.net_profit, money=True))
-        self.comparison_kpi_vars["units"].set(_comparison_kpi(comparison.units, money=False))
-        self.comparison_kpi_vars["unallocated"].set(_comparison_kpi(comparison.unallocated, money=True))
-        self.comparison_tree.delete(*self.comparison_tree.get_children())
-        for row in comparison.products:
-            tag = "positive" if row.net_profit.change >= 0 else "negative"
-            self.comparison_tree.insert(
-                "",
-                "end",
-                iid=row.article,
-                values=(
-                    row.article,
-                    row.name,
-                    _number(row.units.first),
-                    _number(row.units.second),
-                    _signed_number(row.units.change),
-                    _money(row.revenue.first),
-                    _money(row.revenue.second),
-                    _signed_money(row.revenue.change),
-                    _comparison_percent(row.revenue),
-                    _money(row.net_profit.first),
-                    _money(row.net_profit.second),
-                    _signed_money(row.net_profit.change),
-                    _comparison_percent(row.net_profit),
-                    _percent(row.profitability.first),
-                    _percent(row.profitability.second),
-                    _signed_percentage_points(row.profitability.change),
-                ),
-                tags=(tag,),
-            )
-        self._configure_value_tags(self.comparison_tree)
-        self.status_var.set(f"Ğ¡Ñ€Ğ°Ğ²Ğ½ĞµĞ½Ğ¸Ğµ Ñ€Ğ°ÑÑ‡ĞµÑ‚Ğ¾Ğ² #{first_id} Ğ¸ #{second_id}")
-
-    def _clear_comparison(self, message: str) -> None:
-        if not hasattr(self, "comparison_tree"):
-            return
-        self.comparison_tree.delete(*self.comparison_tree.get_children())
-        for variable in self.comparison_kpi_vars.values():
-            variable.set("â€”")
-        self.comparison_tree.insert("", "end", values=("", message))
-
-    def _populate_quality(self) -> None:
-        self.quality_tree.delete(*self.quality_tree.get_children())
-        if self.current_run_id is None:
-            return
-        events = self.db.list_quality_events(self.current_run_id)
-        if not events:
-            self.quality_tree.insert("", "end", values=("Ğ“Ğ¾Ñ‚Ğ¾Ğ²Ğ¾", "ĞŸÑ€Ğ¾Ğ²ĞµÑ€ĞºĞ¸", "ĞÑˆĞ¸Ğ±Ğ¾Ğº Ğ¸ Ğ¿Ñ€ĞµĞ´ÑƒĞ¿Ñ€ĞµĞ¶Ğ´ĞµĞ½Ğ¸Ğ¹ Ğ½ĞµÑ‚"), tags=("positive",))
-        else:
-            for event in events:
-                tag = "negative" if event["severity"] == "ĞÑˆĞ¸Ğ±ĞºĞ°" else "warning"
-                self.quality_tree.insert("", "end", values=(event["severity"], event["event_type"], event["message"]), tags=(tag,))
-        self._configure_value_tags(self.quality_tree)
-
-    def refresh_products(self) -> None:
-        if not hasattr(self, "products_tree"):
-            return
-        self.products_tree.delete(*self.products_tree.get_children())
-        products = self.db.list_products()
-        query = self.product_search_var.get().strip().casefold() if hasattr(self, "product_search_var") else ""
-        status = self.product_status_var.get() if hasattr(self, "product_status_var") else "Ğ’ÑĞµ"
-        visible = [
-            product
-            for product in products
-            if (not query or query in product.article.casefold() or query in product.name.casefold())
-            and (status == "Ğ’ÑĞµ" or (status == "ĞĞºÑ‚Ğ¸Ğ²Ğ½Ñ‹Ğµ" and product.active) or (status == "ĞÑ€Ñ…Ğ¸Ğ²" and not product.active))
-        ]
-        for product in visible:
-            self.products_tree.insert(
-                "",
-                "end",
-                iid=product.article,
-                values=(
-                    product.article, product.name, _money(product.total_cost), _money(product.material_cost),
-                    _money(product.labor_cost), "ĞĞºÑ‚Ğ¸Ğ²ĞµĞ½" if product.active else "ĞÑ€Ñ…Ğ¸Ğ²",
-                ),
-                tags=("" if product.active else "muted",),
-            )
-        if hasattr(self, "product_count_var"):
-            self.product_count_var.set(f"ĞŸĞ¾ĞºĞ°Ğ·Ğ°Ğ½Ğ¾: {len(visible)} Ğ¸Ğ· {len(products)}")
-        self._configure_value_tags(self.products_tree)
-
-    def open_cost_catalog_editor(self) -> None:
-        dialog = CostCatalogEditorDialog(self, self.db.list_products())
-        self.wait_window(dialog)
-        if dialog.cancelled:
-            return
-        changes = build_cost_changes(dialog.products, self.db.product_map(active_only=False))
-        changed_products = [change.product for change in changes if change.changed]
-        if not changed_products and not dialog.order_changed:
-            messagebox.showinfo("Ğ¡ĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚ÑŒ", "Ğ˜Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ğ¹ Ğ½ĞµÑ‚", parent=self)
-            return
-        products_to_apply: list[Product] = []
-        if changed_products:
-            preview = CostImportDialog(self, changes, "Ğ ĞµĞ´Ğ°ĞºÑ‚Ğ¾Ñ€ Ğ¿Ñ€Ğ¸Ğ»Ğ¾Ğ¶ĞµĞ½Ğ¸Ñ")
-            self.wait_window(preview)
-            if preview.cancelled:
-                return
-            products_to_apply = preview.products_to_apply
-        try:
-            changed = self.db.save_products(products_to_apply, source="Ğ ĞµĞ´Ğ°ĞºÑ‚Ğ¾Ñ€ Ğ¿Ñ€Ğ¸Ğ»Ğ¾Ğ¶ĞµĞ½Ğ¸Ñ")
-            self.db.reorder_products(dialog.article_order)
-            self.refresh_products()
-            order_text = " ĞŸĞ¾Ñ€ÑĞ´Ğ¾Ğº Ğ¿Ğ¾Ğ·Ğ¸Ñ†Ğ¸Ğ¹ ÑĞ¾Ñ…Ñ€Ğ°Ğ½ĞµĞ½." if dialog.order_changed else ""
-            messagebox.showinfo(
-                "Ğ¡ĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚ÑŒ ÑĞ¾Ñ…Ñ€Ğ°Ğ½ĞµĞ½Ğ°",
-                f"ĞŸÑ€Ğ¸Ğ¼ĞµĞ½ĞµĞ½Ğ¾ Ğ¸Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ğ¹: {changed}.\n"
-                f"{order_text}\n"
-                "ĞĞ¾Ğ²Ñ‹Ğµ Ğ·Ğ½Ğ°Ñ‡ĞµĞ½Ğ¸Ñ Ğ¸ÑĞ¿Ğ¾Ğ»ÑŒĞ·ÑƒÑÑ‚ÑÑ ÑĞ¾ ÑĞ»ĞµĞ´ÑƒÑÑ‰ĞµĞ³Ğ¾ Ñ€Ğ°ÑÑ‡ĞµÑ‚Ğ°. Ğ¡Ñ‚Ğ°Ñ€Ñ‹Ğµ Ğ¾Ñ‚Ñ‡ĞµÑ‚Ñ‹ Ğ½Ğµ Ğ¸Ğ·Ğ¼ĞµĞ½ĞµĞ½Ñ‹.",
-                parent=self,
-            )
-        except Exception as exc:
-            messagebox.showerror("Ğ¡ĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚ÑŒ", str(exc), parent=self)
-
-    def create_application_backup(self) -> None:
-        destination = filedialog.asksaveasfilename(
-            title="Ğ¡Ğ¾Ğ·Ğ´Ğ°Ñ‚ÑŒ Ñ€ĞµĞ·ĞµÑ€Ğ²Ğ½ÑƒÑ ĞºĞ¾Ğ¿Ğ¸Ñ OZ Price Analyzer",
-            defaultextension=".ozbackup",
-            initialdir=str(self.service.paths["backups"]),
-            initialfile=suggested_backup_name(),
-            filetypes=[("Ğ ĞµĞ·ĞµÑ€Ğ²Ğ½Ğ°Ñ ĞºĞ¾Ğ¿Ğ¸Ñ OZ Price Analyzer", "*.ozbackup")],
-            parent=self,
-        )
-        if not destination:
-            return
-        self.configure(cursor="watch")
-        self.status_var.set("Ğ¡Ğ¾Ğ·Ğ´Ğ°Ğ½Ğ¸Ğµ Ñ€ĞµĞ·ĞµÑ€Ğ²Ğ½Ğ¾Ğ¹ ĞºĞ¾Ğ¿Ğ¸Ğ¸â€¦")
-        self.update_idletasks()
-        try:
-            info = create_backup(self.service.paths["root"], destination)
-            messagebox.showinfo(
-                "Ğ ĞµĞ·ĞµÑ€Ğ²Ğ½Ğ°Ñ ĞºĞ¾Ğ¿Ğ¸Ñ ÑĞ¾Ğ·Ğ´Ğ°Ğ½Ğ°",
-                f"Ğ¤Ğ°Ğ¹Ğ»: {info.path}\n\n"
-                f"Ğ Ğ°ÑÑ‡ĞµÑ‚Ğ¾Ğ²: {info.run_count}\n"
-                f"Ğ¢Ğ¾Ğ²Ğ°Ñ€Ğ¾Ğ²: {info.product_count}\n"
-                f"Ğ˜ÑÑ…Ğ¾Ğ´Ğ½Ñ‹Ñ… Ğ¾Ñ‚Ñ‡ĞµÑ‚Ğ¾Ğ²: {info.source_count}\n"
-                f"Ğ Ğ°Ğ·Ğ¼ĞµÑ€ Ğ¸ÑÑ…Ğ¾Ğ´Ğ½Ğ¸ĞºĞ¾Ğ²: {_file_size(info.source_size)}",
-                parent=self,
-            )
-        except Exception as exc:
-            messagebox.showerror("Ğ ĞµĞ·ĞµÑ€Ğ²Ğ½Ğ°Ñ ĞºĞ¾Ğ¿Ğ¸Ñ", str(exc), parent=self)
-        finally:
-            self.configure(cursor="")
-            self.status_var.set("Ğ“Ğ¾Ñ‚Ğ¾Ğ²Ğ¾" if self.current_run_id is None else f"ĞÑ‚ĞºÑ€Ñ‹Ñ‚ Ñ€Ğ°ÑÑ‡ĞµÑ‚ #{self.current_run_id}")
-
-    def show_about(self) -> None:
-        AboutDialog(self)
-
-    def choose_storage_folder(self) -> None:
-        selected = filedialog.askdirectory(
-            title="Ğ’Ñ‹Ğ±ĞµÑ€Ğ¸Ñ‚Ğµ Ğ¿ÑƒÑÑ‚ÑƒÑ Ğ¿Ğ°Ğ¿ĞºÑƒ Ğ´Ğ»Ñ Ñ…Ñ€Ğ°Ğ½Ğ¸Ğ»Ğ¸Ñ‰Ğ° OZ Price Analyzer",
-            initialdir=str(self.service.paths["root"].parent),
-            mustexist=True,
-            parent=self,
-        )
-        if not selected:
-            return
-        destination = Path(selected).expanduser().resolve()
-        source = self.service.paths["root"].resolve()
-        if destination == source:
-            messagebox.showinfo("Ğ¥Ñ€Ğ°Ğ½Ğ¸Ğ»Ğ¸Ñ‰Ğµ", "Ğ­Ñ‚Ğ° Ğ¿Ğ°Ğ¿ĞºĞ° ÑƒĞ¶Ğµ Ğ¸ÑĞ¿Ğ¾Ğ»ÑŒĞ·ÑƒĞµÑ‚ÑÑ", parent=self)
-            return
-        confirmed = messagebox.askyesno(
-            "ĞŸĞµÑ€ĞµĞ½ĞµÑÑ‚Ğ¸ Ñ…Ñ€Ğ°Ğ½Ğ¸Ğ»Ğ¸Ñ‰Ğµ",
-            f"Ğ¢ĞµĞºÑƒÑ‰Ğ°Ñ Ğ¿Ğ°Ğ¿ĞºĞ°:\n{source}\n\nĞĞ¾Ğ²Ğ°Ñ Ğ¿Ğ°Ğ¿ĞºĞ°:\n{destination}\n\n"
-            "Ğ’ Ğ½Ğ¾Ğ²ÑƒÑ Ğ¿Ğ°Ğ¿ĞºÑƒ Ğ±ÑƒĞ´ÑƒÑ‚ ÑĞºĞ¾Ğ¿Ğ¸Ñ€Ğ¾Ğ²Ğ°Ğ½Ñ‹ Ğ¸ÑÑ‚Ğ¾Ñ€Ğ¸Ñ, ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚ÑŒ, Ğ¸ÑÑ…Ğ¾Ğ´Ğ½Ñ‹Ğµ Ğ¾Ñ‚Ñ‡ĞµÑ‚Ñ‹, "
-            "ÑĞºÑĞ¿Ğ¾Ñ€Ñ‚Ñ‹ Ğ¸ Ñ€ĞµĞ·ĞµÑ€Ğ²Ğ½Ñ‹Ğµ ĞºĞ¾Ğ¿Ğ¸Ğ¸. Ğ¡Ñ‚Ğ°Ñ€Ğ°Ñ Ğ¿Ğ°Ğ¿ĞºĞ° Ğ¾ÑÑ‚Ğ°Ğ½ĞµÑ‚ÑÑ ĞºĞ°Ğº Ğ´Ğ¾Ğ¿Ğ¾Ğ»Ğ½Ğ¸Ñ‚ĞµĞ»ÑŒĞ½Ğ°Ñ ÑÑ‚Ñ€Ğ°Ñ…Ğ¾Ğ²Ğ¾Ñ‡Ğ½Ğ°Ñ ĞºĞ¾Ğ¿Ğ¸Ñ. "
-            "ĞŸÑ€Ğ¾Ğ´Ğ¾Ğ»Ğ¶Ğ¸Ñ‚ÑŒ?",
-            parent=self,
-        )
-        if not confirmed:
-            return
-        self.configure(cursor="watch")
-        self.status_var.set("ĞŸĞµÑ€ĞµĞ½Ğ¾Ñ Ñ…Ñ€Ğ°Ğ½Ğ¸Ğ»Ğ¸Ñ‰Ğ°â€¦")
-        self.update_idletasks()
-        try:
-            result = migrate_storage(source, destination)
-            save_storage_location(destination)
-            self.service = AppService(destination)
-            self.db = self.service.db
-            self.current_run_id = None
-            self.current_calculation = None
-            self.storage_path_var.set(str(destination))
-            self._reload_settings_after_restore()
-            self.refresh_all()
-            messagebox.showinfo(
-                "Ğ¥Ñ€Ğ°Ğ½Ğ¸Ğ»Ğ¸Ñ‰Ğµ Ğ¿ĞµÑ€ĞµĞ½ĞµÑĞµĞ½Ğ¾",
-                f"ĞĞ¾Ğ²Ğ¾Ğµ Ñ…Ñ€Ğ°Ğ½Ğ¸Ğ»Ğ¸Ñ‰Ğµ:\n{destination}\n\n"
-                f"Ğ Ğ°ÑÑ‡ĞµÑ‚Ğ¾Ğ²: {result.backup_info.run_count}\n"
-                f"Ğ¢Ğ¾Ğ²Ğ°Ñ€Ğ¾Ğ²: {result.backup_info.product_count}\n"
-                f"Ğ˜ÑÑ…Ğ¾Ğ´Ğ½Ñ‹Ñ… Ğ¾Ñ‚Ñ‡ĞµÑ‚Ğ¾Ğ²: {result.backup_info.source_count}\n\n"
-                f"Ğ¡Ñ‚Ğ°Ñ€Ğ°Ñ Ğ¿Ğ°Ğ¿ĞºĞ° ÑĞ¾Ñ…Ñ€Ğ°Ğ½ĞµĞ½Ğ°:\n{source}",
-                parent=self,
-            )
-        except Exception as exc:
-            messagebox.showerror("ĞŸĞµÑ€ĞµĞ½Ğ¾Ñ Ñ…Ñ€Ğ°Ğ½Ğ¸Ğ»Ğ¸Ñ‰Ğ°", str(exc), parent=self)
-        finally:
-            self.configure(cursor="")
-            self.status_var.set("Ğ“Ğ¾Ñ‚Ğ¾Ğ²Ğ¾" if self.current_run_id is None else f"ĞÑ‚ĞºÑ€Ñ‹Ñ‚ Ñ€Ğ°ÑÑ‡ĞµÑ‚ #{self.current_run_id}")
-
-    def restore_application_backup(self) -> None:
-        source = filedialog.askopenfilename(
-            title="Ğ’Ñ‹Ğ±ĞµÑ€Ğ¸Ñ‚Ğµ Ñ€ĞµĞ·ĞµÑ€Ğ²Ğ½ÑƒÑ ĞºĞ¾Ğ¿Ğ¸Ñ OZ Price Analyzer",
-            initialdir=str(self.service.paths["backups"]),
-            filetypes=[("Ğ ĞµĞ·ĞµÑ€Ğ²Ğ½Ğ°Ñ ĞºĞ¾Ğ¿Ğ¸Ñ OZ Price Analyzer", "*.ozbackup")],
-            parent=self,
-        )
-        if not source:
-            return
-        self.configure(cursor="watch")
-        self.status_var.set("ĞŸÑ€Ğ¾Ğ²ĞµÑ€ĞºĞ° Ñ€ĞµĞ·ĞµÑ€Ğ²Ğ½Ğ¾Ğ¹ ĞºĞ¾Ğ¿Ğ¸Ğ¸â€¦")
-        self.update_idletasks()
-        try:
-            info = inspect_backup(source)
-        except Exception as exc:
-            self.configure(cursor="")
-            self.status_var.set("Ğ“Ğ¾Ñ‚Ğ¾Ğ²Ğ¾" if self.current_run_id is None else f"ĞÑ‚ĞºÑ€Ñ‹Ñ‚ Ñ€Ğ°ÑÑ‡ĞµÑ‚ #{self.current_run_id}")
-            messagebox.showerror("Ğ’Ğ¾ÑÑÑ‚Ğ°Ğ½Ğ¾Ğ²Ğ»ĞµĞ½Ğ¸Ğµ", str(exc), parent=self)
-            return
-        self.configure(cursor="")
-        confirmed = messagebox.askyesno(
-            "Ğ’Ğ¾ÑÑÑ‚Ğ°Ğ½Ğ¾Ğ²Ğ¸Ñ‚ÑŒ Ğ´Ğ°Ğ½Ğ½Ñ‹Ğµ",
-            f"Ğ ĞµĞ·ĞµÑ€Ğ²Ğ½Ğ°Ñ ĞºĞ¾Ğ¿Ğ¸Ñ: {_backup_timestamp(info.created_at)}\n"
-            f"Ğ Ğ°ÑÑ‡ĞµÑ‚Ğ¾Ğ²: {info.run_count}\n"
-            f"Ğ¢Ğ¾Ğ²Ğ°Ñ€Ğ¾Ğ²: {info.product_count}\n"
-            f"Ğ˜ÑÑ…Ğ¾Ğ´Ğ½Ñ‹Ñ… Ğ¾Ñ‚Ñ‡ĞµÑ‚Ğ¾Ğ²: {info.source_count}\n\n"
-            "Ğ¢ĞµĞºÑƒÑ‰Ğ°Ñ Ğ¸ÑÑ‚Ğ¾Ñ€Ğ¸Ñ Ğ±ÑƒĞ´ĞµÑ‚ Ğ·Ğ°Ğ¼ĞµĞ½ĞµĞ½Ğ°. ĞŸĞµÑ€ĞµĞ´ Ğ·Ğ°Ğ¼ĞµĞ½Ğ¾Ğ¹ Ğ¿Ñ€Ğ¸Ğ»Ğ¾Ğ¶ĞµĞ½Ğ¸Ğµ Ğ°Ğ²Ñ‚Ğ¾Ğ¼Ğ°Ñ‚Ğ¸Ñ‡ĞµÑĞºĞ¸ ÑĞ¾Ğ·Ğ´Ğ°ÑÑ‚ "
-            "ÑÑ‚Ñ€Ğ°Ñ…Ğ¾Ğ²Ğ¾Ñ‡Ğ½ÑƒÑ ĞºĞ¾Ğ¿Ğ¸Ñ Ñ‚ĞµĞºÑƒÑ‰Ğ¸Ñ… Ğ´Ğ°Ğ½Ğ½Ñ‹Ñ…. ĞŸÑ€Ğ¾Ğ´Ğ¾Ğ»Ğ¶Ğ¸Ñ‚ÑŒ?",
-            parent=self,
-        )
-        if not confirmed:
-            self.status_var.set("Ğ“Ğ¾Ñ‚Ğ¾Ğ²Ğ¾" if self.current_run_id is None else f"ĞÑ‚ĞºÑ€Ñ‹Ñ‚ Ñ€Ğ°ÑÑ‡ĞµÑ‚ #{self.current_run_id}")
-            return
-        self.configure(cursor="watch")
-        self.status_var.set("Ğ’Ğ¾ÑÑÑ‚Ğ°Ğ½Ğ¾Ğ²Ğ»ĞµĞ½Ğ¸Ğµ Ğ¸ÑÑ‚Ğ¾Ñ€Ğ¸Ğ¸â€¦")
-        self.update_idletasks()
-        try:
-            result = restore_backup(self.service.paths["root"], source)
-            self.service.db = Database(self.service.paths["database"])
-            self.db = self.service.db
-            self.current_run_id = None
-            self.current_calculation = None
-            self._reload_settings_after_restore()
-            self.refresh_all()
-            safety = f"\n\nĞ¡Ñ‚Ñ€Ğ°Ñ…Ğ¾Ğ²Ğ¾Ñ‡Ğ½Ğ°Ñ ĞºĞ¾Ğ¿Ğ¸Ñ Ğ¿Ñ€ĞµĞ¶Ğ½Ğ¸Ñ… Ğ´Ğ°Ğ½Ğ½Ñ‹Ñ…:\n{result.safety_backup}" if result.safety_backup else ""
-            messagebox.showinfo(
-                "Ğ’Ğ¾ÑÑÑ‚Ğ°Ğ½Ğ¾Ğ²Ğ»ĞµĞ½Ğ¸Ğµ Ğ·Ğ°Ğ²ĞµÑ€ÑˆĞµĞ½Ğ¾",
-                f"Ğ˜ÑÑ‚Ğ¾Ñ€Ğ¸Ñ Ğ¸ Ğ½Ğ°ÑÑ‚Ñ€Ğ¾Ğ¹ĞºĞ¸ Ğ²Ğ¾ÑÑÑ‚Ğ°Ğ½Ğ¾Ğ²Ğ»ĞµĞ½Ñ‹. Ğ Ğ°ÑÑ‡ĞµÑ‚Ğ¾Ğ²: {result.info.run_count}.{safety}",
-                parent=self,
-            )
-        except Exception as exc:
-            messagebox.showerror("Ğ’Ğ¾ÑÑÑ‚Ğ°Ğ½Ğ¾Ğ²Ğ»ĞµĞ½Ğ¸Ğµ", str(exc), parent=self)
-        finally:
-            self.configure(cursor="")
-            self.status_var.set("Ğ“Ğ¾Ñ‚Ğ¾Ğ²Ğ¾" if self.current_run_id is None else f"ĞÑ‚ĞºÑ€Ñ‹Ñ‚ Ñ€Ğ°ÑÑ‡ĞµÑ‚ #{self.current_run_id}")
-
-    def _reload_settings_after_restore(self) -> None:
-        self.theme_var.set(THEME_VALUES.get(self.db.get_setting("theme", "system"), "Ğ¡Ğ¸ÑÑ‚ĞµĞ¼Ğ½Ğ°Ñ"))
-        self.tax_rate_var.set(_plain_number(float(self.db.get_setting("tax_rate", "0.04")) * 100))
-        self.duplicate_policy_var.set(
-            DUPLICATE_VALUES.get(self.db.get_setting("duplicate_policy", "ask"), "Ğ¡Ğ¿Ñ€Ğ°ÑˆĞ¸Ğ²Ğ°Ñ‚ÑŒ")
-        )
-        self.warn_realization_var.set(self.db.get_setting("warn_without_realization", "1") == "1")
-        self.preview_rows_var.set(self.db.get_setting("preview_rows", "500"))
-        if hasattr(self, "storage_path_var"):
-            self.storage_path_var.set(str(self.service.paths["root"]))
-        self._preview_theme()
-
-    def export_product_catalog(self) -> None:
-        destination = filedialog.asksaveasfilename(
-            title="Ğ’Ñ‹Ğ³Ñ€ÑƒĞ·Ğ¸Ñ‚ÑŒ ÑĞ¿Ñ€Ğ°Ğ²Ğ¾Ñ‡Ğ½Ğ¸Ğº ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚Ğ¸",
-            defaultextension=".xlsx",
-            initialdir=str(self.service.paths["exports"]),
-            initialfile="Ğ¡Ğ¿Ñ€Ğ°Ğ²Ğ¾Ñ‡Ğ½Ğ¸Ğº_ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚Ğ¸_OZON.xlsx",
-            filetypes=[("ĞšĞ½Ğ¸Ğ³Ğ° Excel", "*.xlsx")],
-            parent=self,
-        )
-        if not destination:
-            return
-        try:
-            path = export_cost_catalog(self.db.list_products(), destination)
-            messagebox.showinfo(
-                "Ğ¡Ğ¿Ñ€Ğ°Ğ²Ğ¾Ñ‡Ğ½Ğ¸Ğº ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚Ğ¸",
-                f"Ğ¡Ğ¿Ñ€Ğ°Ğ²Ğ¾Ñ‡Ğ½Ğ¸Ğº ÑĞ¾Ñ…Ñ€Ğ°Ğ½ĞµĞ½:\n{path}\n\n"
-                "Ğ¤Ğ°Ğ¹Ğ» Ğ¼Ğ¾Ğ¶Ğ½Ğ¾ Ğ¸ÑĞ¿Ğ¾Ğ»ÑŒĞ·Ğ¾Ğ²Ğ°Ñ‚ÑŒ ĞºĞ°Ğº Ñ€ĞµĞ·ĞµÑ€Ğ²Ğ½ÑƒÑ ĞºĞ¾Ğ¿Ğ¸Ñ Ğ¸Ğ»Ğ¸ Ğ´Ğ»Ñ Ğ¼Ğ°ÑÑĞ¾Ğ²Ğ¾Ğ³Ğ¾ Ğ¾Ğ±Ğ¼ĞµĞ½Ğ°. "
-                "ĞÑĞ½Ğ¾Ğ²Ğ½Ğ¾Ğµ Ñ€ĞµĞ´Ğ°ĞºÑ‚Ğ¸Ñ€Ğ¾Ğ²Ğ°Ğ½Ğ¸Ğµ Ğ´Ğ¾ÑÑ‚ÑƒĞ¿Ğ½Ğ¾ Ğ¿Ñ€ÑĞ¼Ğ¾ Ğ² Ğ¿Ñ€Ğ¸Ğ»Ğ¾Ğ¶ĞµĞ½Ğ¸Ğ¸.",
-                parent=self,
-            )
-        except Exception as exc:
-            messagebox.showerror("Ğ­ĞºÑĞ¿Ğ¾Ñ€Ñ‚ ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚Ğ¸", str(exc), parent=self)
-
-    def import_product_catalog(self) -> None:
-        source = filedialog.askopenfilename(
-            title="Ğ˜Ğ¼Ğ¿Ğ¾Ñ€Ñ‚Ğ¸Ñ€Ğ¾Ğ²Ğ°Ñ‚ÑŒ ÑĞ¿Ñ€Ğ°Ğ²Ğ¾Ñ‡Ğ½Ğ¸Ğº ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚Ğ¸",
-            filetypes=[("ĞšĞ½Ğ¸Ğ³Ğ° Excel", "*.xlsx")],
-            parent=self,
-        )
-        if not source:
-            return
-        try:
-            products = read_cost_catalog(source)
-            changes = build_cost_changes(products, self.db.product_map(active_only=False))
-            dialog = CostImportDialog(self, changes, Path(source).name)
-            self.wait_window(dialog)
-            if dialog.cancelled:
-                return
-            changed = self.db.save_products(dialog.products_to_apply, source=f"Ğ˜Ğ¼Ğ¿Ğ¾Ñ€Ñ‚: {Path(source).name}")
-            self.refresh_products()
-            messagebox.showinfo(
-                "Ğ˜Ğ¼Ğ¿Ğ¾Ñ€Ñ‚ ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚Ğ¸",
-                f"ĞŸÑ€Ğ¸Ğ¼ĞµĞ½ĞµĞ½Ğ¾ Ğ¸Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ğ¹: {changed}.\n"
-                "Ğ¡Ğ¾Ñ…Ñ€Ğ°Ğ½ĞµĞ½Ğ½Ñ‹Ğµ Ñ€Ğ°Ğ½ĞµĞµ Ñ€Ğ°ÑÑ‡ĞµÑ‚Ñ‹ Ğ½Ğµ Ğ¸Ğ·Ğ¼ĞµĞ½ĞµĞ½Ñ‹; Ğ½Ğ¾Ğ²Ñ‹Ğµ Ğ·Ğ½Ğ°Ñ‡ĞµĞ½Ğ¸Ñ Ğ¸ÑĞ¿Ğ¾Ğ»ÑŒĞ·ÑƒÑÑ‚ÑÑ ÑĞ¾ ÑĞ»ĞµĞ´ÑƒÑÑ‰ĞµĞ³Ğ¾ Ñ€Ğ°ÑÑ‡ĞµÑ‚Ğ°.",
-                parent=self,
-            )
-        except Exception as exc:
-            messagebox.showerror("Ğ˜Ğ¼Ğ¿Ğ¾Ñ€Ñ‚ ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚Ğ¸", str(exc), parent=self)
-
-    def show_cost_history(self) -> None:
-        CostHistoryDialog(self, self.db.list_product_cost_history())
-
-    def add_product(self) -> None:
-        dialog = ProductDialog(self, title="ĞĞ¾Ğ²Ñ‹Ğ¹ Ñ‚Ğ¾Ğ²Ğ°Ñ€")
-        self.wait_window(dialog)
-        if dialog.result:
-            try:
-                self.db.save_product(dialog.result)
-                self.refresh_products()
-            except Exception as exc:
-                messagebox.showerror("Ğ¢Ğ¾Ğ²Ğ°Ñ€", str(exc), parent=self)
-
-    def edit_product(self) -> None:
-        selection = self.products_tree.selection()
-        if not selection:
-            messagebox.showinfo("Ğ¢Ğ¾Ğ²Ğ°Ñ€Ñ‹", "Ğ’Ñ‹Ğ±ĞµÑ€Ğ¸Ñ‚Ğµ Ñ‚Ğ¾Ğ²Ğ°Ñ€", parent=self)
-            return
-        product = self.db.product_map(active_only=False)[selection[0]]
-        dialog = ProductDialog(self, title="Ğ˜Ğ·Ğ¼ĞµĞ½Ğ¸Ñ‚ÑŒ Ñ‚Ğ¾Ğ²Ğ°Ñ€", product=product)
-        self.wait_window(dialog)
-        if dialog.result:
-            try:
-                self.db.save_product(dialog.result)
-                self.refresh_products()
-            except Exception as exc:
-                messagebox.showerror("Ğ¢Ğ¾Ğ²Ğ°Ñ€", str(exc), parent=self)
-
-    def toggle_product(self) -> None:
-        selection = self.products_tree.selection()
-        if not selection:
-            return
-        product = self.db.product_map(active_only=False)[selection[0]]
-        product.active = not product.active
-        self.db.save_product(product)
-        self.refresh_products()
-
-    def save_settings(self) -> None:
-        try:
-            tax_percent = _parse_number(self.tax_rate_var.get())
-            if tax_percent < 0 or tax_percent > 100:
-                raise ValueError
-            preview_rows = int(self.preview_rows_var.get())
-            if preview_rows < 100 or preview_rows > 5000:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("ĞĞ°ÑÑ‚Ñ€Ğ¾Ğ¹ĞºĞ¸", "ĞŸÑ€Ğ¾Ğ²ĞµÑ€ÑŒÑ‚Ğµ Ğ½Ğ°Ğ»Ğ¾Ğ³Ğ¾Ğ²ÑƒÑ ÑÑ‚Ğ°Ğ²ĞºÑƒ Ğ¸ ĞºĞ¾Ğ»Ğ¸Ñ‡ĞµÑÑ‚Ğ²Ğ¾ ÑÑ‚Ñ€Ğ¾Ğº Ğ¿Ñ€ĞµĞ´Ğ¿Ñ€Ğ¾ÑĞ¼Ğ¾Ñ‚Ñ€Ğ°", parent=self)
-            return
-        self.db.set_setting("theme", THEME_LABELS[self.theme_var.get()])
-        self.db.set_setting("tax_rate", str(tax_percent / 100))
-        self.db.set_setting("duplicate_policy", DUPLICATE_LABELS[self.duplicate_policy_var.get()])
-        self.db.set_setting("warn_without_realization", "1" if self.warn_realization_var.get() else "0")
-        self.db.set_setting("preview_rows", str(preview_rows))
-        self.colors = apply_theme(self, THEME_LABELS[self.theme_var.get()])
-        messagebox.showinfo("ĞĞ°ÑÑ‚Ñ€Ğ¾Ğ¹ĞºĞ¸", "ĞĞ°ÑÑ‚Ñ€Ğ¾Ğ¹ĞºĞ¸ ÑĞ¾Ñ…Ñ€Ğ°Ğ½ĞµĞ½Ñ‹", parent=self)
-
-    def _preview_theme(self, _event=None) -> None:
-        self.colors = apply_theme(self, THEME_LABELS[self.theme_var.get()])
-        for tree in (
-            self.overview_tree,
-            self.breakdown_tree,
-            self.scenario_tree,
-            self.history_tree,
-            self.quality_tree,
-            self.trend_tree,
-            self.comparison_tree,
-            self.products_tree,
-        ):
-            self._configure_value_tags(tree)
-        self._draw_trend_chart()
-
-    def import_reports(self) -> None:
-        if self.import_in_progress:
-            messagebox.showinfo("Ğ˜Ğ¼Ğ¿Ğ¾Ñ€Ñ‚ Ğ¾Ñ‚Ñ‡ĞµÑ‚Ğ¾Ğ²", "ĞŸÑ€Ğ¾Ğ²ĞµÑ€ĞºĞ° Ñ„Ğ°Ğ¹Ğ»Ğ¾Ğ² ÑƒĞ¶Ğµ Ğ²Ñ‹Ğ¿Ğ¾Ğ»Ğ½ÑĞµÑ‚ÑÑ", parent=self)
-            return
-        paths = filedialog.askopenfilenames(
-            title="Ğ’Ñ‹Ğ±ĞµÑ€Ğ¸Ñ‚Ğµ Ğ¾Ñ‚Ñ‡ĞµÑ‚Ñ‹ Ozon",
-            filetypes=[("ĞÑ‚Ñ‡ĞµÑ‚Ñ‹ Excel", "*.xlsx")],
-            parent=self,
-        )
-        if not paths:
-            return
-        self.configure(cursor="watch")
-        self.status_var.set("ĞŸÑ€Ğ¾Ğ²ĞµÑ€ĞºĞ° Ğ¸ÑÑ…Ğ¾Ğ´Ğ½Ñ‹Ñ… Ñ„Ğ°Ğ¹Ğ»Ğ¾Ğ²â€¦")
-        self.update_idletasks()
-        self.import_in_progress = True
-        threading.Thread(target=self._prepare_import_worker, args=(list(paths),), daemon=True).start()
-        self.after(100, self._poll_import_queue)
-
-    def _prepare_import_worker(self, paths: list[str]) -> None:
-        try:
-            session = self.service.prepare_import(list(paths))
-            self.import_queue.put((session, None))
-        except Exception as exc:
-            self.import_queue.put((None, exc))
-
-    def _poll_import_queue(self) -> None:
-        try:
-            session, error = self.import_queue.get_nowait()
-        except queue.Empty:
-            self.after(100, self._poll_import_queue)
-            return
-        self._complete_import_ui(session, error)
-
-    def _complete_import_ui(self, session: ImportSession | None, error: Exception | None) -> None:
-        try:
-            if error is not None:
-                raise error
-            if session is None:
-                raise RuntimeError("ĞĞµ ÑƒĞ´Ğ°Ğ»Ğ¾ÑÑŒ Ğ¿Ğ¾Ğ´Ğ³Ğ¾Ñ‚Ğ¾Ğ²Ğ¸Ñ‚ÑŒ Ğ¸Ğ¼Ğ¿Ğ¾Ñ€Ñ‚")
-            if not self._handle_duplicates(session):
-                return
-            if not session.sources or not session.has_accrual:
-                raise ValueError("ĞŸĞ¾ÑĞ»Ğµ Ğ¸ÑĞºĞ»ÑÑ‡ĞµĞ½Ğ¸Ñ Ğ´ÑƒĞ±Ğ»Ğ¸ĞºĞ°Ñ‚Ğ¾Ğ² Ğ½Ğµ Ğ¾ÑÑ‚Ğ°Ğ»Ğ¾ÑÑŒ Ğ¾Ñ‚Ñ‡ĞµÑ‚Ğ° Ğ¿Ğ¾ Ğ½Ğ°Ñ‡Ğ¸ÑĞ»ĞµĞ½Ğ¸ÑĞ¼")
-            if not session.has_realization and self.db.get_setting("warn_without_realization", "1") == "1":
-                if not messagebox.askyesno(
-                    "ĞĞµÑ‚ Ğ¾Ñ‚Ñ‡ĞµÑ‚Ğ° Ğ¾ Ğ²Ñ‹ĞºÑƒĞ¿Ğ»ĞµĞ½Ğ½Ñ‹Ñ… Ñ‚Ğ¾Ğ²Ğ°Ñ€Ğ°Ñ…",
-                    "ĞŸÑ€Ğ¾Ğ´Ğ¾Ğ»Ğ¶Ğ¸Ñ‚ÑŒ Ğ±ĞµĞ· RealizationReportCIS? Ğ•ÑĞ»Ğ¸ Ñ‚Ğ°ĞºĞ¸Ğµ Ğ¿Ñ€Ğ¾Ğ´Ğ°Ğ¶Ğ¸ Ğ±Ñ‹Ğ»Ğ¸, Ğ²Ñ‹Ñ€ÑƒÑ‡ĞºĞ° Ğ±ÑƒĞ´ĞµÑ‚ Ğ½ĞµĞ¿Ğ¾Ğ»Ğ½Ğ¾Ğ¹.",
-                    parent=self,
-                ):
-                    return
-            session.unknown_products = discover_unknown_products(session.sources, self.db.product_map(active_only=False))
-            created: list[Product] = []
-            skipped: set[str] = set()
-            if session.unknown_products:
-                dialog = UnknownProductsDialog(self, session.unknown_products)
-                self.wait_window(dialog)
-                if dialog.cancelled:
-                    return
-                created = dialog.created_products
-                skipped = dialog.skipped_articles
-            calculation = self.service.complete_import(session, created_products=created, skipped_articles=skipped)
-            self.current_run_id = calculation.run_id
-            self.refresh_all()
-            messagebox.showinfo(
-                "Ğ Ğ°ÑÑ‡ĞµÑ‚ Ğ³Ğ¾Ñ‚Ğ¾Ğ²",
-                f"Ğ¡Ğ¾Ğ·Ğ´Ğ°Ğ½ Ñ€Ğ°ÑÑ‡ĞµÑ‚ #{calculation.run_id}.\n"
-                f"ĞŸĞµÑ€Ğ¸Ğ¾Ğ´: {_calculation_period(calculation)}\n"
-                f"Ğ’Ñ‹Ñ€ÑƒÑ‡ĞºĞ° Ğ¿Ğ¾ Ğ²Ñ‹ĞºÑƒĞ¿Ğ»ĞµĞ½Ğ½Ñ‹Ğ¼ Ñ‚Ğ¾Ğ²Ğ°Ñ€Ğ°Ğ¼: {_money(calculation.realization_revenue)}",
-                parent=self,
-            )
-        except Exception as exc:
-            messagebox.showerror("Ğ˜Ğ¼Ğ¿Ğ¾Ñ€Ñ‚ Ğ¾Ñ‚Ñ‡ĞµÑ‚Ğ¾Ğ²", str(exc), parent=self)
-        finally:
-            self.import_in_progress = False
-            self.configure(cursor="")
-            self.status_var.set("Ğ“Ğ¾Ñ‚Ğ¾Ğ²Ğ¾" if self.current_run_id is None else f"ĞÑ‚ĞºÑ€Ñ‹Ñ‚ Ñ€Ğ°ÑÑ‡ĞµÑ‚ #{self.current_run_id}")
-
-    def _handle_duplicates(self, session: ImportSession) -> bool:
-        if not session.duplicate_sources:
-            return True
-        policy = self.db.get_setting("duplicate_policy", "ask")
-        names = "\n".join(_duplicate_description(source) for source in session.duplicate_sources)
-        if policy == "allow":
-            return True
-        if policy == "skip":
-            _exclude_duplicate_sources(session)
-            return True
-        answer = messagebox.askyesnocancel(
-            "ĞŸĞ¾Ğ²Ñ‚Ğ¾Ñ€Ğ½Ğ°Ñ Ğ·Ğ°Ğ³Ñ€ÑƒĞ·ĞºĞ° Ñ„Ğ°Ğ¹Ğ»Ğ¾Ğ²",
-            "ĞĞ°Ğ¹Ğ´ĞµĞ½Ñ‹ Ñ„Ğ°Ğ¹Ğ»Ñ‹ Ñ ÑƒĞ¶Ğµ Ğ²Ñ‹Ğ±Ñ€Ğ°Ğ½Ğ½Ñ‹Ğ¼ Ğ¸Ğ»Ğ¸ Ñ€Ğ°Ğ½ĞµĞµ Ğ¾Ğ±Ñ€Ğ°Ğ±Ğ¾Ñ‚Ğ°Ğ½Ğ½Ñ‹Ğ¼ ÑĞ¾Ğ´ĞµÑ€Ğ¶Ğ¸Ğ¼Ñ‹Ğ¼:\n\n"
-            f"{names}\n\nĞ”Ğ° â€” Ğ²ĞºĞ»ÑÑ‡Ğ¸Ñ‚ÑŒ Ğ¿Ğ¾Ğ²Ñ‚Ğ¾Ñ€Ğ½Ğ¾; ĞĞµÑ‚ â€” Ğ¿Ñ€Ğ¾Ğ¿ÑƒÑÑ‚Ğ¸Ñ‚ÑŒ; ĞÑ‚Ğ¼ĞµĞ½Ğ° â€” Ğ¿Ñ€ĞµÑ€Ğ²Ğ°Ñ‚ÑŒ Ğ¸Ğ¼Ğ¿Ğ¾Ñ€Ñ‚.",
-            parent=self,
-        )
-        if answer is None:
-            return False
-        if answer is False:
-            _exclude_duplicate_sources(session)
-        return True
-
-    def export_current_run(self) -> None:
-        if self.current_run_id is None or self.current_calculation is None:
-            messagebox.showinfo("Ğ­ĞºÑĞ¿Ğ¾Ñ€Ñ‚", "Ğ¡Ğ½Ğ°Ñ‡Ğ°Ğ»Ğ° Ğ¸Ğ¼Ğ¿Ğ¾Ñ€Ñ‚Ğ¸Ñ€ÑƒĞ¹Ñ‚Ğµ Ğ¸Ğ»Ğ¸ Ğ²Ñ‹Ğ±ĞµÑ€Ğ¸Ñ‚Ğµ Ñ€Ğ°ÑÑ‡ĞµÑ‚", parent=self)
-            return
-        destination = filedialog.asksaveasfilename(
-            title="Ğ¡Ğ¾Ñ…Ñ€Ğ°Ğ½Ğ¸Ñ‚ÑŒ Ğ¸Ñ‚Ğ¾Ğ³Ğ¾Ğ²Ñ‹Ğ¹ Ğ¾Ñ‚Ñ‡ĞµÑ‚",
-            defaultextension=".xlsx",
-            initialdir=str(self.service.paths["exports"]),
-            initialfile=suggested_export_name(self.current_calculation),
-            filetypes=[("ĞšĞ½Ğ¸Ğ³Ğ° Excel", "*.xlsx")],
-            parent=self,
-        )
-        if not destination:
-            return
-        try:
-            path = export_run(self.db, self.current_run_id, destination)
-            messagebox.showinfo("Ğ­ĞºÑĞ¿Ğ¾Ñ€Ñ‚", f"ĞÑ‚Ñ‡ĞµÑ‚ ÑĞ¾Ñ…Ñ€Ğ°Ğ½ĞµĞ½:\n{path}", parent=self)
-        except Exception as exc:
-            messagebox.showerror("Ğ­ĞºÑĞ¿Ğ¾Ñ€Ñ‚", str(exc), parent=self)
-
-    def _configure_value_tags(self, tree: ttk.Treeview) -> None:
-        palette = self.colors
-        tree.tag_configure("negative", foreground=palette["negative"])
-        tree.tag_configure("positive", foreground=palette["positive"])
-        tree.tag_configure("warning", foreground=palette["warning"])
-        tree.tag_configure("total", background=palette["surface_alt"], foreground=palette["text"])
-        tree.tag_configure("muted", foreground=palette["muted"])
-
-
-class AboutDialog(tk.Toplevel):
-    def __init__(self, parent: OZPriceAnalyzerApp):
-        super().__init__(parent)
-        self.title("Ğ Ğ¿Ñ€Ğ¾Ğ³Ñ€Ğ°Ğ¼Ğ¼Ğµ")
-        self.transient(parent)
-        self.grab_set()
-        self.resizable(False, False)
-        self.configure(background=parent.colors["window"])
-        self.columnconfigure(0, weight=1)
-
-        ttk.Label(self, text=APP_TITLE, style="Title.TLabel").grid(
-            row=0, column=0, sticky="w", padx=24, pady=(22, 2)
-        )
-        ttk.Label(self, text=f"Ğ’ĞµÑ€ÑĞ¸Ñ {APP_VERSION}", style="Section.TLabel").grid(
-            row=1, column=0, sticky="w", padx=24
-        )
-        ttk.Label(
-            self,
-            text="Ğ›Ğ¾ĞºĞ°Ğ»ÑŒĞ½Ñ‹Ğ¹ Ğ°Ğ½Ğ°Ğ»Ğ¸Ğ· Ğ¾Ñ‚Ñ‡ĞµÑ‚Ğ¾Ğ² Ozon, ĞºĞ¾Ğ½Ñ‚Ñ€Ğ¾Ğ»ÑŒ Ğ½Ğ°Ñ‡Ğ¸ÑĞ»ĞµĞ½Ğ¸Ğ¹, Ğ¸ÑÑ‚Ğ¾Ñ€Ğ¸Ñ Ğ¸ ÑÑ†ĞµĞ½Ğ°Ñ€Ğ¸Ğ¸ Ğ´Ğ¾Ñ…Ğ¾Ğ´Ğ½Ğ¾ÑÑ‚Ğ¸.",
-            style="Muted.TLabel",
-            wraplength=560,
-            justify="left",
-        ).grid(row=2, column=0, sticky="w", padx=24, pady=(10, 14))
-
-        details = ttk.LabelFrame(self, text="Ğ¡Ğ²ĞµĞ´ĞµĞ½Ğ¸Ñ", padding=(14, 10))
-        details.grid(row=3, column=0, sticky="ew", padx=24)
-        details.columnconfigure(1, weight=1)
-        build_type = "ĞĞ²Ñ‚Ğ¾Ğ½Ğ¾Ğ¼Ğ½Ğ°Ñ Windows-ÑĞ±Ğ¾Ñ€ĞºĞ°" if getattr(sys, "frozen", False) else "Ğ—Ğ°Ğ¿ÑƒÑĞº Ğ¸Ğ· Python"
-        for row, (label, value) in enumerate(
-            [
-                ("Ğ¢Ğ¸Ğ¿ Ğ·Ğ°Ğ¿ÑƒÑĞºĞ°", build_type),
-                ("Ğ¥Ñ€Ğ°Ğ½Ğ¸Ğ»Ğ¸Ñ‰Ğµ Ğ´Ğ°Ğ½Ğ½Ñ‹Ñ…", str(parent.service.paths["root"])),
-                ("Ğ ĞµĞ¿Ğ¾Ğ·Ğ¸Ñ‚Ğ¾Ñ€Ğ¸Ğ¹", "github.com/otdelvsego-spec/OZPriceAnalyzer"),
-            ]
-        ):
-            ttk.Label(details, text=f"{label}:").grid(row=row, column=0, sticky="nw", padx=(0, 12), pady=3)
-            ttk.Label(details, text=value, style="Muted.TLabel", wraplength=430).grid(
-                row=row, column=1, sticky="w", pady=3
-            )
-
-        ttk.Label(
-            self,
-            text="Microsoft Excel Ğ½Ğµ Ñ‚Ñ€ĞµĞ±ÑƒĞµÑ‚ÑÑ. Ğ’ÑĞµ Ñ€Ğ°Ğ±Ğ¾Ñ‡Ğ¸Ğµ Ğ´Ğ°Ğ½Ğ½Ñ‹Ğµ Ğ¾ÑÑ‚Ğ°ÑÑ‚ÑÑ Ğ½Ğ° ÑÑ‚Ğ¾Ğ¼ ĞºĞ¾Ğ¼Ğ¿ÑŒÑÑ‚ĞµÑ€Ğµ.",
-            style="Muted.TLabel",
-        ).grid(row=4, column=0, sticky="w", padx=24, pady=(12, 4))
-
-        buttons = ttk.Frame(self, padding=(20, 14))
-        buttons.grid(row=5, column=0, sticky="e")
-        ttk.Button(
-            buttons,
-            text="ĞÑ‚ĞºÑ€Ñ‹Ñ‚ÑŒ Ñ…Ñ€Ğ°Ğ½Ğ¸Ğ»Ğ¸Ñ‰Ğµ",
-            command=lambda: _open_path(parent.service.paths["root"]),
-        ).grid(row=0, column=0, padx=4)
-        ttk.Button(
-            buttons,
-            text="ĞÑ‚ĞºÑ€Ñ‹Ñ‚ÑŒ GitHub",
-            command=lambda: webbrowser.open("https://github.com/otdelvsego-spec/OZPriceAnalyzer"),
-        ).grid(row=0, column=1, padx=4)
-        ttk.Button(buttons, text="Ğ—Ğ°ĞºÑ€Ñ‹Ñ‚ÑŒ", style="Accent.TButton", command=self.destroy).grid(
-            row=0, column=2, padx=4
-        )
-        self.bind("<Escape>", lambda _event: self.destroy())
-
-
-class CostCatalogEditorDialog(tk.Toplevel):
-    def __init__(self, parent: OZPriceAnalyzerApp, products: list[Product]):
-        super().__init__(parent)
-        self.title("Ğ ĞµĞ´Ğ°ĞºÑ‚Ğ¾Ñ€ Ñ‚Ğ¾Ğ²Ğ°Ñ€Ğ¾Ğ² Ğ¸ ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚Ğ¸")
-        self.geometry("1280x760")
-        self.minsize(1020, 650)
-        self.transient(parent)
-        self.grab_set()
-        self.cancelled = True
-        self.products: list[Product] = []
-        self.article_order: list[str] = []
-        self.order_changed = False
-        self.product_map = {
-            product.article: Product(
-                article=product.article,
-                name=product.name,
-                material_cost=product.material_cost,
-                labor_cost=product.labor_cost,
-                active=product.active,
-                sort_order=product.sort_order,
-            )
-            for product in products
-        }
-        self.product_order = [product.article for product in products]
-        self.original_order = list(self.product_order)
-        self.original_articles = set(self.product_map)
-        self.current_article: str | None = None
-        self.loading = False
-        self.dirty = False
-
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(3, weight=1)
-        ttk.Label(self, text="Ğ¢Ğ¾Ğ²Ğ°Ñ€Ñ‹ Ğ¸ ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚ÑŒ", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w", padx=20, pady=(18, 2)
-        )
-        ttk.Label(
-            self,
-            text=(
-                "Ğ—Ğ°Ğ¿Ğ¾Ğ»Ğ½ÑĞ¹Ñ‚Ğµ ÑĞ¿Ñ€Ğ°Ğ²Ğ¾Ñ‡Ğ½Ğ¸Ğº Ğ¿Ñ€ÑĞ¼Ğ¾ Ğ·Ğ´ĞµÑÑŒ. ĞŸĞ¾Ğ»Ğ½Ğ°Ñ ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚ÑŒ ÑĞ¾ÑÑ‚Ğ¾Ğ¸Ñ‚ Ğ¸Ğ· Ğ¼Ğ°Ñ‚ĞµÑ€Ğ¸Ğ°Ğ»Ğ° Ğ¸ Ñ‚Ñ€ÑƒĞ´Ğ¾Ğ·Ğ°Ñ‚Ñ€Ğ°Ñ‚. "
-                "ĞŸĞµÑ€ĞµĞ´ Ğ¾ĞºĞ¾Ğ½Ñ‡Ğ°Ñ‚ĞµĞ»ÑŒĞ½Ñ‹Ğ¼ ÑĞ¾Ñ…Ñ€Ğ°Ğ½ĞµĞ½Ğ¸ĞµĞ¼ Ğ¿Ñ€Ğ¸Ğ»Ğ¾Ğ¶ĞµĞ½Ğ¸Ğµ Ğ¿Ğ¾ĞºĞ°Ğ¶ĞµÑ‚ Ğ²ÑĞµ Ğ¸Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ñ."
-            ),
-            style="Muted.TLabel",
-        ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 10))
-
-        controls = ttk.Frame(self)
-        controls.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 8))
-        controls.columnconfigure(2, weight=1)
-        ttk.Label(controls, text="ĞŸĞ¾Ğ¸ÑĞº:").grid(row=0, column=0, padx=(0, 6))
-        self.search_var = tk.StringVar()
-        ttk.Entry(controls, textvariable=self.search_var, width=32).grid(row=0, column=1, padx=(0, 12))
-        self.search_var.trace_add("write", lambda *_args: self._refresh_tree())
-        self.count_var = tk.StringVar()
-        ttk.Label(controls, textvariable=self.count_var, style="Muted.TLabel").grid(row=0, column=2, sticky="w")
-        ttk.Button(controls, text="â†‘ Ğ’Ğ²ĞµÑ€Ñ…", command=lambda: self._move_selected(-1)).grid(
-            row=0, column=3, padx=3
-        )
-        ttk.Button(controls, text="â†“ Ğ’Ğ½Ğ¸Ğ·", command=lambda: self._move_selected(1)).grid(
-            row=0, column=4, padx=3
-        )
-        ttk.Button(controls, text="ĞĞ¾Ğ²Ğ°Ñ Ğ¿Ğ¾Ğ·Ğ¸Ñ†Ğ¸Ñ", style="Accent.TButton", command=self._new_product).grid(
-            row=0, column=5, padx=(8, 0)
-        )
-
-        container = ttk.Frame(self)
-        container.grid(row=3, column=0, sticky="nsew", padx=20)
-        container.columnconfigure(0, weight=1)
-        container.rowconfigure(0, weight=1)
-        columns = ("article", "name", "total", "material", "labor", "status")
-        self.tree = ttk.Treeview(container, columns=columns, show="headings", selectmode="browse")
-        headings = ["ĞÑ€Ñ‚Ğ¸ĞºÑƒĞ»", "ĞĞ°Ğ¸Ğ¼ĞµĞ½Ğ¾Ğ²Ğ°Ğ½Ğ¸Ğµ", "ĞŸĞ¾Ğ»Ğ½Ğ°Ñ ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚ÑŒ", "ĞœĞ°Ñ‚ĞµÑ€Ğ¸Ğ°Ğ»", "Ğ¢Ñ€ÑƒĞ´Ğ¾Ğ·Ğ°Ñ‚Ñ€Ğ°Ñ‚Ñ‹", "Ğ¡Ñ‚Ğ°Ñ‚ÑƒÑ"]
-        widths = [150, 340, 170, 150, 150, 100]
-        for column, heading, width in zip(columns, headings, widths):
-            self.tree.heading(column, text=heading)
-            self.tree.column(
-                column,
-                width=width,
-                minwidth=80,
-                stretch=False,
-                anchor="w" if column in {"article", "name", "status"} else "e",
-            )
-        xscroll = ttk.Scrollbar(container, orient="horizontal", command=self.tree.xview)
-        yscroll = ttk.Scrollbar(container, orient="vertical", command=self.tree.yview)
-        self.tree.configure(xscrollcommand=xscroll.set, yscrollcommand=yscroll.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        yscroll.grid(row=0, column=1, sticky="ns")
-        xscroll.grid(row=1, column=0, sticky="ew")
-        self.tree.bind("<<TreeviewSelect>>", self._on_select)
-        self.tree.bind("<Double-1>", lambda _event: self.name_entry.focus_set())
-        self.tree.tag_configure("muted", foreground=parent.colors["muted"])
-
-        editor = ttk.LabelFrame(self, text="Ğ ĞµĞ´Ğ°ĞºÑ‚Ğ¸Ñ€Ğ¾Ğ²Ğ°Ğ½Ğ¸Ğµ Ğ²Ñ‹Ğ±Ñ€Ğ°Ğ½Ğ½Ğ¾Ğ¹ Ğ¿Ğ¾Ğ·Ğ¸Ñ†Ğ¸Ğ¸", padding=(14, 10))
-        editor.grid(row=4, column=0, sticky="ew", padx=20, pady=(12, 0))
-        editor.columnconfigure(3, weight=1)
-        self.article_var = tk.StringVar()
-        self.name_var = tk.StringVar()
-        self.total_var = tk.StringVar()
-        self.labor_var = tk.StringVar(value="0")
-        self.material_var = tk.StringVar(value="â€”")
-        self.active_var = tk.BooleanVar(value=True)
-        ttk.Label(editor, text="ĞÑ€Ñ‚Ğ¸ĞºÑƒĞ»:").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=4)
-        self.article_entry = ttk.Entry(editor, textvariable=self.article_var, width=22)
-        self.article_entry.grid(row=0, column=1, sticky="w", padx=(0, 18), pady=4)
-        ttk.Label(editor, text="ĞĞ°Ğ¸Ğ¼ĞµĞ½Ğ¾Ğ²Ğ°Ğ½Ğ¸Ğµ:").grid(row=0, column=2, sticky="w", padx=(0, 6), pady=4)
-        self.name_entry = ttk.Entry(editor, textvariable=self.name_var)
-        self.name_entry.grid(row=0, column=3, sticky="ew", padx=(0, 18), pady=4)
-        ttk.Checkbutton(editor, text="ĞĞºÑ‚Ğ¸Ğ²ĞµĞ½", variable=self.active_var).grid(row=0, column=4, sticky="w", pady=4)
-
-        ttk.Label(editor, text="ĞŸĞ¾Ğ»Ğ½Ğ°Ñ ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚ÑŒ, Ñ€ÑƒĞ±.:").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=4)
-        ttk.Entry(editor, textvariable=self.total_var, width=22).grid(row=1, column=1, sticky="w", padx=(0, 18), pady=4)
-        ttk.Label(editor, text="Ğ¢Ñ€ÑƒĞ´Ğ¾Ğ·Ğ°Ñ‚Ñ€Ğ°Ñ‚Ñ‹, Ñ€ÑƒĞ±.:").grid(row=1, column=2, sticky="w", padx=(0, 6), pady=4)
-        ttk.Entry(editor, textvariable=self.labor_var, width=18).grid(row=1, column=3, sticky="w", pady=4)
-        ttk.Label(editor, text="ĞœĞ°Ñ‚ĞµÑ€Ğ¸Ğ°Ğ» Ñ€Ğ°ÑÑÑ‡Ğ¸Ñ‚Ñ‹Ğ²Ğ°ĞµÑ‚ÑÑ Ğ°Ğ²Ñ‚Ğ¾Ğ¼Ğ°Ñ‚Ğ¸Ñ‡ĞµÑĞºĞ¸:").grid(
-            row=2, column=0, columnspan=2, sticky="w", pady=(4, 0)
-        )
-        ttk.Label(editor, textvariable=self.material_var, style="Section.TLabel").grid(
-            row=2, column=2, sticky="w", pady=(4, 0)
-        )
-        ttk.Button(editor, text="ĞŸÑ€Ğ¸Ğ¼ĞµĞ½Ğ¸Ñ‚ÑŒ Ğ² Ñ‚Ğ°Ğ±Ğ»Ğ¸Ñ†Ñƒ", command=self._commit_current).grid(
-            row=2, column=4, sticky="e", pady=(4, 0)
-        )
-
-        for variable in (self.article_var, self.name_var, self.total_var, self.labor_var):
-            variable.trace_add("write", self._field_changed)
-        self.active_var.trace_add("write", self._field_changed)
-
-        buttons = ttk.Frame(self, padding=(20, 14))
-        buttons.grid(row=5, column=0, sticky="e")
-        ttk.Button(buttons, text="ĞÑ‚Ğ¼ĞµĞ½Ğ°", command=self.destroy).grid(row=0, column=0, padx=4)
-        ttk.Button(
-            buttons,
-            text="ĞŸÑ€Ğ¾Ğ²ĞµÑ€Ğ¸Ñ‚ÑŒ Ğ¸ ÑĞ¾Ñ…Ñ€Ğ°Ğ½Ğ¸Ñ‚ÑŒ ÑĞ¿Ñ€Ğ°Ğ²Ğ¾Ñ‡Ğ½Ğ¸Ğº",
-            style="Accent.TButton",
-            command=self._finish,
-        ).grid(row=0, column=1, padx=4)
-        self.bind("<Control-s>", lambda _event: self._finish())
-        self.bind("<Escape>", lambda _event: self.destroy())
-
-        self._refresh_tree()
-        first = next(iter(self.product_map), None)
-        if first:
-            self._select_article(first)
-        else:
-            self._new_product()
-
-    def _field_changed(self, *_args) -> None:
-        if self.loading:
-            return
-        self.dirty = True
-        try:
-            total = _parse_number(self.total_var.get())
-            labor = _parse_number(self.labor_var.get() or "0")
-            self.material_var.set(_money(total - labor) if total >= labor >= 0 else "ĞŸÑ€Ğ¾Ğ²ĞµÑ€ÑŒÑ‚Ğµ Ğ·Ğ½Ğ°Ñ‡ĞµĞ½Ğ¸Ñ")
-        except ValueError:
-            self.material_var.set("â€”")
-
-    def _refresh_tree(self) -> None:
-        if not hasattr(self, "tree"):
-            return
-        query = self.search_var.get().strip().casefold()
-        selected = self.current_article
-        self.loading = True
-        try:
-            self.tree.delete(*self.tree.get_children())
-            visible = [
-                self.product_map[article]
-                for article in self.product_order
-                if article in self.product_map
-                and (
-                    not query
-                    or query in article.casefold()
-                    or query in self.product_map[article].name.casefold()
-                )
-            ]
-            for product in visible:
-                self.tree.insert(
-                    "",
-                    "end",
-                    iid=product.article,
-                    values=(
-                        product.article,
-                        product.name,
-                        _money(product.total_cost),
-                        _money(product.material_cost),
-                        _money(product.labor_cost),
-                        "ĞĞºÑ‚Ğ¸Ğ²ĞµĞ½" if product.active else "ĞÑ€Ñ…Ğ¸Ğ²",
-                    ),
-                    tags=("" if product.active else "muted",),
-                )
-            self.count_var.set(f"ĞŸĞ¾ĞºĞ°Ğ·Ğ°Ğ½Ğ¾: {len(visible)} Ğ¸Ğ· {len(self.product_map)}")
-            if selected and self.tree.exists(selected):
-                self.tree.selection_set(selected)
-                self.tree.focus(selected)
-        finally:
-            self.loading = False
-
-    def _move_selected(self, direction: int) -> None:
-        if self.search_var.get().strip():
-            messagebox.showinfo(
-                "ĞŸĞ¾Ñ€ÑĞ´Ğ¾Ğº Ñ‚Ğ¾Ğ²Ğ°Ñ€Ğ¾Ğ²",
-                "ĞÑ‡Ğ¸ÑÑ‚Ğ¸Ñ‚Ğµ Ğ¿Ğ¾Ğ¸ÑĞº, Ñ‡Ñ‚Ğ¾Ğ±Ñ‹ Ğ¼ĞµĞ½ÑÑ‚ÑŒ Ğ¿Ğ¾Ğ·Ğ¸Ñ†Ğ¸Ğ¸ Ğ² Ğ¿Ğ¾Ğ»Ğ½Ğ¾Ğ¼ ÑĞ¿Ğ¸ÑĞºĞµ.",
-                parent=self,
-            )
-            return
-        selection = self.tree.selection()
-        if not selection:
-            messagebox.showinfo("ĞŸĞ¾Ñ€ÑĞ´Ğ¾Ğº Ñ‚Ğ¾Ğ²Ğ°Ñ€Ğ¾Ğ²", "Ğ’Ñ‹Ğ±ĞµÑ€Ğ¸Ñ‚Ğµ Ğ¿Ğ¾Ğ·Ğ¸Ñ†Ğ¸Ñ Ğ² Ñ‚Ğ°Ğ±Ğ»Ğ¸Ñ†Ğµ", parent=self)
-            return
-        if self.dirty and not self._commit_current():
-            return
-        article = selection[0]
-        index = self.product_order.index(article)
-        target = index + direction
-        if target < 0 or target >= len(self.product_order):
-            return
-        self.product_order[index], self.product_order[target] = (
-            self.product_order[target],
-            self.product_order[index],
-        )
-        self._refresh_tree()
-        self._select_article(article)
-
-    def _on_select(self, _event=None) -> None:
-        if self.loading:
-            return
-        selection = self.tree.selection()
-        if not selection:
-            return
-        target = selection[0]
-        if target == self.current_article:
-            return
-        if self.dirty:
-            answer = messagebox.askyesnocancel(
-                "ĞĞµÑĞ¾Ñ…Ñ€Ğ°Ğ½ĞµĞ½Ğ½Ğ°Ñ ÑÑ‚Ñ€Ğ¾ĞºĞ°",
-                "ĞŸÑ€Ğ¸Ğ¼ĞµĞ½Ğ¸Ñ‚ÑŒ Ğ¸Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ñ Ñ‚ĞµĞºÑƒÑ‰ĞµĞ¹ ÑÑ‚Ñ€Ğ¾ĞºĞ¸ Ğ¿ĞµÑ€ĞµĞ´ Ğ¿ĞµÑ€ĞµÑ…Ğ¾Ğ´Ğ¾Ğ¼ Ğº Ğ´Ñ€ÑƒĞ³Ğ¾Ğ¹ Ğ¿Ğ¾Ğ·Ğ¸Ñ†Ğ¸Ğ¸?",
-                parent=self,
-            )
-            if answer is None:
-                self._select_article(self.current_article)
-                return
-            if answer and not self._commit_current():
-                self._select_article(self.current_article)
-                return
-        self._load_product(target)
-
-    def _select_article(self, article: str | None) -> None:
-        if not article:
-            self.loading = True
-            try:
-                self.tree.selection_remove(*self.tree.selection())
-            finally:
-                self.loading = False
-            return
-        if not self.tree.exists(article):
-            return
-        self.loading = True
-        try:
-            self.tree.selection_set(article)
-            self.tree.focus(article)
-            self.tree.see(article)
-        finally:
-            self.loading = False
-        self._load_product(article)
-
-    def _load_product(self, article: str) -> None:
-        product = self.product_map[article]
-        self.loading = True
-        try:
-            self.current_article = article
-            self.article_var.set(product.article)
-            self.name_var.set(product.name)
-            self.total_var.set(_plain_number(product.total_cost))
-            self.labor_var.set(_plain_number(product.labor_cost))
-            self.material_var.set(_money(product.material_cost))
-            self.active_var.set(product.active)
-            self.article_entry.configure(state="disabled" if article in self.original_articles else "normal")
-            self.dirty = False
-        finally:
-            self.loading = False
-
-    def _new_product(self) -> None:
-        if self.dirty:
-            if not self._commit_current():
-                return
-        self.loading = True
-        try:
-            self.tree.selection_remove(*self.tree.selection())
-            self.current_article = None
-            self.article_var.set("")
-            self.name_var.set("")
-            self.total_var.set("")
-            self.labor_var.set("0")
-            self.material_var.set("â€”")
-            self.active_var.set(True)
-            self.article_entry.configure(state="normal")
-            self.dirty = False
-        finally:
-            self.loading = False
-        self.article_entry.focus_set()
-
-    def _commit_current(self) -> bool:
-        entry = CostEditorEntry(
-            article=self.article_var.get(),
-            name=self.name_var.get(),
-            total_cost=self.total_var.get(),
-            labor_cost=self.labor_var.get(),
-            active=self.active_var.get(),
-            row_number=(self.product_order.index(self.current_article) + 1)
-            if self.current_article in self.product_order
-            else len(self.product_map) + 1,
-        )
-        try:
-            product = build_products_from_editor_entries([entry])[0]
-            if product.article != self.current_article and product.article in self.product_map:
-                raise ValueError(f"ĞÑ€Ñ‚Ğ¸ĞºÑƒĞ» {product.article} ÑƒĞ¶Ğµ ĞµÑÑ‚ÑŒ Ğ² ÑĞ¿Ñ€Ğ°Ğ²Ğ¾Ñ‡Ğ½Ğ¸ĞºĞµ")
-        except Exception as exc:
-            messagebox.showerror("Ğ¡ĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚ÑŒ", str(exc), parent=self)
-            return False
-        previous_article = self.current_article
-        if previous_article and previous_article != product.article and previous_article not in self.original_articles:
-            self.product_map.pop(previous_article, None)
-            if previous_article in self.product_order:
-                self.product_order[self.product_order.index(previous_article)] = product.article
-        elif product.article not in self.product_order:
-            self.product_order = insert_at_group_end(self.product_order, product.article)
-        self.product_map[product.article] = product
-        self.current_article = product.article
-        self.dirty = False
-        self._refresh_tree()
-        self._select_article(product.article)
-        return True
-
-    def _finish(self) -> None:
-        if self.dirty and not self._commit_current():
-            return
-        try:
-            entries = [
-                CostEditorEntry(
-                    article=product.article,
-                    name=product.name,
-                    total_cost=product.total_cost,
-                    labor_cost=product.labor_cost,
-                    active=product.active,
-                    row_number=index,
-                )
-                for index, product in enumerate(
-                    (self.product_map[article] for article in self.product_order), start=1
-                )
-            ]
-            self.products = build_products_from_editor_entries(entries)
-            self.article_order = [product.article for product in self.products]
-            for index, product in enumerate(self.products, start=1):
-                product.sort_order = index
-            self.order_changed = self.article_order != self.original_order
-        except Exception as exc:
-            messagebox.showerror("Ğ¡ĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚ÑŒ", str(exc), parent=self)
-            return
-        self.cancelled = False
-        self.destroy()
-
-
-class CostImportDialog(tk.Toplevel):
-    def __init__(self, parent: OZPriceAnalyzerApp, changes: list[CostChange], source_name: str):
-        super().__init__(parent)
-        self.title("ĞŸÑ€ĞµĞ´Ğ²Ğ°Ñ€Ğ¸Ñ‚ĞµĞ»ÑŒĞ½Ğ°Ñ Ğ¿Ñ€Ğ¾Ğ²ĞµÑ€ĞºĞ° ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚Ğ¸")
-        self.geometry("1260x650")
-        self.minsize(980, 520)
-        self.transient(parent)
-        self.grab_set()
-        self.cancelled = True
-        self.changes = changes
-        self.products_to_apply = [change.product for change in changes if change.changed]
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(3, weight=1)
-
-        ttk.Label(self, text="ĞŸÑ€Ğ¾Ğ²ĞµÑ€ÑŒÑ‚Ğµ Ğ¸Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ñ Ğ¿ĞµÑ€ĞµĞ´ Ğ¿Ñ€Ğ¸Ğ¼ĞµĞ½ĞµĞ½Ğ¸ĞµĞ¼", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w", padx=20, pady=(18, 2)
-        )
-        changed_count = len(self.products_to_apply)
-        new_count = sum(change.status == "ĞĞ¾Ğ²Ğ°Ñ Ğ¿Ğ¾Ğ·Ğ¸Ñ†Ğ¸Ñ" for change in changes)
-        ttk.Label(
-            self,
-            text=(
-                f"Ğ˜ÑÑ‚Ğ¾Ñ‡Ğ½Ğ¸Ğº: {source_name} Â· ÑÑ‚Ñ€Ğ¾Ğº: {len(changes)} Â· Ğ¸Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ğ¹: {changed_count} Â· Ğ½Ğ¾Ğ²Ñ‹Ñ… Ñ‚Ğ¾Ğ²Ğ°Ñ€Ğ¾Ğ²: {new_count}. "
-                "Ğ¡Ñ‚Ğ°Ñ€Ñ‹Ğµ Ğ¾Ñ‚Ñ‡ĞµÑ‚Ñ‹ Ğ¸ Ğ¸Ñ… ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚ÑŒ Ğ¾ÑÑ‚Ğ°Ğ½ÑƒÑ‚ÑÑ Ğ±ĞµĞ· Ğ¸Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ğ¹."
-            ),
-            style="Muted.TLabel",
-        ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 10))
-        ttk.Label(
-            self,
-            text="Ğ—ĞµĞ»ĞµĞ½Ñ‹Ğ¼ Ğ¾Ñ‚Ğ¼ĞµÑ‡ĞµĞ½Ñ‹ Ğ½Ğ¾Ğ²Ñ‹Ğµ Ğ¸ Ğ¸Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ½Ñ‹Ğµ Ğ¿Ğ¾Ğ·Ğ¸Ñ†Ğ¸Ğ¸, ÑĞµÑ€Ñ‹Ğ¼ â€” ÑÑ‚Ñ€Ğ¾ĞºĞ¸ Ğ±ĞµĞ· Ğ¸Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ğ¹.",
-            style="Muted.TLabel",
-        ).grid(row=2, column=0, sticky="w", padx=20, pady=(0, 8))
-
-        container = ttk.Frame(self)
-        container.grid(row=3, column=0, sticky="nsew", padx=20)
-        container.columnconfigure(0, weight=1)
-        container.rowconfigure(0, weight=1)
-        columns = (
-            "article", "name", "old_total", "new_total", "change",
-            "old_labor", "new_labor", "active", "status",
-        )
-        self.tree = ttk.Treeview(container, columns=columns, show="headings")
-        headings = [
-            "ĞÑ€Ñ‚Ğ¸ĞºÑƒĞ»", "ĞĞ°Ğ¸Ğ¼ĞµĞ½Ğ¾Ğ²Ğ°Ğ½Ğ¸Ğµ", "Ğ¡Ñ‚Ğ°Ñ€Ğ°Ñ Ñ/Ñ", "ĞĞ¾Ğ²Ğ°Ñ Ñ/Ñ", "Ğ˜Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ğµ",
-            "Ğ¡Ñ‚Ğ°Ñ€Ñ‹Ğµ Ñ‚Ñ€ÑƒĞ´Ğ¾Ğ·Ğ°Ñ‚Ñ€Ğ°Ñ‚Ñ‹", "ĞĞ¾Ğ²Ñ‹Ğµ Ñ‚Ñ€ÑƒĞ´Ğ¾Ğ·Ğ°Ñ‚Ñ€Ğ°Ñ‚Ñ‹", "ĞĞºÑ‚Ğ¸Ğ²ĞµĞ½", "Ğ”ĞµĞ¹ÑÑ‚Ğ²Ğ¸Ğµ",
-        ]
-        widths = [140, 280, 130, 130, 130, 160, 160, 90, 150]
-        for column, heading, width in zip(columns, headings, widths):
-            self.tree.heading(column, text=heading)
-            self.tree.column(column, width=width, minwidth=80, stretch=False, anchor="w" if column in {"article", "name", "status"} else "e")
-        xscroll = ttk.Scrollbar(container, orient="horizontal", command=self.tree.xview)
-        yscroll = ttk.Scrollbar(container, orient="vertical", command=self.tree.yview)
-        self.tree.configure(xscrollcommand=xscroll.set, yscrollcommand=yscroll.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        yscroll.grid(row=0, column=1, sticky="ns")
-        xscroll.grid(row=1, column=0, sticky="ew")
-        for change in changes:
-            previous = change.previous
-            tag = "changed" if change.changed else "muted"
-            self.tree.insert(
-                "",
-                "end",
-                values=(
-                    change.product.article,
-                    change.product.name,
-                    _money(previous.total_cost) if previous else "â€”",
-                    _money(change.product.total_cost),
-                    _signed_money(change.total_change) if change.total_change is not None else "ĞĞ¾Ğ²Ğ°Ñ",
-                    _money(previous.labor_cost) if previous else "â€”",
-                    _money(change.product.labor_cost),
-                    "Ğ”Ğ°" if change.product.active else "ĞĞµÑ‚",
-                    change.status,
-                ),
-                tags=(tag,),
-            )
-        self.tree.tag_configure("changed", foreground=parent.colors["positive"])
-        self.tree.tag_configure("muted", foreground=parent.colors["muted"])
-
-        buttons = ttk.Frame(self, padding=(20, 14))
-        buttons.grid(row=4, column=0, sticky="e")
-        ttk.Button(buttons, text="ĞÑ‚Ğ¼ĞµĞ½Ğ°", command=self.destroy).grid(row=0, column=0, padx=4)
-        apply_button = ttk.Button(buttons, text="ĞŸÑ€Ğ¸Ğ¼ĞµĞ½Ğ¸Ñ‚ÑŒ Ğ¸Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ñ", style="Accent.TButton", command=self._apply)
-        apply_button.grid(row=0, column=1, padx=4)
-        if not self.products_to_apply:
-            apply_button.configure(state="disabled")
-
-    def _apply(self) -> None:
-        if not self.products_to_apply:
-            return
-        self.cancelled = False
-        self.destroy()
-
-
-class CostHistoryDialog(tk.Toplevel):
-    def __init__(self, parent: OZPriceAnalyzerApp, rows: list[dict[str, object]]):
-        super().__init__(parent)
-        self.title("Ğ–ÑƒÑ€Ğ½Ğ°Ğ» Ğ¸Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ğ¹ ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚Ğ¸")
-        self.geometry("1320x650")
-        self.minsize(980, 500)
-        self.transient(parent)
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(2, weight=1)
-        ttk.Label(self, text="Ğ–ÑƒÑ€Ğ½Ğ°Ğ» Ğ¸Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ğ¹ ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚Ğ¸", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w", padx=20, pady=(18, 2)
-        )
-        ttk.Label(
-            self,
-            text="Ğ–ÑƒÑ€Ğ½Ğ°Ğ» Ğ¿Ğ¾ĞºĞ°Ğ·Ñ‹Ğ²Ğ°ĞµÑ‚ Ñ€ÑƒÑ‡Ğ½Ñ‹Ğµ Ğ¸Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ñ, Ğ¸Ğ¼Ğ¿Ğ¾Ñ€Ñ‚ XLSX Ğ¸ ÑĞ¾Ğ·Ğ´Ğ°Ğ½Ğ¸Ğµ Ğ½Ğ¾Ğ²Ñ‹Ñ… Ğ°Ñ€Ñ‚Ğ¸ĞºÑƒĞ»Ğ¾Ğ² Ğ¸Ğ· Ğ¾Ñ‚Ñ‡ĞµÑ‚Ğ¾Ğ².",
-            style="Muted.TLabel",
-        ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 10))
-        container = ttk.Frame(self)
-        container.grid(row=2, column=0, sticky="nsew", padx=20)
-        container.columnconfigure(0, weight=1)
-        container.rowconfigure(0, weight=1)
-        columns = ("date", "article", "name", "old_total", "new_total", "change", "old_labor", "new_labor", "source")
-        tree = ttk.Treeview(container, columns=columns, show="headings")
-        headings = [
-            "Ğ”Ğ°Ñ‚Ğ°", "ĞÑ€Ñ‚Ğ¸ĞºÑƒĞ»", "ĞĞ°Ğ¸Ğ¼ĞµĞ½Ğ¾Ğ²Ğ°Ğ½Ğ¸Ğµ", "Ğ¡Ñ‚Ğ°Ñ€Ğ°Ñ Ñ/Ñ", "ĞĞ¾Ğ²Ğ°Ñ Ñ/Ñ", "Ğ˜Ğ·Ğ¼ĞµĞ½ĞµĞ½Ğ¸Ğµ",
-            "Ğ¡Ñ‚Ğ°Ñ€Ñ‹Ğµ Ñ‚Ñ€ÑƒĞ´Ğ¾Ğ·Ğ°Ñ‚Ñ€Ğ°Ñ‚Ñ‹", "ĞĞ¾Ğ²Ñ‹Ğµ Ñ‚Ñ€ÑƒĞ´Ğ¾Ğ·Ğ°Ñ‚Ñ€Ğ°Ñ‚Ñ‹", "Ğ˜ÑÑ‚Ğ¾Ñ‡Ğ½Ğ¸Ğº",
-        ]
-        widths = [145, 130, 250, 120, 120, 120, 155, 155, 260]
-        for column, heading, width in zip(columns, headings, widths):
-            tree.heading(column, text=heading)
-            tree.column(column, width=width, minwidth=80, stretch=False, anchor="w" if column in {"article", "name", "source"} else "e")
-        xscroll = ttk.Scrollbar(container, orient="horizontal", command=tree.xview)
-        yscroll = ttk.Scrollbar(container, orient="vertical", command=tree.yview)
-        tree.configure(xscrollcommand=xscroll.set, yscrollcommand=yscroll.set)
-        tree.grid(row=0, column=0, sticky="nsew")
-        yscroll.grid(row=0, column=1, sticky="ns")
-        xscroll.grid(row=1, column=0, sticky="ew")
-        for row in rows:
-            old_material = row["old_material_cost"]
-            old_labor = row["old_labor_cost"]
-            old_total = float(old_material) + float(old_labor) if old_material is not None and old_labor is not None else None
-            new_total = float(row["new_material_cost"]) + float(row["new_labor_cost"])
-            tree.insert(
-                "",
-                "end",
-                values=(
-                    str(row["changed_at"])[:16],
-                    row["article"],
-                    row["new_name"],
-                    _money(old_total) if old_total is not None else "â€”",
-                    _money(new_total),
-                    _signed_money(new_total - old_total) if old_total is not None else "ĞĞ¾Ğ²Ğ°Ñ",
-                    _money(float(old_labor)) if old_labor is not None else "â€”",
-                    _money(float(row["new_labor_cost"])),
-                    row["change_source"],
-                ),
-            )
-        if not rows:
-            tree.insert("", "end", values=("", "", "Ğ–ÑƒÑ€Ğ½Ğ°Ğ» Ğ¿Ğ¾ĞºĞ° Ğ¿ÑƒÑÑ‚"))
-        ttk.Button(self, text="Ğ—Ğ°ĞºÑ€Ñ‹Ñ‚ÑŒ", command=self.destroy).grid(row=3, column=0, sticky="e", padx=20, pady=14)
-
-
-class ProductDialog(tk.Toplevel):
-    def __init__(self, parent: OZPriceAnalyzerApp, title: str, product: Product | None = None):
-        super().__init__(parent)
-        self.result: Product | None = None
-        self.product = product
-        self.title(title)
-        self.transient(parent)
-        self.grab_set()
-        self.resizable(False, False)
-        self.configure(background=parent.colors["window"])
-        self.columnconfigure(1, weight=1)
-        self.article_var = tk.StringVar(value=product.article if product else "")
-        self.name_var = tk.StringVar(value=product.name if product else "")
-        self.total_var = tk.StringVar(value=_plain_number(product.total_cost) if product else "")
-        self.labor_var = tk.StringVar(value=_plain_number(product.labor_cost) if product else "0")
-
-        fields = [
-            ("ĞÑ€Ñ‚Ğ¸ĞºÑƒĞ»", self.article_var),
-            ("ĞĞ°Ğ¸Ğ¼ĞµĞ½Ğ¾Ğ²Ğ°Ğ½Ğ¸Ğµ", self.name_var),
-            ("ĞŸĞ¾Ğ»Ğ½Ğ°Ñ ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚ÑŒ, Ñ€ÑƒĞ±.", self.total_var),
-            ("Ğ¢Ñ€ÑƒĞ´Ğ¾Ğ·Ğ°Ñ‚Ñ€Ğ°Ñ‚Ñ‹ Ğ² ÑĞ¾ÑÑ‚Ğ°Ğ²Ğµ Ñ/Ñ, Ñ€ÑƒĞ±.", self.labor_var),
-        ]
-        for row, (label, variable) in enumerate(fields):
-            ttk.Label(self, text=label).grid(row=row, column=0, sticky="w", pady=6, padx=(22, 12))
-            entry = ttk.Entry(self, textvariable=variable, width=42)
-            entry.grid(row=row, column=1, sticky="ew", pady=6, padx=(0, 22))
-            if product and row == 0:
-                entry.configure(state="disabled")
-        buttons = ttk.Frame(self)
-        buttons.grid(row=len(fields), column=0, columnspan=2, sticky="e", padx=18, pady=(14, 18))
-        ttk.Button(buttons, text="ĞÑ‚Ğ¼ĞµĞ½Ğ°", command=self.destroy).grid(row=0, column=0, padx=4)
-        ttk.Button(buttons, text="Ğ¡Ğ¾Ñ…Ñ€Ğ°Ğ½Ğ¸Ñ‚ÑŒ", style="Accent.TButton", command=self._save).grid(row=0, column=1, padx=4)
-        self.bind("<Return>", lambda _event: self._save())
-        self.bind("<Escape>", lambda _event: self.destroy())
-
-    def _save(self) -> None:
-        try:
-            article = self.article_var.get().strip()
-            name = self.name_var.get().strip() or article
-            total = _parse_number(self.total_var.get())
-            labor = _parse_number(self.labor_var.get())
-            if not article or total < 0 or labor < 0 or labor > total:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror(
-                "Ğ¢Ğ¾Ğ²Ğ°Ñ€",
-                "Ğ£ĞºĞ°Ğ¶Ğ¸Ñ‚Ğµ Ğ°Ñ€Ñ‚Ğ¸ĞºÑƒĞ» Ğ¸ ĞºĞ¾Ñ€Ñ€ĞµĞºÑ‚Ğ½ÑƒÑ ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚ÑŒ. Ğ¢Ñ€ÑƒĞ´Ğ¾Ğ·Ğ°Ñ‚Ñ€Ğ°Ñ‚Ñ‹ Ğ´Ğ¾Ğ»Ğ¶Ğ½Ñ‹ Ğ±Ñ‹Ñ‚ÑŒ Ğ¾Ñ‚ 0 Ğ´Ğ¾ Ğ¿Ğ¾Ğ»Ğ½Ğ¾Ğ¹ ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚Ğ¸.",
-                parent=self,
-            )
-            return
-        self.result = Product(
-            article=article,
-            name=name,
-            material_cost=total - labor,
-            labor_cost=labor,
-            active=self.product.active if self.product else True,
-        )
-        self.destroy()
-
-
-class UnknownProductsDialog(tk.Toplevel):
-    def __init__(self, parent: OZPriceAnalyzerApp, unknown: list[UnknownProduct]):
-        super().__init__(parent)
-        self.title("ĞĞ¾Ğ²Ñ‹Ğµ Ñ‚Ğ¾Ğ²Ğ°Ñ€Ñ‹")
-        self.geometry("1040x620")
-        self.transient(parent)
-        self.grab_set()
-        self.cancelled = True
-        self.items = {item.article: item for item in unknown}
-        self.decisions: dict[str, Product | None] = {}
-
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(2, weight=1)
-        ttk.Label(self, text="Ğ’ Ğ¾Ñ‚Ñ‡ĞµÑ‚Ğ°Ñ… Ğ½Ğ°Ğ¹Ğ´ĞµĞ½Ñ‹ Ğ½Ğ¾Ğ²Ñ‹Ğµ Ğ°Ñ€Ñ‚Ğ¸ĞºÑƒĞ»Ñ‹", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w", padx=20, pady=(18, 2)
-        )
-        ttk.Label(
-            self,
-            text="Ğ”Ğ»Ñ Ğ²ĞºĞ»ÑÑ‡ĞµĞ½Ğ¸Ñ Ğ½Ğ°Ñ‡Ğ¸ÑĞ»ĞµĞ½Ğ¸Ğ¹ ÑƒĞºĞ°Ğ¶Ğ¸Ñ‚Ğµ ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚ÑŒ. ĞŸÑ€Ğ¾Ğ¿ÑƒÑ‰ĞµĞ½Ğ½Ñ‹Ğ¹ Ğ°Ñ€Ñ‚Ğ¸ĞºÑƒĞ» Ğ½Ğµ Ğ¿Ğ¾Ğ¿Ğ°Ğ´ĞµÑ‚ Ğ½Ğ¸ Ğ² Ñ‚Ğ¾Ğ²Ğ°Ñ€, Ğ½Ğ¸ Ğ² Ğ½ĞµÑ€Ğ°ÑĞ¿Ñ€ĞµĞ´ĞµĞ»ĞµĞ½Ğ½Ñ‹Ğµ ÑÑƒĞ¼Ğ¼Ñ‹.",
-            style="Muted.TLabel",
-        ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 10))
-
-        container = ttk.Frame(self)
-        container.grid(row=2, column=0, sticky="nsew", padx=20)
-        container.columnconfigure(0, weight=1)
-        container.rowconfigure(0, weight=1)
-        self.tree = ttk.Treeview(container, columns=("article", "name", "sku", "sources", "decision"), show="headings")
-        headings = ["ĞÑ€Ñ‚Ğ¸ĞºÑƒĞ»", "ĞĞ°Ğ¸Ğ¼ĞµĞ½Ğ¾Ğ²Ğ°Ğ½Ğ¸Ğµ", "SKU", "Ğ¤Ğ°Ğ¹Ğ»Ñ‹", "Ğ ĞµÑˆĞµĞ½Ğ¸Ğµ"]
-        widths = [150, 260, 120, 310, 130]
-        for column, heading, width in zip(self.tree["columns"], headings, widths):
-            self.tree.heading(column, text=heading)
-            self.tree.column(column, width=width, stretch=False, anchor="w")
-        scroll = ttk.Scrollbar(container, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scroll.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        scroll.grid(row=0, column=1, sticky="ns")
-        for item in unknown:
-            self.tree.insert(
-                "", "end", iid=item.article,
-                values=(item.article, item.name, item.sku, ", ".join(sorted(item.source_names)), "ĞĞµ Ğ²Ñ‹Ğ±Ñ€Ğ°Ğ½Ğ¾"),
-            )
-        self.tree.bind("<<TreeviewSelect>>", self._select)
-
-        editor = ttk.Frame(self, padding=(20, 12))
-        editor.grid(row=3, column=0, sticky="ew")
-        ttk.Label(editor, text="ĞŸĞ¾Ğ»Ğ½Ğ°Ñ ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚ÑŒ, Ñ€ÑƒĞ±.:").grid(row=0, column=0, padx=(0, 6))
-        self.total_var = tk.StringVar()
-        ttk.Entry(editor, textvariable=self.total_var, width=14).grid(row=0, column=1, padx=(0, 14))
-        ttk.Label(editor, text="Ğ¢Ñ€ÑƒĞ´Ğ¾Ğ·Ğ°Ñ‚Ñ€Ğ°Ñ‚Ñ‹, Ñ€ÑƒĞ±.:").grid(row=0, column=2, padx=(0, 6))
-        self.labor_var = tk.StringVar(value="0")
-        ttk.Entry(editor, textvariable=self.labor_var, width=14).grid(row=0, column=3, padx=(0, 14))
-        ttk.Button(editor, text="Ğ¡Ğ¾Ğ·Ğ´Ğ°Ñ‚ÑŒ Ğ¿Ğ¾Ğ·Ğ¸Ñ†Ğ¸Ñ", command=self._create).grid(row=0, column=4, padx=4)
-        ttk.Button(editor, text="ĞŸÑ€Ğ¾Ğ¿ÑƒÑÑ‚Ğ¸Ñ‚ÑŒ", command=self._skip).grid(row=0, column=5, padx=4)
-
-        buttons = ttk.Frame(self, padding=(20, 12))
-        buttons.grid(row=4, column=0, sticky="e")
-        ttk.Button(buttons, text="ĞÑ‚Ğ¼ĞµĞ½Ğ¸Ñ‚ÑŒ Ğ¸Ğ¼Ğ¿Ğ¾Ñ€Ñ‚", command=self.destroy).grid(row=0, column=0, padx=4)
-        ttk.Button(buttons, text="ĞŸÑ€Ğ¾Ğ´Ğ¾Ğ»Ğ¶Ğ¸Ñ‚ÑŒ Ñ€Ğ°ÑÑ‡ĞµÑ‚", style="Accent.TButton", command=self._finish).grid(row=0, column=1, padx=4)
-        first = next(iter(self.items), None)
-        if first:
-            self.tree.selection_set(first)
-            self.tree.focus(first)
-
-    @property
-    def created_products(self) -> list[Product]:
-        return [item for item in self.decisions.values() if item is not None]
-
-    @property
-    def skipped_articles(self) -> set[str]:
-        return {article for article, product in self.decisions.items() if product is None}
-
-    def _selected_article(self) -> str | None:
-        selection = self.tree.selection()
-        return selection[0] if selection else None
-
-    def _select(self, _event=None) -> None:
-        article = self._selected_article()
-        decision = self.decisions.get(article) if article else None
-        if isinstance(decision, Product):
-            self.total_var.set(_plain_number(decision.total_cost))
-            self.labor_var.set(_plain_number(decision.labor_cost))
-        else:
-            self.total_var.set("")
-            self.labor_var.set("0")
-
-    def _create(self) -> None:
-        article = self._selected_article()
-        if not article:
-            return
-        try:
-            total = _parse_number(self.total_var.get())
-            labor = _parse_number(self.labor_var.get())
-            if total < 0 or labor < 0 or labor > total:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("Ğ¡ĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚ÑŒ", "ĞŸÑ€Ğ¾Ğ²ĞµÑ€ÑŒÑ‚Ğµ Ğ¿Ğ¾Ğ»Ğ½ÑƒÑ ÑĞµĞ±ĞµÑÑ‚Ğ¾Ğ¸Ğ¼Ğ¾ÑÑ‚ÑŒ Ğ¸ Ñ‚Ñ€ÑƒĞ´Ğ¾Ğ·Ğ°Ñ‚Ñ€Ğ°Ñ‚Ñ‹", parent=self)
-            return
-        item = self.items[article]
-        self.decisions[article] = Product(article, item.name or article, total - labor, labor)
-        self._set_decision_text(article, f"Ğ¡Ğ¾Ğ·Ğ´Ğ°Ñ‚ÑŒ: {_money(total)}")
-        self._select_next_unresolved()
-
-    def _skip(self) -> None:
-        article = self._selected_article()
-        if not article:
-            return
-        self.decisions[article] = None
-        self._set_decision_text(article, "ĞŸÑ€Ğ¾Ğ¿ÑƒÑÑ‚Ğ¸Ñ‚ÑŒ")
-        self._select_next_unresolved()
-
-    def _set_decision_text(self, article: str, text: str) -> None:
-        values = list(self.tree.item(article, "values"))
-        values[-1] = text
-        self.tree.item(article, values=values)
-
-    def _select_next_unresolved(self) -> None:
-        for article in self.items:
-            if article not in self.decisions:
-                self.tree.selection_set(article)
-                self.tree.focus(article)
-                self.tree.see(article)
-                return
-
-    def _finish(self) -> None:
-        unresolved = [article for article in self.items if article not in self.decisions]
-        if unresolved:
-            messagebox.showwarning(
-                "ĞĞ¾Ğ²Ñ‹Ğµ Ñ‚Ğ¾Ğ²Ğ°Ñ€Ñ‹",
-                f"Ğ’Ñ‹Ğ±ĞµÑ€Ğ¸Ñ‚Ğµ Ğ´ĞµĞ¹ÑÑ‚Ğ²Ğ¸Ğµ ĞµÑ‰Ğµ Ğ´Ğ»Ñ {len(unresolved)} Ğ¿Ğ¾Ğ·Ğ¸Ñ†Ğ¸Ğ¹: ÑĞ¾Ğ·Ğ´Ğ°Ñ‚ÑŒ Ğ¸Ğ»Ğ¸ Ğ¿Ñ€Ğ¾Ğ¿ÑƒÑÑ‚Ğ¸Ñ‚ÑŒ.",
-                parent=self,
-            )
-            return
-        self.cancelled = False
-        self.destroy()
-
-
-def _result_values(result: ProductResult, tax_rate: float) -> tuple[object, ...]:
-    return (
-        result.article,
-        result.name,
-        _money(result.total_cost),
-        _money(result.material_cost),
-        _money(result.labor_cost),
-        _money(result.material_sold),
-        _money(result.labor_sold),
-        _money(result.cost_sold),
-        _percent(result.profitability(tax_rate)),
-        _money(result.net_profit_per_unit(tax_rate)),
-        _money(result.profit_per_unit()),
-        _money(result.net_profit(tax_rate)),
-        _money(result.financial_result),
-        _money(result.average_price()) if result.average_price() is not None else "â€”",
-        _money(result.tax(tax_rate)),
-        _money(result.taxable_income),
-        _number(result.units),
-        _money(result.revenue_including_points),
-        _money(result.revenue_no_points),
-        _money(result.partner_programs),
-        _money(result.points),
-        _money(result.commission),
-        _money(result.processing),
-        _money(result.delivery),
-        _money(result.logistics),
-        _money(result.reverse_logistics),
-        _money(result.returns_cancels),
-        _money(result.acquiring),
-        _money(result.stars),
-        _money(result.packaging),
-        _money(result.compensation),
-        _money(result.other),
-        _money(result.financial_result),
-    )
-
-
-def _scenario_values(row: ScenarioRow) -> tuple[object, ...]:
-    return (
-        row.article,
-        row.name,
-        _money(row.unit_cost),
-        _number(row.units),
-        _optional_money(row.current_price),
-        _optional_money(row.planned_price),
-        _optional_percent(row.price_change),
-        _optional_percent(row.profitability),
-        _optional_money(row.ozon_costs_without_commission),
-        _optional_money(row.planned_revenue),
-        _optional_percent(row.commission_rate),
-        _optional_money(row.planned_commission),
-        _optional_money(row.planned_points),
-        _optional_money(row.taxable_base),
-        _optional_money(row.tax),
-        _optional_money(row.profit),
-        _optional_money(row.profit_per_unit_before_cost),
-        _optional_money(row.net_profit_per_unit),
-    )
-
-
-def _money(value: float | None) -> str:
-    if value is None:
-        return "â€”"
-    return f"{value:,.2f} â‚½".replace(",", " ")
-
-
-def _signed_money(value: float) -> str:
-    return ("+" if value > 0 else "") + _money(value)
-
-
-def _signed_number(value: float) -> str:
-    return ("+" if value > 0 else "") + _number(value)
-
-
-def _number(value: float) -> str:
-    return f"{value:,.2f}".replace(",", " ").rstrip("0").rstrip(".")
-
-
-def _percent(value: float) -> str:
-    return f"{value * 100:,.2f}%".replace(",", " ")
-
-
-def _signed_percentage_points(value: float) -> str:
-    prefix = "+" if value > 0 else ""
-    return f"{prefix}{value * 100:,.2f} Ğ¿.Ğ¿.".replace(",", " ")
-
-
-def _comparison_percent(metric: ComparisonMetric) -> str:
-    value = metric.change_percent
-    if value is None:
-        return "0,00%"
-    if value == float("inf"):
-        return "Ğ½Ğ¾Ğ²Ğ¾Ğµ Ğ·Ğ½Ğ°Ñ‡ĞµĞ½Ğ¸Ğµ"
-    prefix = "+" if value > 0 else ""
-    return prefix + _percent(value)
-
-
-def _comparison_kpi(metric: ComparisonMetric, money: bool) -> str:
-    absolute = _signed_money(metric.change) if money else _signed_number(metric.change)
-    return f"{absolute} Â· {_comparison_percent(metric)}"
-
-
-def _axis_value(value: float, metric: str) -> str:
-    if metric == "units":
-        return _number(value)
-    absolute = abs(value)
-    if absolute >= 1_000_000:
-        return f"{value / 1_000_000:.1f} Ğ¼Ğ»Ğ½"
-    if absolute >= 1_000:
-        return f"{value / 1_000:.0f} Ñ‚Ñ‹Ñ."
-    return f"{value:.0f}"
-
-
-def _trend_value(value: float, metric: str) -> str:
-    return _number(value) if metric == "units" else _money(value)
-
-
-def _short_period(value: str) -> str:
-    return value.split("â€“", 1)[0]
-
-
-def _optional_money(value: float | None) -> str:
-    return _money(value) if value is not None else "â€”"
-
-
-def _optional_percent(value: float | None) -> str:
-    return _percent(value) if value is not None else "â€”"
-
-
-def _plain_number(value: float | None) -> str:
-    if value is None:
-        return ""
-    return f"{value:.6f}".rstrip("0").rstrip(".")
-
-
-def _parse_number(value: str) -> float:
-    return float(value.replace("\u00a0", "").replace(" ", "").replace(",", ".").replace("â‚½", "").replace("%", "").strip())
-
-
-def _period_text(start: str | None, end: str | None) -> str:
-    if start and end:
-        return f"{_date_display(start)}â€“{_date_display(end)}"
-    return "ĞŸĞµÑ€Ğ¸Ğ¾Ğ´ Ğ½Ğµ Ğ¾Ğ¿Ñ€ĞµĞ´ĞµĞ»ĞµĞ½"
-
-
-def _date_display(value: str) -> str:
-    parts = value[:10].split("-")
-    return ".".join(reversed(parts)) if len(parts) == 3 else value
-
-
-def _backup_timestamp(value: str) -> str:
-    try:
-        return datetime.fromisoformat(value).strftime("%d.%m.%Y %H:%M")
-    except ValueError:
-        return value or "Ğ´Ğ°Ñ‚Ğ° Ğ½Ğµ ÑƒĞºĞ°Ğ·Ğ°Ğ½Ğ°"
-
-
-def _file_size(value: int) -> str:
-    size = float(value)
-    for unit in ("Ğ‘", "ĞšĞ‘", "ĞœĞ‘", "Ğ“Ğ‘"):
-        if size < 1024 or unit == "Ğ“Ğ‘":
-            return f"{size:.0f} {unit}" if unit == "Ğ‘" else f"{size:.1f} {unit}"
-        size /= 1024
-    return f"{value} Ğ‘"
-
-
-def _calculation_period(calculation: RunCalculation) -> str:
-    if calculation.period_start and calculation.period_end:
-        return f"{calculation.period_start:%d.%m.%Y}â€“{calculation.period_end:%d.%m.%Y}"
-    return "Ğ½Ğµ Ğ¾Ğ¿Ñ€ĞµĞ´ĞµĞ»ĞµĞ½"
-
-
-def _duplicate_description(source) -> str:
-    if source.duplicate_run_ids:
-        runs = ", ".join("#" + str(value) for value in source.duplicate_run_ids)
-        return f"â€¢ {source.path.name} â€” ÑƒĞ¶Ğµ Ğ² Ñ€Ğ°ÑÑ‡ĞµÑ‚Ğ°Ñ… {runs}"
-    return f"â€¢ {source.path.name} â€” ÑĞ¾Ğ²Ğ¿Ğ°Ğ´Ğ°ĞµÑ‚ Ñ Ğ´Ñ€ÑƒĞ³Ğ¸Ğ¼ Ğ²Ñ‹Ğ±Ñ€Ğ°Ğ½Ğ½Ñ‹Ğ¼ Ñ„Ğ°Ğ¹Ğ»Ğ¾Ğ¼"
-
-
-def _exclude_duplicate_sources(session: ImportSession) -> None:
-    duplicate_ids = {id(source) for source in session.duplicate_sources}
-    session.sources = [source for source in session.sources if id(source) not in duplicate_ids]
-
-
-def _open_path(path: Path) -> None:
-    if sys.platform == "win32":
-        os.startfile(path)  # type: ignore[attr-defined]
-    elif sys.platform == "darwin":
-        subprocess.Popen(["open", str(path)])
-    else:
-        subprocess.Popen(["xdg-open", str(path)])
-
-
-def run_app() -> None:
-    app = OZPriceAnalyzerApp()
-    app.mainloop()
-
-
-if __name__ == "__main__":
-    run_app()
+YªçŠx-®éÜj×¢ëiºÚ+Š§j[h‘éÜ¢éíãyÑ:-jZ.¶›­–)Ş³Vg&öÒõögWGW&Uõò–×÷'Bææ÷FF–öç0 ¦–×÷'B÷0¦–×÷'BVWVP¦–×÷'B7V'&ö6W70¦–×÷'B7—0¦–×÷'BF‡&VF–æp¦–×÷'BF¶–çFW"2F°¦–×÷'BvV&'&÷w6W ¦g&öÒFFWF–ÖR–×÷'BFFWF–ÖP¦g&öÒF†Æ–"–×÷'BF€¦g&öÒF¶–çFW"–×÷'Bf–ÆVF–ÆörÂÖW76vV&÷‚Â6–×ÆVF–ÆörÂGF° ¦g&öÒæ&6·W–×÷'B7&VFUö&6·WÂ–ç7V7Eö&6·WÂ&W7F÷&Uö&6·WÂ7VvvW7FVEö&6·WöæÖP¦g&öÒæ6Æ7VÆF÷"–×÷'B6Æ7VÆFU÷66Væ&–òÂF—66÷fW%÷Væ¶æ÷vå÷&öGV7G0¦g&öÒæ6ö×&—6öâ–×÷'B6ö×&—6öäÖWG&–2Â6ö×&Uö6Æ7VÆF–öç0¦g&öÒæ6÷7G2–×÷'B€¢6÷7D6†ævRÀ¢6÷7DVF—F÷$VçG'’À¢'V–ÆEö6÷7Eö6†ævW2À¢'V–ÆE÷&öGV7G5ög&öÕöVF—F÷%öVçG&–W2À¢W‡÷'Eö6÷7Eö6FÆörÀ¢&VEö6÷7Eö6FÆörÀ¢¦g&öÒæ6öæf–r–×÷'BõD•DÄRÂõdU%4”ôâÂ6fU÷7F÷&vUöÆö6F–öà¦g&öÒæFF&6R–×÷'BFF&6P¦g&öÒæW†6VÅ÷&VFW"–×÷'B$Uõ%Eõ$TÄ•¤D”ôâÂ&Wf–Wu÷6†VWBÂv÷&¶&ööµ÷6†VWEöæÖW0¦g&öÒæW‡÷'FW"–×÷'BW‡÷'E÷'VâÂ7VvvW7FVEöW‡÷'EöæÖP¦g&öÒæÖöFVÇ2–×÷'B&öGV7BÂ&öGV7E&W7VÇBÂ'Vä6Æ7VÆF–öâÂ66Væ&–õ&÷rÂVæ¶æ÷vå&öGV7@¦g&öÒæ÷&FW&–ær–×÷'B–ç6W'EöEöw&÷WöVæ@¦g&öÒç6W'f–6R–×÷'B6W'f–6RÂ–×÷'E6W76–öà¦g&öÒç7F÷&vR–×÷'BÖ–w&FU÷7F÷&vP¦g&öÒçF†VÖR–×÷'BÇ•÷F†VÖP¦g&öÒçG&VæG2–×÷'BG&VæEö–çBÂ'V–ÆE÷G&VæE÷ö–çG2Â6†'Eö&÷VæG0  ¥D„TÔUôÄ$TÅ2Ò²-
+-]Íİò#¢'7—7FVÒ"Â-
+-]Íİò#¢&F&²"Â-
+-]-½ò#¢&Æ–v‡B'Ğ¥D„TÔUõdÅTU2Ò·fÇVS¢¶W’f÷"¶W’ÂfÇVR–âD„TÔUôÄ$TÅ2æ—FV×2‚—Ğ¤EUÄ”4DUôÄ$TÅ2Ò²-
+ı--Â#¢&6²"Â-	ıíı=­-Â#¢'6¶—"Â-
+}]-Â#¢&ÆÆ÷r'Ğ¤EUÄ”4DUõdÅTU2Ò·fÇVS¢¶W’f÷"¶W’ÂfÇVR–âEUÄ”4DUôÄ$TÅ2æ—FV×2‚—Ğ¥E$TäEôÔUE$”52Ò°¢-	-½=}­#¢'&WfVçVR"À¢-
+}-òı½½Â#¢&æWE÷&öf—B"À¢-	ıíMm‚Â"â#¢'Væ—G2"À¢-	İ]ı]M]½]İİ½RMí]íM²ò]íM²#¢'VæÆÆö6FVB"À§Ğ  ¦6Æ72õ¥&–6TæÇ—¦W$‡F²åF²“ ¢FVbõö–æ—Eõò‡6VÆbÂ6W'f–6S¢6W'f–6RÂæöæRÒæöæR“ ¢7WW"‚’åõö–æ—Eõò‚¢6VÆbç6W'f–6RÒ6W'f–6R÷"6W'f–6R‚¢6VÆbæF"Ò6VÆbç6W'f–6RæF ¢6VÆbæ7W'&VçE÷'Våö–C¢–çBÂæöæRÒæöæP¢6VÆbæ7W'&VçEö6Æ7VÆF–öã¢'Vä6Æ7VÆF–öâÂæöæRÒæöæP¢6VÆbç'VåöF—7Æ•÷Fõö–C¢F–7E·7G"Â–çEÒÒ·Ğ¢6VÆbç6÷W&6Uö'•ö––C¢F–7E·7G"ÂF–7E·7G"Âö&¦V7EÕÒÒ·Ğ¢6VÆbç&Wf–Wuö†VFW'3¢Æ—7E·7G%ÒÒµĞ¢6VÆbç&Wf–Wu÷&÷w3¢Æ—7E¶Æ—7E·7G%ÕÒÒµĞ¢6VÆbç&Wf–Wu÷Fƒ¢7G"ÂæöæRÒæöæP¢6VÆbç66Væ&–õ÷&÷w3¢F–7E·7G"Â66Væ&–õ&÷uÒÒ·Ğ¢6VÆbçG&VæE÷ö–çG3¢Æ—7EµG&VæEö–çEÒÒµĞ¢6VÆbçG&VæEö6çf5÷ö–çG3¢Æ—7E·GWÆU¶fÆöBÂfÆöBÂG&VæEö–çEÕÒÒµĞ¢6VÆbæ–×÷'Eö–å÷&öw&W72ÒfÇ6P¢6VÆbæ–×÷'E÷VWVS¢VWVRåVWVU·GWÆU´–×÷'E6W76–öâÂæöæRÂW†6WF–öâÂæöæUÕÒÒVWVRåVWVR‚¢6VÆbæ6öÆ÷'2ÒÇ•÷F†VÖR‡6VÆbÂ6VÆbæF"ævWE÷6WGF–ær‚'F†VÖR"Â'7—7FVÒ"’ ¢6VÆbçF—FÆR†b'´õD•DÄWÒ´õdU%4”ôçÒ"¢6VÆbævVöÖWG'’‚#SCƒ“#"¢6VÆbæÖ–ç6—¦RƒƒÂs#¢2F²föçBfÖ–Ç’6öçF–æ–ær76W2×W7B&Rw&÷WVB2öæRF6ÂÆ—7B—FVÒà¢6VÆbæ÷F–öåöFB‚"¤föçB"Â'µ6VvöRT—Ò"¢6VÆbåö'V–ÆE÷V’‚¢6VÆbç&Vg&W6…öÆÂ‚ ¢FVbö'V–ÆE÷V’‡6VÆb’ÓâæöæS ¢6VÆbæ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢6VÆbç&÷v6öæf–wW&RƒÂvV–v‡CÓ¢6VÆbåö'V–ÆEö†VFW"‚¢6VÆbææ÷FV&öö²ÒGF²äæ÷FV&öö²‡6VÆb¢6VÆbææ÷FV&öö²æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò&ç6Wr"ÂGƒÓ‚ÂG“ÒƒÂ"’ ¢6VÆbæ÷fW'f–Wu÷F"ÒGF²äg&ÖR‡6VÆbææ÷FV&öö²ÂFF–æsÓB¢6VÆbç6÷W&6W5÷F"ÒGF²äg&ÖR‡6VÆbææ÷FV&öö²ÂFF–æsÓB¢6VÆbæ'&V¶F÷vå÷F"ÒGF²äg&ÖR‡6VÆbææ÷FV&öö²ÂFF–æsÓB¢6VÆbæwV–FU÷F"ÒGF²äg&ÖR‡6VÆbææ÷FV&öö²ÂFF–æsÓB¢6VÆbç66Væ&–õ÷F"ÒGF²äg&ÖR‡6VÆbææ÷FV&öö²ÂFF–æsÓB¢6VÆbæ†—7F÷'•÷F"ÒGF²äg&ÖR‡6VÆbææ÷FV&öö²ÂFF–æsÓB¢6VÆbçG&VæE÷F"ÒGF²äg&ÖR‡6VÆbææ÷FV&öö²ÂFF–æsÓB¢6VÆbæ6ö×&—6öå÷F"ÒGF²äg&ÖR‡6VÆbææ÷FV&öö²ÂFF–æsÓB¢6VÆbç6WGF–æw5÷F"ÒGF²äg&ÖR‡6VÆbææ÷FV&öö²ÂFF–æsÓB¢6VÆbææ÷FV&öö²æFB‡6VÆbæ÷fW'f–Wu÷F"ÂFW‡CÒ-	í}í"¢6VÆbææ÷FV&öö²æFB‡6VÆbç6÷W&6W5÷F"ÂFW‡CÒ-	]íMİ½RM½²"¢6VÆbææ÷FV&öö²æFB‡6VÆbæ'&V¶F÷vå÷F"ÂFW‡CÒ-
+}-­"¢6VÆbææ÷FV&öö²æFB‡6VÆbæwV–FU÷F"ÂFW‡CÒ-
+ı-í}İ¢İ}½]İ’"¢6VÆbææ÷FV&öö²æFB‡6VÆbç66Væ&–õ÷F"ÂFW‡CÒ-
+m]İ’m]İ²"¢6VÆbææ÷FV&öö²æFB‡6VÆbæ†—7F÷'•÷F"ÂFW‡CÒ-	-íòí-}]-í""¢6VÆbææ÷FV&öö²æFB‡6VÆbçG&VæE÷F"ÂFW‡CÒ-	MİÍ­"¢6VÆbææ÷FV&öö²æFB‡6VÆbæ6ö×&—6öå÷F"ÂFW‡CÒ-
+-İ]İRı]íMí""¢6VÆbææ÷FV&öö²æFB‡6VÆbç6WGF–æw5÷F"ÂFW‡CÒ-	İ-í­‚" ¢6VÆbåö'V–ÆEö÷fW'f–Wu÷F"‚¢6VÆbåö'V–ÆE÷6÷W&6W5÷F"‚¢6VÆbåö'V–ÆEö'&V¶F÷vå÷F"‚¢6VÆbåö'V–ÆEöwV–FU÷F"‚¢6VÆbåö'V–ÆE÷66Væ&–õ÷F"‚¢6VÆbåö'V–ÆEö†—7F÷'•÷F"‚¢6VÆbåö'V–ÆE÷G&VæE÷F"‚¢6VÆbåö'V–ÆEö6ö×&—6öå÷F"‚¢6VÆbåö'V–ÆE÷6WGF–æw5÷F"‚ ¢6VÆbç7FGW5÷f"ÒF²å7G&–æuf"‡fÇVSÒ-	=í-í-â"¢GF²äÆ&VÂ‡6VÆbÂFW‡Gf&–&ÆS×6VÆbç7FGW5÷f"Â7G–ÆSÒ$×WFVBåDÆ&VÂ"’æw&–B€¢&÷sÓ"Â6öÇVÖãÓÂ7F–6·“Ò&Wr"ÂGƒÓ#"ÂG“ÒƒÂ¢ ¢FVbö'V–ÆEö†VFW"‡6VÆb’ÓâæöæS ¢†VFW"ÒGF²äg&ÖR‡6VÆbÂFF–æsÒƒ#"Â‚Â#"Âb’¢†VFW"æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò&Wr"¢†VFW"æ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢F—FÆUö&÷‚ÒGF²äg&ÖR††VFW"¢F—FÆUö&÷‚æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"¢GF²äÆ&VÂ‡F—FÆUö&÷‚ÂFW‡CÒ$õ¢&–6RæÇ—¦W""Â7G–ÆSÒ%F—FÆRåDÆ&VÂ"’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"¢GF²äÆ&VÂ€¢F—FÆUö&÷‚À¢FW‡CÒ-	í-}]-²÷¦öâÂ-íòÂ­íİ-í½Âİ}½]İ’‚ı½İí-òMí]íMİí-Â"À¢7G–ÆSÒ$×WFVBåDÆ&VÂ"À¢’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂG“Òƒ"Â’ ¢7F–öç2ÒGF²äg&ÖR††VFW"¢7F–öç2æw&–B‡&÷sÓÂ6öÇVÖãÓÂ&÷w7ãÓ"Â7F–6·“Ò&R"¢GF²äÆ&VÂ†7F–öç2ÂFW‡CÒ-
+}]#¢"Â7G–ÆSÒ$×WFVBåDÆ&VÂ"’æw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÒƒÂb’¢6VÆbç'Vå÷f"ÒF²å7G&–æuf"‚¢6VÆbç'Våö6öÖ&òÒGF²ä6öÖ&ö&÷‚†7F–öç2ÂFW‡Gf&–&ÆS×6VÆbç'Vå÷f"Â7FFSÒ'&VFöæÇ’"Âv–GFƒÓ3"¢6VÆbç'Våö6öÖ&òæw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÒƒÂ"’¢6VÆbç'Våö6öÖ&òæ&–æB‚#ÃÄ6öÖ&ö&÷…6VÆV7FVCãâ"Â6VÆbåööå÷'Vå÷6VÆV7FVB¢GF²ä'WGFöâ†7F–öç2ÂFW‡CÒ-	Íıí-í--Âí-}]-²"Â7G–ÆSÒ$66VçBåD'WGFöâ"Â6öÖÖæC×6VÆbæ–×÷'E÷&W÷'G2’æw&–B€¢&÷sÓÂ6öÇVÖãÓ"ÂGƒÓP¢¢GF²ä'WGFöâ†7F–öç2ÂFW‡CÒ-
+İ­ıí""W†6VÂ"Â6öÖÖæC×6VÆbæW‡÷'Eö7W'&VçE÷'Vâ’æw&–B‡&÷sÓÂ6öÇVÖãÓ2ÂGƒÓR¢GF²ä'WGFöâ†7F–öç2ÂFW‡CÒ-	âıí=ÍÍR"Â6öÖÖæC×6VÆbç6†÷uö&÷WB’æw&–B€¢&÷sÓÂ6öÇVÖãÓ2Â7F–6·“Ò&R"ÂGƒÓRÂG“ÒƒbÂ¢ ¢FVbö'V–ÆEö÷fW'f–Wu÷F"‡6VÆb’ÓâæöæS ¢6VÆbæ÷fW'f–Wu÷F"æ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢6VÆbæ÷fW'f–Wu÷F"ç&÷v6öæf–wW&Rƒ"ÂvV–v‡CÓ¢GF²äÆ&VÂ‡6VÆbæ÷fW'f–Wu÷F"ÂFW‡CÒ-	-í=í-½’í-}]""Â7G–ÆSÒ%6V7F–öâåDÆ&VÂ"’æw&–B€¢&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂG“ÒƒÂ‚¢¢6VÆbæ·•ög&ÖRÒGF²äg&ÖR‡6VÆbæ÷fW'f–Wu÷F"¢6VÆbæ·•ög&ÖRæw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò&Wr"ÂG“ÒƒÂ"’¢f÷"6öÇVÖâ–â&ævRƒb“ ¢6VÆbæ·•ög&ÖRæ6öÇVÖæ6öæf–wW&R†6öÇVÖâÂvV–v‡CÓ¢6VÆbæ·•÷f'3¢F–7E·7G"ÂF²å7G&–æuf%ÒÒ·Ğ¢6&G2Ò°¢‚'&WfVçVR"Â-	-½=}­"’À¢‚&æWE÷&öf—B"Â-
+}-òı½½Â"’À¢‚'&öf—F&–Æ—G’"Â-	Mí]íMİí-Â"’À¢‚'Væ—G2"Â-	ıíMm‚Â"â"’À¢‚'VæÆÆö6FVB"Â-	İ]ı]M]½]İİ½R"’À¢‚&f–ÆW2"Â-	]íMİ½RM½²"’À¢Ğ¢f÷"–æFW‚Â†¶W’ÂF—FÆR’–âVçVÖW&FR†6&G2“ ¢6VÆbæ·•÷f'5¶¶W•ÒÒF²å7G&–æuf"‡fÇVSÒ.(	B"¢6&BÒGF²äg&ÖR‡6VÆbæ·•ög&ÖRÂ7G–ÆSÒ$6&BåDg&ÖR"ÂFF–æsÒƒbÂB’¢6&Bæw&–B‡&÷sÓÂ6öÇVÖãÖ–æFW‚Â7F–6·“Ò&ç6Wr"ÂGƒÒƒ–b–æFW‚ÓÒVÇ6RRÂ–b–æFW‚ÓÒRVÇ6RR’¢GF²äÆ&VÂ†6&BÂFW‡C×F—FÆRÂ7G–ÆSÒ$6&D×WFVBåDÆ&VÂ"’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"¢GF²äÆ&VÂ†6&BÂFW‡Gf&–&ÆS×6VÆbæ·•÷f'5¶¶W•ÒÂ7G–ÆSÒ$·’åDÆ&VÂ"’æw&–B€¢&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂG“ÒƒRÂ¢ ¢6öÇVÖç2Ò°¢&'F–6ÆR"Â&æÖR"Â'Væ—Eö6÷7B"Â&ÖFW&–Â"Â&Æ&÷""Â&ÖFW&–Å÷6öÆB"Â&Æ&÷%÷6öÆB"Â&6÷7E÷6öÆB"À¢'&öf—F&–Æ—G’"Â&æWE÷Væ—B"Â'&öf—E÷Væ—B"Â&æWE÷F÷FÂ"Â'&öf—E÷F÷FÂ"Â&fu÷&–6R"Â'F‚"À¢'F†&ÆR"Â'Væ—G2"Â'&WfVçVR"Â'&WfVçVUöæõ÷ö–çG2"Â''FæW""Â'ö–çG2"Â&6öÖÖ—76–öâ"Â'&ö6W76–ær"À¢&FVÆ—fW'’"Â&Æöv—7F–72"Â'&WfW'6R"Â'&WGW&ç2"Â&7V—&–ær"Â'7F'2"Â'6¶v–ær"Â&6ö×Vç6F–öâ"À¢&÷F†W""Â&f–ææ6–Å÷&W7VÇB"À¢Ğ¢†VF–æw2Ò°¢-	-­=²"Â-	İÍ]İí-İR"Â-	-í=âı"Â-	Í-]²"Â-
+-=Mí}--²"Â-	Í-]²ıíMİİí=â"À¢-
+-=Mí}--²ıíMİİí=â"Â-
+ııíMİİí=â"Â-	Mí]íMİí-Â"Â-
+}-òı½½Âİ]Bâ"À¢-	ı½½Âí"ıíMbİ]Bâ"Â-
+}-òı½½Â-]=â"Â-	ı½½Âí"ıíMb-]=â"Â-
+]Mİıòm]İ"À¢-	İ½í2"Â-	İ½í=íí½=]Í½’Mí]íB"Â-	ıíMm‚"Â-	-½=}­½½Í‚"Â-	-½=}­]r½½í""À¢-	ıí=ÍÍ²ı-İ]í""Â-	½½²"Â-	­íÍò÷¦öâ"Â-	íí-­í-ı-½]İò"Â-	Mí--­Mâ	ı	-	r"À¢-	½í=-­"Â-	í-İò½í=-­"Â-	-í}--²ıí-Í]İ²"Â-
+İ­-İ2"Â-	}-]}Mİ½R-í-²"À¢-
+=ı­í-­‚Í-]½²"Â-	­íÍı]İm‚÷¦öâ"Â-	ıí}Rİ}½]İò"Â-
+Mİ]}=½Í-"÷¦öâ"À¢Ğ¢6VÆbæ÷fW'f–Wu÷G&VRÒ6VÆbåö7&VFU÷G&VR‡6VÆbæ÷fW'f–Wu÷F"Â6öÇVÖç2Â†VF–æw2Â&÷sÓ"Âv–GF‡3Õ³#Â#3Ò²³#UÒ¢3 ¢FVbö'V–ÆE÷6÷W&6W5÷F"‡6VÆb’ÓâæöæS ¢6VÆbç6÷W&6W5÷F"æ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢6VÆbç6÷W&6W5÷F"ç&÷v6öæf–wW&Rƒ2ÂvV–v‡CÓ¢6÷W&6Uö†VFW"ÒGF²äg&ÖR‡6VÆbç6÷W&6W5÷F"¢6÷W&6Uö†VFW"æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò&Wr"ÂG“ÒƒÂ‚’¢6÷W&6Uö†VFW"æ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢GF²äÆ&VÂ‡6÷W&6Uö†VFW"ÂFW‡CÒ-
+M½²-½İİí=â}]-"Â7G–ÆSÒ%6V7F–öâåDÆ&VÂ"’æw&–B€¢&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r ¢¢GF²ä'WGFöâ‡6÷W&6Uö†VFW"ÂFW‡CÒ-	ıíÍí-]-Â½íí’„Å5‚"Â6öÖÖæC×6VÆbæ'&÷w6U÷†Ç7…÷&Wf–Wr’æw&–B€¢&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò&R ¢¢6÷W&6Uö6öÇVÖç2Ò²&æÖR"Â'G—R"Â'&÷w2"Â&Ö÷VçB"Â'W&–öB"Â&†6‚%Ğ¢6÷W&6Uö†VF–æw2Ò²-
+M²"Â-
+-ò"Â-
+-í¢"Â-
+=ÍÍ"Â-	ı]íB"Â%4„Ó#Sb%Ğ¢6VÆbç6÷W&6U÷G&VRÒ6VÆbåö7&VFU÷G&VR€¢6VÆbç6÷W&6W5÷F"Â6÷W&6Uö6öÇVÖç2Â6÷W&6Uö†VF–æw2Â&÷sÓÂ†V–v‡CÓbÂv–GF‡3Õ³3ƒÂSÂƒÂ3Â“Â##Ğ¢¢6VÆbç6÷W&6U÷G&VRæ&–æB‚#ÃÅG&VWf–Wu6VÆV7Cãâ"Â6VÆbåööå÷6÷W&6U÷6VÆV7FVB ¢6öçG&öÇ2ÒGF²äg&ÖR‡6VÆbç6÷W&6W5÷F"ÂFF–æsÒƒÂÂÂ‚’¢6öçG&öÇ2æw&–B‡&÷sÓ"Â6öÇVÖãÓÂ7F–6·“Ò&Wr"¢GF²äÆ&VÂ†6öçG&öÇ2ÂFW‡CÒ-	½#¢"’æw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÒƒÂb’¢6VÆbç6†VWE÷f"ÒF²å7G&–æuf"‚¢6VÆbç6†VWEö6öÖ&òÒGF²ä6öÖ&ö&÷‚†6öçG&öÇ2ÂFW‡Gf&–&ÆS×6VÆbç6†VWE÷f"Â7FFSÒ'&VFöæÇ’"Âv–GFƒÓ3R¢6VÆbç6†VWEö6öÖ&òæw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÒƒÂ‚’¢6VÆbç6†VWEö6öÖ&òæ&–æB‚#ÃÄ6öÖ&ö&÷…6VÆV7FVCãâ"ÂÆÖ&FöWfVçC¢6VÆbåöÆöE÷&Wf–Wr‚’¢GF²äÆ&VÂ†6öçG&öÇ2ÂFW‡CÒ-	ıí¢"ıí­}İİ½R-í­S¢"’æw&–B‡&÷sÓÂ6öÇVÖãÓ"ÂGƒÒƒÂb’¢6VÆbç&Wf–Wu÷6V&6…÷f"ÒF²å7G&–æuf"‚¢6V&6‚ÒGF²äVçG'’†6öçG&öÇ2ÂFW‡Gf&–&ÆS×6VÆbç&Wf–Wu÷6V&6…÷f"Âv–GFƒÓ3R¢6V&6‚æw&–B‡&÷sÓÂ6öÇVÖãÓ2ÂGƒÒƒÂ‚’¢6V&6‚æ&–æB‚#Ä¶W•&VÆV6Sâ"ÂÆÖ&FöWfVçC¢6VÆbåöf–ÇFW%÷&Wf–Wr‚’¢GF²äÆ&VÂ†6öçG&öÇ2ÂFW‡CÒ-	ıíÍí--½ıí½İı]-ò]r}ı=­W†6VÂ"Â7G–ÆSÒ$×WFVBåDÆ&VÂ"’æw&–B€¢&÷sÓÂ6öÇVÖãÓBÂ7F–6·“Ò'r"ÂGƒÒƒ"Â¢¢6VÆbç&Wf–Wuöf–ÆU÷f"ÒF²å7G&–æuf"‡fÇVSÒ-
+M²İR-½Ò"¢GF²äÆ&VÂ†6öçG&öÇ2ÂFW‡Gf&–&ÆS×6VÆbç&Wf–Wuöf–ÆU÷f"Â7G–ÆSÒ$×WFVBåDÆ&VÂ"’æw&–B€¢&÷sÓÂ6öÇVÖãÓÂ6öÇVÖç7ãÓRÂ7F–6·“Ò'r"ÂG“Òƒ‚Â¢¢6VÆbç&Wf–Wuö6öçF–æW"ÒGF²äg&ÖR‡6VÆbç6÷W&6W5÷F"¢6VÆbç&Wf–Wuö6öçF–æW"æw&–B‡&÷sÓ2Â6öÇVÖãÓÂ7F–6·“Ò&ç6Wr"¢6VÆbç&Wf–Wuö6öçF–æW"æ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢6VÆbç&Wf–Wuö6öçF–æW"ç&÷v6öæf–wW&RƒÂvV–v‡CÓ¢6VÆbç&Wf–Wu÷G&VS¢GF²åG&VWf–WrÂæöæRÒæöæP ¢FVbö'V–ÆEö'&V¶F÷vå÷F"‡6VÆb’ÓâæöæS ¢6VÆbæ'&V¶F÷vå÷F"æ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢6VÆbæ'&V¶F÷vå÷F"ç&÷v6öæf–wW&Rƒ"ÂvV–v‡CÓ¢GF²äÆ&VÂ‡6VÆbæ'&V¶F÷vå÷F"ÂFW‡CÒ-	İ]ı]M]½]İİ½RMí]íM²ò]íM²"Â7G–ÆSÒ%6V7F–öâåDÆ&VÂ"’æw&–B€¢&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂG“ÒƒÂ"¢¢GF²äÆ&VÂ€¢6VÆbæ'&V¶F÷vå÷F"À¢FW‡CÒ-	}M]Âİ]íMı-òİ}½]İò]r-­=½â	ıí½ím-]½Íİ½R=ÍÍ²(	BMí]íM²Âí-m-]½Íİ½R(	B]íM²â"À¢7G–ÆSÒ$×WFVBåDÆ&VÂ"À¢’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂG“ÒƒÂ’¢6VÆbæ'&V¶F÷vå÷G&VRÒ6VÆbåö7&VFU÷G&VR€¢6VÆbæ'&V¶F÷vå÷F"À¢²'G—R"Â&6÷VçB"Â&Ö÷VçB"Â'6†&R%ÒÀ¢²-
+-òİ}½]İò"Â-	­í½}]--â-í¢"Â-
+=ÍÍÂ=â"Â-	Mí½ò"İ]ı]M]½]İİ½R%ÒÀ¢&÷sÓ"À¢v–GF‡3Õ³S#ÂSÂƒÂ“ÒÀ¢ ¢FVbö'V–ÆEöwV–FU÷F"‡6VÆb’ÓâæöæS ¢6VÆbæwV–FU÷F"æ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢6VÆbæwV–FU÷F"ç&÷v6öæf–wW&Rƒ"ÂvV–v‡CÓ¢GF²äÆ&VÂ‡6VÆbæwV–FU÷F"ÂFW‡CÒ-
+ı-í}İ¢İ}½]İ’"Â7G–ÆSÒ%6V7F–öâåDÆ&VÂ"’æw&–B€¢&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂG“ÒƒÂ"¢¢GF²äÆ&VÂ€¢6VÆbæwV–FU÷F"À¢FW‡CÒ-
+M­-}]­íRİ½}R-­=½ıí-]ı]-òM½ò­mMí’-í­‚â
+ı-í}İ¢İ}]=âİRıİ=mM]"ı]M]½ı-Ââ"À¢7G–ÆSÒ$×WFVBåDÆ&VÂ"À¢’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂG“ÒƒÂ’¢6VÆbæwV–FU÷G&VRÒ6VÆbåö7&VFU÷G&VR€¢6VÆbæwV–FU÷F"À¢²'G—R"Â&6FVv÷'’"Â&7W'&VçE÷7FGW2"Â&7W'&VçE÷v—F‚"Â&7W'&VçE÷v—F†÷WB"Â&†—7F÷'•÷7FGW2"Â&†—7F÷'•÷v—F‚"Â&†—7F÷'•÷v—F†÷WB%ÒÀ¢²-
+-òİ}½]İò"Â-	­=Mí-İí-ò"Â-
+-]­=’}ı=¢"Â-
+-­=½íÂ"Â-	]r-­=½"Â-	-íò"Â-	-íò-­=½íÂ"Â-	-íò]r-­=½%ÒÀ¢&÷sÓ"À¢v–GF‡3Õ³3#ÂCcÂ#cÂRÂRÂ#cÂSÂSÒÀ¢ ¢FVbö'V–ÆE÷66Væ&–õ÷F"‡6VÆb’ÓâæöæS ¢6VÆbç66Væ&–õ÷F"æ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢6VÆbç66Væ&–õ÷F"ç&÷v6öæf–wW&Rƒ2ÂvV–v‡CÓ¢GF²äÆ&VÂ‡6VÆbç66Væ&–õ÷F"ÂFW‡CÒ-	Mí]íMİí-Âı‚ı½İí-í’m]İR"Â7G–ÆSÒ%6V7F–öâåDÆ&VÂ"’æw&–B€¢&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂG“ÒƒÂ"¢¢GF²äÆ&VÂ€¢6VÆbç66Væ&–õ÷F"À¢FW‡CÒ-	í­]ÂıíMbí-]-ò-]­=Ââ	­íÍòÂ½½²‚ıí}R}--²ı]]}-½-í-òıâ]MİÂıí­}-]½ıÂ-½İİí=âı]íMâ"À¢7G–ÆSÒ$×WFVBåDÆ&VÂ"À¢’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂG“ÒƒÂ’ ¢66Væ&–õ÷F÷ÒGF²äg&ÖR‡6VÆbç66Væ&–õ÷F"¢66Væ&–õ÷F÷æw&–B‡&÷sÓ"Â6öÇVÖãÓÂ7F–6·“Ò&Wr"ÂG“ÒƒÂ’¢66Væ&–õ÷F÷æ6öÇVÖæ6öæf–wW&RƒRÂvV–v‡CÓ¢GF²äÆ&VÂ‡66Væ&–õ÷F÷ÂFW‡CÒ-	ı½İí-òm]İ-½İİí=â-í-¢"’æw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÒƒÂb’¢6VÆbçÆææVE÷&–6U÷f"ÒF²å7G&–æuf"‚¢GF²äVçG'’‡66Væ&–õ÷F÷ÂFW‡Gf&–&ÆS×6VÆbçÆææVE÷&–6U÷f"Âv–GFƒÓb’æw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÒƒÂb’¢GF²ä'WGFöâ‡66Væ&–õ÷F÷ÂFW‡CÒ-	ıÍ]İ-Â"Â6öÖÖæC×6VÆbæÇ•÷ÆææVE÷&–6R’æw&–B‡&÷sÓÂ6öÇVÖãÓ"ÂGƒÒƒÂ‚’¢GF²äÆ&VÂ‡66Væ&–õ÷F÷ÂFW‡CÒ-	}Í]İ-Â-Rm]İ²İÂS¢"’æw&–B‡&÷sÓÂ6öÇVÖãÓ2ÂGƒÒƒÂb’¢6VÆbæ&F6…÷W&6VçE÷f"ÒF²å7G&–æuf"‡fÇVSÒ#R"¢GF²äVçG'’‡66Væ&–õ÷F÷ÂFW‡Gf&–&ÆS×6VÆbæ&F6…÷W&6VçE÷f"Âv–GFƒÓ’æw&–B‡&÷sÓÂ6öÇVÖãÓBÂGƒÒƒÂb’¢GF²ä'WGFöâ‡66Væ&–õ÷F÷ÂFW‡CÒ-	ıÍ]İ-Â­â-]Â"Â6öÖÖæC×6VÆbæÇ•ö&F6…÷W&6VçB’æw&–B‡&÷sÓÂ6öÇVÖãÓRÂ7F–6·“Ò'r"¢GF²ä'WGFöâ‡66Væ&–õ÷F÷ÂFW‡CÒ-
+í-Âm]İ²"Â6öÖÖæC×6VÆbç&W6WE÷66Væ&–ò’æw&–B‡&÷sÓÂ6öÇVÖãÓbÂGƒÒƒ"Â’ ¢6VÆbç66Væ&–õ÷G&VRÒ6VÆbåö7&VFU÷G&VR€¢6VÆbç66Væ&–õ÷F"À¢²&'F–6ÆR"Â&æÖR"Â&6÷7B"Â'Væ—G2"Â&7W'&VçE÷&–6R"Â'ÆææVE÷&–6R"Â&6†ævR"Â'&öf—F&–Æ—G’"Â&÷F†W%ö6÷7G2"Â'ÆææVE÷&WfVçVR"Â&6öÖÖ—76–öå÷&FR"Â&6öÖÖ—76–öâ"Â'ö–çG2"Â'F†&ÆR"Â'F‚"Â'&öf—B"Â'&öf—E÷Væ—B"Â&æWE÷Væ—B%ÒÀ¢²-	-­=²"Â-	İÍ]İí-İR"Â-
+]]-íÍí-Â"Â-	ıíMm‚"Â-
+-]­=òm]İ"Â-	ı½İí-òm]İ"Â-	}Í]İ]İR"Â-	Mí]íMİí-Â"Â-	}--²÷¦öâ]r­íÍ‚"Â-	ı½İí-ò-½=}­"Â-
+]Mİıò­íÍò"Â-	ı½İí-ò­íÍò"Â-	ı½İí-½R½½²"Â-	İ½í=í-ò}"Â-	İ½í2"Â-	ı½½Âí"ıíMb"Â-	ı½½Âı]BâMâı"Â-
+}-òı½½Âı]Bâ%ÒÀ¢&÷sÓ2À¢v–GF‡3Õ³#Â#3Ò²³3UÒ¢bÀ¢¢6VÆbç66Væ&–õ÷G&VRæ&–æB‚#ÃÅG&VWf–Wu6VÆV7Cãâ"Â6VÆbåööå÷66Væ&–õ÷6VÆV7FVB ¢6VÆbç66Væ&–õö·•ög&ÖRÒGF²äg&ÖR‡6VÆbç66Væ&–õ÷F"¢6VÆbç66Væ&–õö·•ög&ÖRæw&–B‡&÷sÓBÂ6öÇVÖãÓÂ7F–6·“Ò&Wr"ÂG“ÒƒÂ’¢f÷"6öÇVÖâ–â&ævRƒB“ ¢6VÆbç66Væ&–õö·•ög&ÖRæ6öÇVÖæ6öæf–wW&R†6öÇVÖâÂvV–v‡CÓ¢6VÆbç66Væ&–õö·•÷f'3¢F–7E·7G"ÂF²å7G&–æuf%ÒÒ·Ğ¢f÷"–æFW‚Â†¶W’ÂF—FÆR’–âVçVÖW&FR€¢²‚&7W'&VçE÷&WfVçVR"Â-
+-]­=ò-½=}­"’Â‚'ÆææVE÷&WfVçVR"Â-	ı½İí-ò-½=}­"’Â‚'ÆææVEöæWB"Â-	ı½İí-ò}-òı½½Â"’Â‚'ÆææVEöÖ&v–â"Â-	ı½İí-òMí]íMİí-Â"•Ğ¢“ ¢6VÆbç66Væ&–õö·•÷f'5¶¶W•ÒÒF²å7G&–æuf"‡fÇVSÒ.(	B"¢6&BÒGF²äg&ÖR‡6VÆbç66Væ&–õö·•ög&ÖRÂ7G–ÆSÒ$6&BåDg&ÖR"ÂFF–æsÒƒbÂ"’¢6&Bæw&–B‡&÷sÓÂ6öÇVÖãÖ–æFW‚Â7F–6·“Ò&ç6Wr"ÂGƒÒƒ–b–æFW‚ÓÒVÇ6RRÂ–b–æFW‚ÓÒ2VÇ6RR’¢GF²äÆ&VÂ†6&BÂFW‡C×F—FÆRÂ7G–ÆSÒ$6&D×WFVBåDÆ&VÂ"’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"¢GF²äÆ&VÂ†6&BÂFW‡Gf&–&ÆS×6VÆbç66Væ&–õö·•÷f'5¶¶W•ÒÂ7G–ÆSÒ$·’åDÆ&VÂ"’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂG“ÒƒBÂ’ ¢FVbö'V–ÆEö†—7F÷'•÷F"‡6VÆb’ÓâæöæS ¢6VÆbæ†—7F÷'•÷F"æ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢6VÆbæ†—7F÷'•÷F"ç&÷v6öæf–wW&RƒÂvV–v‡CÓ2¢6VÆbæ†—7F÷'•÷F"ç&÷v6öæf–wW&Rƒ2ÂvV–v‡CÓ"¢†VFW"ÒGF²äg&ÖR‡6VÆbæ†—7F÷'•÷F"¢†VFW"æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò&Wr"ÂG“ÒƒÂ‚’¢†VFW"æ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢GF²äÆ&VÂ††VFW"ÂFW‡CÒ-	-íò}]-í""Â7G–ÆSÒ%6V7F–öâåDÆ&VÂ"’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"¢GF²ä'WGFöâ††VFW"ÂFW‡CÒ-	ı]]Í]İí--Â"Â6öÖÖæC×6VÆbç&VæÖUö†—7F÷'•÷'Vâ’æw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÒƒ‚Â’¢GF²ä'WGFöâ††VFW"ÂFW‡CÒ-
+=M½-Â"Â6öÖÖæC×6VÆbæFVÆWFUö†—7F÷'•÷'Vâ’æw&–B‡&÷sÓÂ6öÇVÖãÓ"ÂGƒÒƒ‚Â’¢6VÆbæ†—7F÷'•÷G&VRÒ6VÆbåö7&VFU÷G&VR€¢6VÆbæ†—7F÷'•÷F"À¢²&–B"Â&æÖR"Â'W&–öB"Â&7&VFVB"Â&f–ÆW2"Â'Væ—G2"Â'&WfVçVR"Â&æWB"Â'VæÆÆö6FVB"Â'7FGW2%ÒÀ¢².(Ib"Â-	İÍ]İí-İR"Â-	ı]íB"Â-	M-}]-"Â-
+M½í""Â-	ıíMm‚"Â-	-½=}­"Â-
+}-òı½½Â"Â-	İ]ı]M]½]İİ½R"Â-
+--=%ÒÀ¢&÷sÓÀ¢†V–v‡CÓÀ¢v–GF‡3Õ³cÂ3Â#ÂcÂƒÂÂSÂSÂcÂÒÀ¢¢6VÆbæ†—7F÷'•÷G&VRæ&–æB‚#ÃÅG&VWf–Wu6VÆV7Cãâ"Â6VÆbåööåö†—7F÷'•÷6VÆV7FVB¢6VÆbæ†—7F÷'•÷G&VRæ&–æB‚#ÄF÷V&ÆRÓâ"Â6VÆbåö÷Våö†—7F÷'•÷'Vâ¢GF²äÆ&VÂ‡6VÆbæ†—7F÷'•÷F"ÂFW‡CÒ-	­íİ-í½Â­}]---½İİí=âí-}]-"Â7G–ÆSÒ%6V7F–öâåDÆ&VÂ"’æw&–B€¢&÷sÓ"Â6öÇVÖãÓÂ7F–6·“Ò'r"ÂG“ÒƒBÂ‚¢¢6VÆbçVÆ—G•÷G&VRÒ6VÆbåö7&VFU÷G&VR€¢6VÆbæ†—7F÷'•÷F"À¢²'6WfW&—G’"Â'G—R"Â&ÖW76vR%ÒÀ¢²-
+=í-]İÂ"Â-	ıí-]­"Â-
+íí]İR%ÒÀ¢&÷sÓ2À¢v–GF‡3Õ³CÂ##Â“ÒÀ¢ ¢FVbö'V–ÆE÷G&VæE÷F"‡6VÆb’ÓâæöæS ¢6VÆbçG&VæE÷F"æ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢6VÆbçG&VæE÷F"ç&÷v6öæf–wW&Rƒ2ÂvV–v‡CÓ2¢6VÆbçG&VæE÷F"ç&÷v6öæf–wW&RƒRÂvV–v‡CÓ"¢GF²äÆ&VÂ‡6VÆbçG&VæE÷F"ÂFW‡CÒ-	MİÍ­ıí­}-]½]’"Â7G–ÆSÒ%6V7F–öâåDÆ&VÂ"’æw&–B€¢&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂG“ÒƒÂ"¢¢GF²äÆ&VÂ€¢6VÆbçG&VæE÷F"À¢FW‡CÒ-	­mMò-í}­(	Bí]İ]İİ½’}]"â	ı]íM²ıí½ím]İ²ıâM-Rİ}½í-}]-â"À¢7G–ÆSÒ$×WFVBåDÆ&VÂ"À¢’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂG“ÒƒÂ’¢6öçG&öÇ2ÒGF²äg&ÖR‡6VÆbçG&VæE÷F"¢6öçG&öÇ2æw&–B‡&÷sÓ"Â6öÇVÖãÓÂ7F–6·“Ò&Wr"ÂG“ÒƒÂ‚’¢GF²äÆ&VÂ†6öçG&öÇ2ÂFW‡CÒ-	ıí­}-]½Ã¢"’æw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÒƒÂb’¢6VÆbçG&VæEöÖWG&–5÷f"ÒF²å7G&–æuf"‡fÇVSÒ-	-½=}­"¢G&VæEö6öÖ&òÒGF²ä6öÖ&ö&÷‚€¢6öçG&öÇ2À¢FW‡Gf&–&ÆS×6VÆbçG&VæEöÖWG&–5÷f"À¢7FFSÒ'&VFöæÇ’"À¢fÇVW3ÖÆ—7B…E$TäEôÔUE$”52’À¢v–GFƒÓ3bÀ¢¢G&VæEö6öÖ&òæw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"¢G&VæEö6öÖ&òæ&–æB‚#ÃÄ6öÖ&ö&÷…6VÆV7FVCãâ"ÂÆÖ&FöWfVçC¢6VÆbåöG&u÷G&VæEö6†'B‚’ ¢6VÆbçG&VæEö6çf2ÒF²ä6çf2€¢6VÆbçG&VæE÷F"À¢†V–v‡CÓ3cÀ¢†–v†Æ–v‡GF†–6¶æW73ÓÀ¢&CÓÀ¢¢6VÆbçG&VæEö6çf2æw&–B‡&÷sÓ2Â6öÇVÖãÓÂ7F–6·“Ò&ç6Wr"ÂG“ÒƒÂ’¢6VÆbçG&VæEö6çf2æ&–æB‚#Ä6öæf–wW&Sâ"ÂÆÖ&FöWfVçC¢6VÆbåöG&u÷G&VæEö6†'B‚’¢6VÆbçG&VæEö6çf2æ&–æB‚#ÄÖ÷F–öãâ"Â6VÆbå÷G&VæEö†÷fW"¢6VÆbçG&VæEö6çf2æ&–æB‚#ÄÆVfSâ"ÂÆÖ&FöWfVçC¢6VÆbçG&VæEö6çf2æFVÆWFR‚'FööÇF—"’ ¢GF²äÆ&VÂ‡6VÆbçG&VæE÷F"ÂFW‡CÒ-
+-½mMİÍ­‚"Â7G–ÆSÒ%6V7F–öâåDÆ&VÂ"’æw&–B€¢&÷sÓBÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂG“ÒƒBÂ‚¢¢6VÆbçG&VæE÷G&VRÒ6VÆbåö7&VFU÷G&VR€¢6VÆbçG&VæE÷F"À¢²''Vâ"Â'W&–öB"Â'Væ—G2"Â'&WfVçVR"Â'&WfVçVUö6†ævR"Â&æWB"Â&æWEö6†ævR"Â'VæÆÆö6FVB%ÒÀ¢°¢-
+}]""Â-	ı]íB"Â-	ıíMm‚"Â-	-½=}­"Â-	}Í]İ]İR-½=}­‚"À¢-
+}-òı½½Â"Â-	}Í]İ]İRı½½‚"Â-	İ]ı]M]½]İİ½R"À¢ÒÀ¢&÷sÓRÀ¢v–GF‡3Õ³ƒÂ#3ÂÂSÂsÂSÂsÂsÒÀ¢†V–v‡CÓ‚À¢ ¢FVbö'V–ÆEö6ö×&—6öå÷F"‡6VÆb’ÓâæöæS ¢6VÆbæ6ö×&—6öå÷F"æ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢6VÆbæ6ö×&—6öå÷F"ç&÷v6öæf–wW&RƒBÂvV–v‡CÓ¢GF²äÆ&VÂ‡6VÆbæ6ö×&—6öå÷F"ÂFW‡CÒ-
+-İ]İRí]İ]İİ½Rı]íMí""Â7G–ÆSÒ%6V7F–öâåDÆ&VÂ"’æw&–B€¢&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂG“ÒƒÂ"¢¢GF²äÆ&VÂ€¢6VÆbæ6ö×&—6öå÷F"À¢FW‡CÒ-	ı]-½’ı]íB(	B}-İ]İòâ	}Í]İ]İRıí­}½-]"--íí’ı]íBí-İí-]½Íİâı]-í=ââ"À¢7G–ÆSÒ$×WFVBåDÆ&VÂ"À¢’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂG“ÒƒÂ’ ¢6öçG&öÇ2ÒGF²äg&ÖR‡6VÆbæ6ö×&—6öå÷F"¢6öçG&öÇ2æw&–B‡&÷sÓ"Â6öÇVÖãÓÂ7F–6·“Ò&Wr"ÂG“ÒƒÂ"’¢GF²äÆ&VÂ†6öçG&öÇ2ÂFW‡CÒ-	ı]-½’ı]íC¢"’æw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÒƒÂb’¢6VÆbæ6ö×&Uöf—'7E÷f"ÒF²å7G&–æuf"‚¢6VÆbæ6ö×&Uöf—'7Eö6öÖ&òÒGF²ä6öÖ&ö&÷‚€¢6öçG&öÇ2ÂFW‡Gf&–&ÆS×6VÆbæ6ö×&Uöf—'7E÷f"Â7FFSÒ'&VFöæÇ’"Âv–GFƒÓ3@¢¢6VÆbæ6ö×&Uöf—'7Eö6öÖ&òæw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÒƒÂ‚’¢GF²äÆ&VÂ†6öçG&öÇ2ÂFW‡CÒ-	--íí’ı]íC¢"’æw&–B‡&÷sÓÂ6öÇVÖãÓ"ÂGƒÒƒÂb’¢6VÆbæ6ö×&U÷6V6öæE÷f"ÒF²å7G&–æuf"‚¢6VÆbæ6ö×&U÷6V6öæEö6öÖ&òÒGF²ä6öÖ&ö&÷‚€¢6öçG&öÇ2ÂFW‡Gf&–&ÆS×6VÆbæ6ö×&U÷6V6öæE÷f"Â7FFSÒ'&VFöæÇ’"Âv–GFƒÓ3@¢¢6VÆbæ6ö×&U÷6V6öæEö6öÖ&òæw&–B‡&÷sÓÂ6öÇVÖãÓ2ÂGƒÒƒÂ"’¢GF²ä'WGFöâ†6öçG&öÇ2ÂFW‡CÒ-
+-İ-Â"Â7G–ÆSÒ$66VçBåD'WGFöâ"Â6öÖÖæC×6VÆbç&Vg&W6…ö6ö×&—6öâ’æw&–B€¢&÷sÓÂ6öÇVÖãÓ@¢ ¢6VÆbæ6ö×&—6öåö·•ög&ÖRÒGF²äg&ÖR‡6VÆbæ6ö×&—6öå÷F"¢6VÆbæ6ö×&—6öåö·•ög&ÖRæw&–B‡&÷sÓ2Â6öÇVÖãÓÂ7F–6·“Ò&Wr"ÂG“ÒƒÂ"’¢f÷"6öÇVÖâ–â&ævRƒB“ ¢6VÆbæ6ö×&—6öåö·•ög&ÖRæ6öÇVÖæ6öæf–wW&R†6öÇVÖâÂvV–v‡CÓ¢6VÆbæ6ö×&—6öåö·•÷f'3¢F–7E·7G"ÂF²å7G&–æuf%ÒÒ·Ğ¢f÷"–æFW‚Â†¶W’ÂF—FÆR’–âVçVÖW&FR€¢°¢‚'&WfVçVR"Â-	}Í]İ]İR-½=}­‚"’À¢‚&æWE÷&öf—B"Â-	}Í]İ]İR}-í’ı½½‚"’À¢‚'Væ—G2"Â-	}Í]İ]İRıíMb"’À¢‚'VæÆÆö6FVB"Â-	}Í]İ]İRİ]ı]M]½]İİ½R"’À¢Ğ¢“ ¢6VÆbæ6ö×&—6öåö·•÷f'5¶¶W•ÒÒF²å7G&–æuf"‡fÇVSÒ.(	B"¢6&BÒGF²äg&ÖR‡6VÆbæ6ö×&—6öåö·•ög&ÖRÂ7G–ÆSÒ$6&BåDg&ÖR"ÂFF–æsÒƒbÂ"’¢6&Bæw&–B‡&÷sÓÂ6öÇVÖãÖ–æFW‚Â7F–6·“Ò&ç6Wr"ÂGƒÒƒ–b–æFW‚ÓÒVÇ6RRÂ–b–æFW‚ÓÒ2VÇ6RR’¢GF²äÆ&VÂ†6&BÂFW‡C×F—FÆRÂ7G–ÆSÒ$6&D×WFVBåDÆ&VÂ"’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"¢GF²äÆ&VÂ†6&BÂFW‡Gf&–&ÆS×6VÆbæ6ö×&—6öåö·•÷f'5¶¶W•ÒÂ7G–ÆSÒ$·’åDÆ&VÂ"’æw&–B€¢&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂG“ÒƒBÂ¢ ¢6VÆbæ6ö×&—6öå÷G&VRÒ6VÆbåö7&VFU÷G&VR€¢6VÆbæ6ö×&—6öå÷F"À¢°¢&'F–6ÆR"Â&æÖR"Â'Væ—G5öf—'7B"Â'Væ—G5÷6V6öæB"Â'Væ—G5ö6†ævR"À¢'&WfVçVUöf—'7B"Â'&WfVçVU÷6V6öæB"Â'&WfVçVUö6†ævR"Â'&WfVçVU÷W&6VçB"À¢'&öf—Eöf—'7B"Â'&öf—E÷6V6öæB"Â'&öf—Eö6†ævR"Â'&öf—E÷W&6VçB"À¢&Ö&v–åöf—'7B"Â&Ö&v–å÷6V6öæB"Â&Ö&v–åö6†ævR"À¢ÒÀ¢°¢-	-­=²"Â-	İÍ]İí-İR"Â-	ıíMm‚"Â-	ıíMm‚""Â-	}Í]İ]İRıíMb"À¢-	-½=}­"Â-	-½=}­""Â-	}Í]İ]İR-½=}­‚"Â-	-½=}­ÂR"À¢-
+}-òı½½Â"Â-
+}-òı½½Â""Â-	}Í]İ]İRı½½‚"Â-	ı½½ÂÂR"À¢-	Mí]íMİí-Â"Â-	Mí]íMİí-Â""Â-	}Í]İ]İRMí]íMİí-‚"À¢ÒÀ¢&÷sÓBÀ¢v–GF‡3Õ³#Â#3Ò²³3UÒ¢BÀ¢ ¢FVbö'V–ÆE÷6WGF–æw5÷F"‡6VÆb’ÓâæöæS ¢6VÆbç6WGF–æw5÷F"æ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢6VÆbç6WGF–æw5÷F"ç&÷v6öæf–wW&Rƒ2ÂvV–v‡CÓ¢GF²äÆ&VÂ‡6VÆbç6WGF–æw5÷F"ÂFW‡CÒ-	İ-í­‚ı½ím]İò"Â7G–ÆSÒ%6V7F–öâåDÆ&VÂ"’æw&–B€¢&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂG“ÒƒÂ‚¢¢6WGF–æw2ÒGF²äg&ÖR‡6VÆbç6WGF–æw5÷F"¢6WGF–æw2æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò&Wr"ÂG“ÒƒÂ"’¢6WGF–æw2æ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢6WGF–æw2æ6öÇVÖæ6öæf–wW&Rƒ2ÂvV–v‡CÓ ¢GF²äÆ&VÂ‡6WGF–æw2ÂFW‡CÒ-
+-]Í¢"’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂGƒÒƒÂ‚’ÂG“ÓR¢6VÆbçF†VÖU÷f"ÒF²å7G&–æuf"‡fÇVSÕD„TÔUõdÅTU2ævWB‡6VÆbæF"ævWE÷6WGF–ær‚'F†VÖR"Â'7—7FVÒ"’Â-
+-]Íİò"’¢F†VÖUö6öÖ&òÒGF²ä6öÖ&ö&÷‚‡6WGF–æw2ÂFW‡Gf&–&ÆS×6VÆbçF†VÖU÷f"Â7FFSÒ'&VFöæÇ’"ÂfÇVW3ÖÆ—7B…D„TÔUôÄ$TÅ2’Âv–GFƒÓ#¢F†VÖUö6öÖ&òæw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂG“ÓR¢F†VÖUö6öÖ&òæ&–æB‚#ÃÄ6öÖ&ö&÷…6VÆV7FVCãâ"Â6VÆbå÷&Wf–Wu÷F†VÖR ¢GF²äÆ&VÂ‡6WGF–æw2ÂFW‡CÒ-	İ½í=í-ò--­ÂS¢"’æw&–B‡&÷sÓÂ6öÇVÖãÓ"Â7F–6·“Ò'r"ÂGƒÒƒ#BÂ‚’ÂG“ÓR¢6VÆbçF…÷&FU÷f"ÒF²å7G&–æuf"‡fÇVSÕ÷Æ–åöçVÖ&W"†fÆöB‡6VÆbæF"ævWE÷6WGF–ær‚'F…÷&FR"Â#ãB"’’¢’¢GF²äVçG'’‡6WGF–æw2ÂFW‡Gf&–&ÆS×6VÆbçF…÷&FU÷f"Âv–GFƒÓB’æw&–B‡&÷sÓÂ6öÇVÖãÓ2Â7F–6·“Ò'r"ÂG“ÓR ¢GF²äÆ&VÂ‡6WGF–æw2ÂFW‡CÒ-	ıí--íİò}==}­M½¢"’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂGƒÒƒÂ‚’ÂG“ÓR¢6VÆbæGWÆ–6FU÷öÆ–7•÷f"ÒF²å7G&–æuf"€¢fÇVSÔEUÄ”4DUõdÅTU2ævWB‡6VÆbæF"ævWE÷6WGF–ær‚&GWÆ–6FU÷öÆ–7’"Â&6²"’Â-
+ı--Â"¢¢GF²ä6öÖ&ö&÷‚€¢6WGF–æw2À¢FW‡Gf&–&ÆS×6VÆbæGWÆ–6FU÷öÆ–7•÷f"À¢7FFSÒ'&VFöæÇ’"À¢fÇVW3ÖÆ—7B„EUÄ”4DUôÄ$TÅ2’À¢v–GFƒÓ#À¢’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂG“ÓR ¢6VÆbçv&å÷&VÆ—¦F–öå÷f"ÒF²ä&ööÆVåf"‡fÇVS×6VÆbæF"ævWE÷6WGF–ær‚'v&å÷v—F†÷WE÷&VÆ—¦F–öâ"Â#"’ÓÒ#"¢GF²ä6†V6¶'WGFöâ€¢6WGF–æw2À¢f&–&ÆS×6VÆbçv&å÷&VÆ—¦F–öå÷f"À¢FW‡CÒ-	ı]M=ı]mM-ÂÂ]½‚İR-½Òí-}]"â-½­=ı½]İİ½R-í-R"À¢’æw&–B‡&÷sÓÂ6öÇVÖãÓ"Â6öÇVÖç7ãÓ"Â7F–6·“Ò'r"ÂGƒÒƒ#BÂ’ÂG“ÓR ¢GF²äÆ&VÂ‡6WGF–æw2ÂFW‡CÒ-
+-í¢"ı]MıíÍí-S¢"’æw&–B‡&÷sÓ"Â6öÇVÖãÓÂ7F–6·“Ò'r"ÂGƒÒƒÂ‚’ÂG“ÓR¢6VÆbç&Wf–Wu÷&÷w5÷f"ÒF²å7G&–æuf"‡fÇVS×6VÆbæF"ævWE÷6WGF–ær‚'&Wf–Wu÷&÷w2"Â#S"’¢GF²å7–æ&÷‚‡6WGF–æw2ÂFW‡Gf&–&ÆS×6VÆbç&Wf–Wu÷&÷w5÷f"Âg&öÕóÓÂFóÓSÂ–æ7&VÖVçCÓÂv–GFƒÓ"’æw&–B€¢&÷sÓ"Â6öÇVÖãÓÂ7F–6·“Ò'r"ÂG“ÓP¢¢GF²äÆ&VÂ‡6WGF–æw2ÂFW‡CÒ-
+]İ½S¢"’æw&–B‡&÷sÓ"Â6öÇVÖãÓ"Â7F–6·“Ò'r"ÂGƒÒƒ#BÂ‚’ÂG“ÓR¢7F÷&vUö6öçG&öÇ2ÒGF²äg&ÖR‡6WGF–æw2¢7F÷&vUö6öçG&öÇ2æw&–B‡&÷sÓ"Â6öÇVÖãÓ2Â7F–6·“Ò&Wr"ÂG“ÓR¢7F÷&vUö6öçG&öÇ2æ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢6VÆbç7F÷&vU÷F…÷f"ÒF²å7G&–æuf"‡fÇVS×7G"‡6VÆbç6W'f–6RçF‡5²'&ö÷B%Ò’¢GF²äVçG'’‡7F÷&vUö6öçG&öÇ2ÂFW‡Gf&–&ÆS×6VÆbç7F÷&vU÷F…÷f"Â7FFSÒ'&VFöæÇ’"Âv–GFƒÓC‚’æw&–B€¢&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò&Wr"ÂGƒÒƒÂb¢¢GF²ä'WGFöâ‡7F÷&vUö6öçG&öÇ2ÂFW‡CÒ-	}Í]İ-Î(
+b"Â6öÖÖæC×6VÆbæ6†ö÷6U÷7F÷&vUöföÆFW"’æw&–B€¢&÷sÓÂ6öÇVÖãÓÂGƒÓ0¢¢GF²ä'WGFöâ€¢7F÷&vUö6öçG&öÇ2À¢FW‡CÒ-	í-­½-Â"À¢6öÖÖæCÖÆÖ&F¢ö÷Vå÷F‚‡6VÆbç6W'f–6RçF‡5²'&ö÷B%Ò’À¢’æw&–B‡&÷sÓÂ6öÇVÖãÓ"ÂGƒÒƒ2Â’¢GF²ä'WGFöâ‡6WGF–æw2ÂFW‡CÒ-
+í]İ-Âİ-í­‚"Â7G–ÆSÒ$66VçBåD'WGFöâ"Â6öÖÖæC×6VÆbç6fU÷6WGF–æw2’æw&–B€¢&÷sÓ2Â6öÇVÖãÓÂ6öÇVÖç7ãÓBÂ7F–6·“Ò'r"ÂG“ÒƒÂ¢ ¢&6·Wö&÷‚ÒGF²äÆ&VÄg&ÖR‡6WGF–æw2ÂFW‡CÒ-
+]}]-İò­íıò‚ı]]İíİM==í’­íÍıÍí-]"ÂFF–æsÒƒ"Â’¢&6·Wö&÷‚æw&–B‡&÷sÓBÂ6öÇVÖãÓÂ6öÇVÖç7ãÓBÂ7F–6·“Ò&Wr"ÂG“ÒƒBÂ’¢&6·Wö&÷‚æ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢GF²äÆ&VÂ€¢&6·Wö&÷‚À¢FW‡CÒ-	]"íM]m"-íâ}]-í"Âİ-í­‚Â]]-íÍí-Â‚í]İ]İİ½R]íMİ½Rí-}]-²â"À¢7G–ÆSÒ$×WFVBåDÆ&VÂ"À¢’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"¢&6·Wö7F–öç2ÒGF²äg&ÖR†&6·Wö&÷‚¢&6·Wö7F–öç2æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò&R"ÂGƒÒƒbÂ’¢GF²ä'WGFöâ€¢&6·Wö7F–öç2À¢FW‡CÒ-
+í}M-Â]}]-İ=â­íıâ"À¢6öÖÖæC×6VÆbæ7&VFUöÆ–6F–öåö&6·WÀ¢’æw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÓB¢GF²ä'WGFöâ€¢&6·Wö7F–öç2À¢FW‡CÒ-	-í-İí--Âòı]]İ]-‚"À¢6öÖÖæC×6VÆbç&W7F÷&UöÆ–6F–öåö&6·WÀ¢’æw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÓB ¢&öGV7Eö†VFW"ÒGF²äg&ÖR‡6VÆbç6WGF–æw5÷F"¢&öGV7Eö†VFW"æw&–B‡&÷sÓ"Â6öÇVÖãÓÂ7F–6·“Ò&Wr"ÂG“ÒƒbÂ‚’¢&öGV7Eö†VFW"æ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢GF²äÆ&VÂ‡&öGV7Eö†VFW"ÂFW‡CÒ-
+-í-²‚]]-íÍí-Â"Â7G–ÆSÒ%6V7F–öâåDÆ&VÂ"’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"¢GF²ä'WGFöâ€¢&öGV7Eö†VFW"À¢FW‡CÒ-
+]M­-í--Âı-í}İ¢"À¢7G–ÆSÒ$66VçBåD'WGFöâ"À¢6öÖÖæC×6VÆbæ÷Våö6÷7Eö6FÆöuöVF—F÷"À¢’æw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÒƒ‚ÂB’¢GF²ä'WGFöâ‡&öGV7Eö†VFW"ÂFW‡CÒ-	Mí--Â-í-"Â6öÖÖæC×6VÆbæFE÷&öGV7B’æw&–B‡&÷sÓÂ6öÇVÖãÓ"ÂGƒÓB¢GF²ä'WGFöâ‡&öGV7Eö†VFW"ÂFW‡CÒ-	}Í]İ-Â-½İİ½’"Â6öÖÖæC×6VÆbæVF—E÷&öGV7B’æw&–B‡&÷sÓÂ6öÇVÖãÓ2ÂGƒÓB¢GF²ä'WGFöâ‡&öGV7Eö†VFW"ÂFW‡CÒ-	"]"ò-í-İí--Â"Â6öÖÖæC×6VÆbçFövvÆU÷&öGV7B’æw&–B‡&÷sÓÂ6öÇVÖãÓBÂGƒÓB¢GF²ä'WGFöâ‡&öGV7Eö†VFW"ÂFW‡CÒ-	m=İ²}Í]İ]İ’"Â6öÖÖæC×6VÆbç6†÷uö6÷7Eö†—7F÷'’’æw&–B‡&÷sÓÂ6öÇVÖãÓRÂGƒÓB¢GF²äÆ&VÂ€¢&öGV7Eö†VFW"À¢FW‡CÒ-	íİí-İí’ıíí(	B}ıí½İ]İRııÍâ"ı½ím]İ‚â„Å5‚İ=m]Ò-í½Í­âM½òíÍ]İ½‚]}]-İí’­íı‚â"À¢7G–ÆSÒ$×WFVBåDÆ&VÂ"À¢’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ6öÇVÖç7ãÓbÂ7F–6·“Ò'r"ÂG“ÒƒBÂ‚’ ¢f–ÇFW'2ÒGF²äg&ÖR‡&öGV7Eö†VFW"¢f–ÇFW'2æw&–B‡&÷sÓ"Â6öÇVÖãÓÂ6öÇVÖç7ãÓbÂ7F–6·“Ò&Wr"¢f–ÇFW'2æ6öÇVÖæ6öæf–wW&RƒRÂvV–v‡CÓ¢GF²äÆ&VÂ†f–ÇFW'2ÂFW‡CÒ-	ıí£¢"’æw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÒƒÂb’¢6VÆbç&öGV7E÷6V&6…÷f"ÒF²å7G&–æuf"‚¢6V&6…öVçG'’ÒGF²äVçG'’†f–ÇFW'2ÂFW‡Gf&–&ÆS×6VÆbç&öGV7E÷6V&6…÷f"Âv–GFƒÓ#‚¢6V&6…öVçG'’æw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÒƒÂ"’¢6VÆbç&öGV7E÷6V&6…÷f"çG&6UöFB‚'w&—FR"ÂÆÖ&F¥ö&w3¢6VÆbç&Vg&W6…÷&öGV7G2‚’¢GF²äÆ&VÂ†f–ÇFW'2ÂFW‡CÒ-	ıí­}½--Ã¢"’æw&–B‡&÷sÓÂ6öÇVÖãÓ"ÂGƒÒƒÂb’¢6VÆbç&öGV7E÷7FGW5÷f"ÒF²å7G&–æuf"‡fÇVSÒ-	-R"¢7FGW5ö6öÖ&òÒGF²ä6öÖ&ö&÷‚€¢f–ÇFW'2À¢FW‡Gf&–&ÆS×6VÆbç&öGV7E÷7FGW5÷f"À¢7FFSÒ'&VFöæÇ’"À¢fÇVW3Ò‚-	-R"Â-	­--İ½R"Â-	]""’À¢v–GFƒÓ"À¢¢7FGW5ö6öÖ&òæw&–B‡&÷sÓÂ6öÇVÖãÓ2ÂGƒÒƒÂ"’¢7FGW5ö6öÖ&òæ&–æB‚#ÃÄ6öÖ&ö&÷…6VÆV7FVCãâ"ÂÆÖ&FöWfVçC¢6VÆbç&Vg&W6…÷&öGV7G2‚’¢6VÆbç&öGV7Eö6÷VçE÷f"ÒF²å7G&–æuf"‡fÇVSÒ-	ıí­}İã¢"¢GF²äÆ&VÂ†f–ÇFW'2ÂFW‡Gf&–&ÆS×6VÆbç&öGV7Eö6÷VçE÷f"Â7G–ÆSÒ$×WFVBåDÆ&VÂ"’æw&–B€¢&÷sÓÂ6öÇVÖãÓBÂ7F–6·“Ò'r ¢¢GF²ä'WGFöâ†f–ÇFW'2ÂFW‡CÒ-	-½==}-Â„Å5‚"Â6öÖÖæC×6VÆbæW‡÷'E÷&öGV7Eö6FÆör’æw&–B‡&÷sÓÂ6öÇVÖãÓbÂGƒÓB¢GF²ä'WGFöâ†f–ÇFW'2ÂFW‡CÒ-	}==}-Â„Å5‚"Â6öÖÖæC×6VÆbæ–×÷'E÷&öGV7Eö6FÆör’æw&–B‡&÷sÓÂ6öÇVÖãÓrÂGƒÓB¢6VÆbç&öGV7G5÷G&VRÒ6VÆbåö7&VFU÷G&VR€¢6VÆbç6WGF–æw5÷F"À¢²&'F–6ÆR"Â&æÖR"Â'F÷FÂ"Â&ÖFW&–Â"Â&Æ&÷""Â'7FGW2%ÒÀ¢²-	-­=²"Â-	İÍ]İí-İR"Â-	ıí½İò]]-íÍí-Â"Â-	Í-]²"Â-
+-=Mí}--²"Â-
+--=%ÒÀ¢&÷sÓ2À¢v–GF‡3Õ³SÂ3cÂƒÂSÂSÂÒÀ¢¢6VÆbç&öGV7G5÷G&VRæ&–æB‚#ÄF÷V&ÆRÓâ"ÂÆÖ&FöWfVçC¢6VÆbæVF—E÷&öGV7B‚’ ¢FVbö7&VFU÷G&VR€¢6VÆbÀ¢&VçBÀ¢6öÇVÖç3¢Æ—7E·7G%ÒÀ¢†VF–æw3¢Æ—7E·7G%ÒÀ¢&÷s¢–çBÀ¢v–GF‡3¢Æ—7E¶–çEÒÂæöæRÒæöæRÀ¢†V–v‡C¢–çBÒ‚À¢’ÓâGF²åG&VWf–Ws ¢6öçF–æW"ÒGF²äg&ÖR‡&VçB¢6öçF–æW"æw&–B‡&÷s×&÷rÂ6öÇVÖãÓÂ7F–6·“Ò&ç6Wr"¢6öçF–æW"æ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢6öçF–æW"ç&÷v6öæf–wW&RƒÂvV–v‡CÓ¢G&VRÒGF²åG&VWf–Wr†6öçF–æW"Â6öÇVÖç3Ö6öÇVÖç2Â6†÷sÒ&†VF–æw2"Â†V–v‡CÖ†V–v‡B¢‡67&öÆÂÒGF²å67&öÆÆ&"†6öçF–æW"Â÷&–VçCÒ&†÷&—¦öçFÂ"Â6öÖÖæC×G&VRç‡f–Wr¢—67&öÆÂÒGF²å67&öÆÆ&"†6öçF–æW"Â÷&–VçCÒ'fW'F–6Â"Â6öÖÖæC×G&VRç—f–Wr¢G&VRæ6öæf–wW&R‡‡67&öÆÆ6öÖÖæC×‡67&öÆÂç6WBÂ—67&öÆÆ6öÖÖæC×—67&öÆÂç6WB¢G&VRæw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò&ç6Wr"¢—67&öÆÂæw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò&ç2"¢‡67&öÆÂæw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò&Wr"¢v–GF‡2Òv–GF‡2÷"³CÒ¢ÆVâ†6öÇVÖç2¢f÷"6öÇVÖâÂ†VF–ærÂv–GF‚–â¦—†6öÇVÖç2Â†VF–æw2Âv–GF‡2“ ¢G&VRæ†VF–ær†6öÇVÖâÂFW‡CÖ†VF–ær¢G&VRæ6öÇVÖâ†6öÇVÖâÂv–GFƒ×v–GF‚ÂÖ–çv–GFƒÓsÂ7G&WF6ƒÔfÇ6RÂæ6†÷#Ò'r"–b6öÇVÖâ–â²&'F–6ÆR"Â&æÖR"Â'G—R"Â&6FVv÷'’"Â&ÖW76vR'ÒVÇ6R&R"¢&WGW&âG&VP ¢FVb&Vg&W6…öÆÂ‡6VÆb’ÓâæöæS ¢6VÆbç&Vg&W6…÷&öGV7G2‚¢6VÆbç&Vg&W6…÷'Vç2‚ ¢FVb&Vg&W6…÷'Vç2‡6VÆb’ÓâæöæS ¢'Vç2Ò6VÆbæF"æÆ—7E÷'Vç2‚¢6VÆbç'VåöF—7Æ•÷Fõö–Bæ6ÆV"‚¢fÇVW3¢Æ—7E·7G%ÒÒµĞ¢f÷"'Vâ–â'Vç3 ¢W&–öBÒ÷W&–öE÷FW‡B‡'VâçW&–öE÷7F'BÂ'VâçW&–öEöVæB¢F—7Æ’Òb"7·'Vâæ–GÒ+r·'Vâç&W÷'EöæÖWÒ+r·W&–öGÒ ¢fÇVW2æVæB†F—7Æ’¢6VÆbç'VåöF—7Æ•÷Fõö–E¶F—7Æ•ÒÒ'Vâæ–@¢6VÆbç'Våö6öÖ&õ²'fÇVW2%ÒÒfÇVW0¢6VÆbæ6ö×&Uöf—'7Eö6öÖ&õ²'fÇVW2%ÒÒfÇVW0¢6VÆbæ6ö×&U÷6V6öæEö6öÖ&õ²'fÇVW2%ÒÒfÇVW0¢–bæ÷B'Vç3 ¢6VÆbç'Vå÷f"ç6WB‚-	İ]"}]-í""¢6VÆbåö6ÆV%ö7W'&VçE÷f–Wr‚¢VÇ6S ¢F&vWEö–BÒ6VÆbæ7W'&VçE÷'Våö–B–b6VÆbæ7W'&VçE÷'Våö–B–â·'Vâæ–Bf÷"'Vâ–â'Vç7ÒVÇ6R'Vç5³Òæ–@¢F—7Æ’ÒæW‡B†¶W’f÷"¶W’ÂfÇVR–â6VÆbç'VåöF—7Æ•÷Fõö–Bæ—FV×2‚’–bfÇVRÓÒF&vWEö–B¢6VÆbç'Vå÷f"ç6WB†F—7Æ’¢6VÆbç6VÆV7E÷'Vâ‡F&vWEö–B¢–bÆVâ‡fÇVW2’ãÒ# ¢–b6VÆbæ6ö×&Uöf—'7E÷f"ævWB‚’æ÷B–âfÇVW3 ¢6VÆbæ6ö×&Uöf—'7E÷f"ç6WB‡fÇVW5³Ò¢–b6VÆbæ6ö×&U÷6V6öæE÷f"ævWB‚’æ÷B–âfÇVW3 ¢6VÆbæ6ö×&U÷6V6öæE÷f"ç6WB‡fÇVW5³Ò¢6VÆbç&Vg&W6…ö6ö×&—6öâ‚¢VÇ6S ¢6VÆbæ6ö×&Uöf—'7E÷f"ç6WB‡fÇVW5³Ò¢6VÆbæ6ö×&U÷6V6öæE÷f"ç6WB‡fÇVW5³Ò¢6VÆbåö6ÆV%ö6ö×&—6öâ‚-	M½ò-İ]İò}==}-R­¢ÍİÍ=ÂM-ı]íM"¢6VÆbç&Vg&W6…ö†—7F÷'’‚¢6VÆbç&Vg&W6…÷G&VæG2‡'Vç2 ¢FVb6VÆV7E÷'Vâ‡6VÆbÂ'Våö–C¢–çB’ÓâæöæS ¢6VÆbæ7W'&VçE÷'Våö–BÒ'Våö–@¢6VÆbæ7W'&VçEö6Æ7VÆF–öâÒ6VÆbæF"æÆöEö6Æ7VÆF–öâ‡'Våö–B¢6VÆbå÷÷VÆFUö÷fW'f–Wr‚¢6VÆbå÷÷VÆFU÷6÷W&6W2‚¢6VÆbå÷÷VÆFUö'&V¶F÷vâ‚¢6VÆbå÷÷VÆFUöwV–FR‚¢6VÆbå÷÷VÆFU÷66Væ&–ò‚¢6VÆbå÷÷VÆFU÷VÆ—G’‚¢6VÆbç7FGW5÷f"ç6WB†b-	í-­½"}]"7·'Våö–GÓ¢µö6Æ7VÆF–öå÷W&–öB‡6VÆbæ7W'&VçEö6Æ7VÆF–öâ—Ò" ¢FVbööå÷'Vå÷6VÆV7FVB‡6VÆbÂöWfVçCÔæöæR’ÓâæöæS ¢'Våö–BÒ6VÆbç'VåöF—7Æ•÷Fõö–BævWB‡6VÆbç'Vå÷f"ævWB‚’¢–b'Våö–B—2æ÷BæöæS ¢6VÆbç6VÆV7E÷'Vâ‡'Våö–B ¢FVbö6ÆV%ö7W'&VçE÷f–Wr‡6VÆb’ÓâæöæS ¢6VÆbæ7W'&VçE÷'Våö–BÒæöæP¢6VÆbæ7W'&VçEö6Æ7VÆF–öâÒæöæP¢f÷"G&VR–â‡6VÆbæ÷fW'f–Wu÷G&VRÂ6VÆbç6÷W&6U÷G&VRÂ6VÆbæ'&V¶F÷vå÷G&VRÂ6VÆbæwV–FU÷G&VRÂ6VÆbç66Væ&–õ÷G&VRÂ6VÆbçVÆ—G•÷G&VR“ ¢G&VRæFVÆWFR‚§G&VRævWEö6†–ÆG&Vâ‚’¢f÷"f&–&ÆR–â6VÆbæ·•÷f'2çfÇVW2‚“ ¢f&–&ÆRç6WB‚.(	B"¢f÷"f&–&ÆR–â6VÆbç66Væ&–õö·•÷f'2çfÇVW2‚“ ¢f&–&ÆRç6WB‚.(	B" ¢FVb÷÷VÆFUö÷fW'f–Wr‡6VÆb’ÓâæöæS ¢6Æ7VÆF–öâÒ6VÆbæ7W'&VçEö6Æ7VÆF–öà¢–b6Æ7VÆF–öâ—2æöæS ¢&WGW&à¢F÷FÇ2Ò6Æ7VÆF–öâçF÷FÇ2‚¢6÷7BÒF÷FÇ5²&6÷7E÷6öÆB%Ğ¢6VÆbæ·•÷f'5²'&WfVçVR%Òç6WB…öÖöæW’‡F÷FÇ5²'&WfVçVR%Ò’¢6VÆbæ·•÷f'5²&æWE÷&öf—B%Òç6WB…öÖöæW’‡F÷FÇ5²&æWE÷&öf—B%Ò’¢6VÆbæ·•÷f'5²'&öf—F&–Æ—G’%Òç6WB…÷W&6VçB‡F÷FÇ5²&æWE÷&öf—B%Òò6÷7B–b6÷7BVÇ6R’¢6VÆbæ·•÷f'5²'Væ—G2%Òç6WB…öçVÖ&W"‡F÷FÇ5²'Væ—G2%Ò’¢6VÆbæ·•÷f'5²'VæÆÆö6FVB%Òç6WB…öÖöæW’‡F÷FÇ5²'VæÆÆö6FVB%Ò’¢6VÆbæ·•÷f'5²&f–ÆW2%Òç6WB‡7G"†ÆVâ‡6VÆbæF"æÆ—7E÷6÷W&6Uöf–ÆW2†6Æ7VÆF–öâç'Våö–B÷"’’’¢6VÆbæ÷fW'f–Wu÷G&VRæFVÆWFR‚§6VÆbæ÷fW'f–Wu÷G&VRævWEö6†–ÆG&Vâ‚’¢f÷"&W7VÇB–â6Æ7VÆF–öâç&öGV7G3 ¢fÇVW2Ò÷&W7VÇE÷fÇVW2‡&W7VÇBÂ6Æ7VÆF–öâçF…÷&FR¢FrÒ&æVvF—fR"–b&W7VÇBææWE÷&öf—B†6Æ7VÆF–öâçF…÷&FR’ÂVÇ6R'÷6—F—fR ¢6VÆbæ÷fW'f–Wu÷G&VRæ–ç6W'B‚""Â&VæB"Â––C×&W7VÇBæ'F–6ÆRÂfÇVW3×fÇVW2ÂFw3Ò‡FrÂ’¢6VÆbåö6öæf–wW&U÷fÇVU÷Fw2‡6VÆbæ÷fW'f–Wu÷G&VR ¢FVb÷÷VÆFU÷6÷W&6W2‡6VÆb’ÓâæöæS ¢–b6VÆbæ7W'&VçE÷'Våö–B—2æöæS ¢&WGW&à¢6÷W&6W2Ò6VÆbæF"æÆ—7E÷6÷W&6Uöf–ÆW2‡6VÆbæ7W'&VçE÷'Våö–B¢6VÆbç6÷W&6U÷G&VRæFVÆWFR‚§6VÆbç6÷W&6U÷G&VRævWEö6†–ÆG&Vâ‚’¢6VÆbç6÷W&6Uö'•ö––Bæ6ÆV"‚¢f÷"&÷r–â6÷W&6W3 ¢––BÒ7G"‡&÷u²&–B%Ò¢6VÆbç6÷W&6Uö'•ö––E¶––EÒÒ&÷p¢&W÷'E÷G—RÒ-	İ}½]İò"–b&÷u²'&W÷'E÷G—R%ÒÓÒ$45%TÂ"VÇ6R-	-½­=ı½]İİ½R-í-² ¢W&–öBÒ÷W&–öE÷FW‡B‡&÷rævWB‚'W&–öE÷7F'B"’Â&÷rævWB‚'W&–öEöVæB"’¢6VÆbç6÷W&6U÷G&VRæ–ç6W'B€¢""À¢&VæB"À¢––CÖ––BÀ¢fÇVW3Ò‡&÷u²&÷&–v–æÅöæÖR%ÒÂ&W÷'E÷G—RÂ&÷u²'&÷uö6÷VçB%ÒÂöÖöæW’†fÆöB‡&÷u²'F÷FÅöÖ÷VçB%Ò’’ÂW&–öBÂ7G"‡&÷u²&f–ÆUö†6‚%Ò•³£#EÒ’À¢¢–b6÷W&6W3 ¢f—'7BÒ7G"‡6÷W&6W5³Õ²&–B%Ò¢6VÆbç6÷W&6U÷G&VRç6VÆV7F–öå÷6WB†f—'7B¢6VÆbç6÷W&6U÷G&VRæfö7W2†f—'7B¢6VÆbåööå÷6÷W&6U÷6VÆV7FVB‚ ¢FVbööå÷6÷W&6U÷6VÆV7FVB‡6VÆbÂöWfVçCÔæöæR’ÓâæöæS ¢6VÆV7F–öâÒ6VÆbç6÷W&6U÷G&VRç6VÆV7F–öâ‚¢–bæ÷B6VÆV7F–öã ¢&WGW&à¢6÷W&6RÒ6VÆbç6÷W&6Uö'•ö––BævWB‡6VÆV7F–öå³Ò¢–b6÷W&6R—2æöæS ¢&WGW&à¢G'“ ¢6VÆbç&Wf–Wu÷F‚Ò7G"‡6÷W&6U²'7F÷&VE÷F‚%Ò¢6VÆbç&Wf–Wuöf–ÆU÷f"ç6WB†b-
+M³¢·6÷W&6U²v÷&–v–æÅöæÖRu×Ò"¢6†VWG2Òv÷&¶&ööµ÷6†VWEöæÖW2‡6VÆbç&Wf–Wu÷F‚¢6VÆbç6†VWEö6öÖ&õ²'fÇVW2%ÒÒ6†VWG0¢&VfW'&VBÒ7G"‡6÷W&6U²'6†VWEöæÖR%Ò¢6VÆbç6†VWE÷f"ç6WB‡&VfW'&VB–b&VfW'&VB–â6†VWG2VÇ6R6†VWG5³Ò¢6VÆbåöÆöE÷&Wf–Wr‚¢W†6WBW†6WF–öâ2W†3 ¢ÖW76vV&÷‚ç6†÷vW'&÷"‚-	ıíÍí-M½"Â7G"†W†2’Â&VçC×6VÆb ¢FVböÆöE÷&Wf–Wr‡6VÆb’ÓâæöæS ¢–bæ÷B6VÆbç&Wf–Wu÷F‚÷"æ÷B6VÆbç6†VWE÷f"ævWB‚“ ¢&WGW&à¢Ö…÷&÷w2Ò–çB‡6VÆbæF"ævWE÷6WGF–ær‚'&Wf–Wu÷&÷w2"Â#S"’¢G'“ ¢6VÆbç&Wf–Wuö†VFW'2Â6VÆbç&Wf–Wu÷&÷w2Ò&Wf–Wu÷6†VWB€¢6VÆbç&Wf–Wu÷F‚Â6VÆbç6†VWE÷f"ævWB‚’ÂÖ…÷&÷w3ÖÖ…÷&÷w0¢¢6VÆbåöf–ÇFW%÷&Wf–Wr‚¢W†6WBW†6WF–öâ2W†3 ¢ÖW76vV&÷‚ç6†÷vW'&÷"‚-	ıíÍí-M½"Â7G"†W†2’Â&VçC×6VÆb ¢FVb'&÷w6U÷†Ç7…÷&Wf–Wr‡6VÆb’ÓâæöæS ¢F‚Òf–ÆVF–Æöræ6¶÷Væf–ÆVæÖR€¢F—FÆSÒ-	ıíÍí-]-Â­İ=2]rW†6VÂ"À¢f–ÆWG—W3Õ²‚-	­İ=‚W†6VÂ"Â"¢ç†Ç7‚"•ÒÀ¢&VçC×6VÆbÀ¢¢–bæ÷BFƒ ¢&WGW&à¢G'“ ¢6†VWG2Òv÷&¶&ööµ÷6†VWEöæÖW2‡F‚¢–bæ÷B6†VWG3 ¢&—6RfÇVTW'&÷"‚-	"­İ=Rİ]"½-í""¢6VÆbç&Wf–Wu÷F‚ÒF€¢6VÆbç&Wf–Wuöf–ÆU÷f"ç6WB†b-
+M³¢µF‚‡F‚’ææÖWÒ+r-í½Í­âıíÍí-"¢6VÆbç6†VWEö6öÖ&õ²'fÇVW2%ÒÒ6†VWG0¢6VÆbç6†VWE÷f"ç6WB‡6†VWG5³Ò¢6VÆbç6÷W&6U÷G&VRç6VÆV7F–öå÷&VÖ÷fR‚§6VÆbç6÷W&6U÷G&VRç6VÆV7F–öâ‚’¢6VÆbåöÆöE÷&Wf–Wr‚¢W†6WBW†6WF–öâ2W†3 ¢ÖW76vV&÷‚ç6†÷vW'&÷"‚-	ıíÍí-M½"Â7G"†W†2’Â&VçC×6VÆb ¢FVböf–ÇFW%÷&Wf–Wr‡6VÆb’ÓâæöæS ¢VW'’Ò6VÆbç&Wf–Wu÷6V&6…÷f"ævWB‚’æ66VföÆB‚’ç7G&—‚¢&÷w2Ò6VÆbç&Wf–Wu÷&÷w0¢–bVW'“ ¢&÷w2Ò·&÷rf÷"&÷r–â&÷w2–bVW'’–â"Â"æ¦ö–â‡&÷r’æ66VföÆB‚•Ğ¢6VÆbå÷&VæFW%÷&Wf–Wu÷G&VR‡6VÆbç&Wf–Wuö†VFW'2Â&÷w2 ¢FVb÷&VæFW%÷&Wf–Wu÷G&VR‡6VÆbÂ†VFW'3¢Æ—7E·7G%ÒÂ&÷w3¢Æ—7E¶Æ—7E·7G%ÕÒ’ÓâæöæS ¢–b6VÆbç&Wf–Wu÷G&VR—2æ÷BæöæS ¢6VÆbç&Wf–Wu÷G&VRæÖ7FW"æFW7G&÷’‚¢–bæ÷B†VFW'3 ¢&WGW&à¢6öÇVÖç2Ò¶b&7¶–æFW‡Ò"f÷"–æFW‚–â&ævR†ÆVâ††VFW'2’•Ğ¢g&ÖRÒGF²äg&ÖR‡6VÆbç&Wf–Wuö6öçF–æW"¢g&ÖRæw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò&ç6Wr"¢g&ÖRæ6ıw÷-¢G§²ÚîÆ­yİİ}½Íıí-=-R½‚-½]-R}]""Â&VçC×6VÆb¢&WGW&à¢FW7F–æF–öâÒf–ÆVF–Æöræ6·6fV6f–ÆVæÖR€¢F—FÆSÒ-
+í]İ-Â-í=í-½’í-}]""À¢FVfVÇFW‡FVç6–öãÒ"ç†Ç7‚"À¢–æ—F–ÆF—#×7G"‡6VÆbç6W'f–6RçF‡5²&W‡÷'G2%Ò’À¢–æ—F–Æf–ÆS×7VvvW7FVEöW‡÷'EöæÖR‡6VÆbæ7W'&VçEö6Æ7VÆF–öâ’À¢f–ÆWG—W3Õ²‚-	­İ=W†6VÂ"Â"¢ç†Ç7‚"•ÒÀ¢&VçC×6VÆbÀ¢¢–bæ÷BFW7F–æF–öã ¢&WGW&à¢G'“ ¢F‚ÒW‡÷'E÷'Vâ‡6VÆbæF"Â6VÆbæ7W'&VçE÷'Våö–BÂFW7F–æF–öâ¢ÖW76vV&÷‚ç6†÷v–æfò‚-
+İ­ıí""Âb-	í-}]"í]İ]Ó¥Æç·F‡Ò"Â&VçC×6VÆb¢W†6WBW†6WF–öâ2W†3 ¢ÖW76vV&÷‚ç6†÷vW'&÷"‚-
+İ­ıí""Â7G"†W†2’Â&VçC×6VÆb ¢FVbö6öæf–wW&U÷fÇVU÷Fw2‡6VÆbÂG&VS¢GF²åG&VWf–Wr’ÓâæöæS ¢ÆWGFRÒ6VÆbæ6öÆ÷'0¢G&VRçFuö6öæf–wW&R‚&æVvF—fR"Âf÷&Vw&÷VæC×ÆWGFU²&æVvF—fR%Ò¢G&VRçFuö6öæf–wW&R‚'÷6—F—fR"Âf÷&Vw&÷VæC×ÆWGFU²'÷6—F—fR%Ò¢G&VRçFuö6öæf–wW&R‚'v&æ–ær"Âf÷&Vw&÷VæC×ÆWGFU²'v&æ–ær%Ò¢G&VRçFuö6öæf–wW&R‚'F÷FÂ"Â&6¶w&÷VæC×ÆWGFU²'7W&f6UöÇB%ÒÂf÷&Vw&÷VæC×ÆWGFU²'FW‡B%Ò¢G&VRçFuö6öæf–wW&R‚&×WFVB"Âf÷&Vw&÷VæC×ÆWGFU²&×WFVB%Ò  ¦6Æ72&÷WDF–Æör‡F²åF÷ÆWfVÂ“ ¢FVbõö–æ—Eõò‡6VÆbÂ&VçC¢õ¥&–6TæÇ—¦W$“ ¢7WW"‚’åõö–æ—Eõò‡&VçB¢6VÆbçF—FÆR‚-	âıí=ÍÍR"¢6VÆbçG&ç6–VçB‡&VçB¢6VÆbæw&%÷6WB‚¢6VÆbç&W6—¦&ÆR„fÇ6RÂfÇ6R¢6VÆbæ6öæf–wW&R†&6¶w&÷VæC×&VçBæ6öÆ÷'5²'v–æF÷r%Ò¢6VÆbæ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ ¢GF²äÆ&VÂ‡6VÆbÂFW‡CÔõD•DÄRÂ7G–ÆSÒ%F—FÆRåDÆ&VÂ"’æw&–B€¢&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂGƒÓ#BÂG“Òƒ#"Â"¢¢GF²äÆ&VÂ‡6VÆbÂFW‡CÖb-	-]ò´õdU%4”ôçÒ"Â7G–ÆSÒ%6V7F–öâåDÆ&VÂ"’æw&–B€¢&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂGƒÓ#@¢¢GF²äÆ&VÂ€¢6VÆbÀ¢FW‡CÒ-	½í­½Íİ½’İ½rí-}]-í"÷¦öâÂ­íİ-í½Âİ}½]İ’Â-íò‚m]İ‚Mí]íMİí-‚â"À¢7G–ÆSÒ$×WFVBåDÆ&VÂ"À¢w&ÆVæwFƒÓScÀ¢§W7F–g“Ò&ÆVgB"À¢’æw&–B‡&÷sÓ"Â6öÇVÖãÓÂ7F–6·“Ò'r"ÂGƒÓ#BÂG“ÒƒÂB’ ¢FWF–Ç2ÒGF²äÆ&VÄg&ÖR‡6VÆbÂFW‡CÒ-
+-]M]İò"ÂFF–æsÒƒBÂ’¢FWF–Ç2æw&–B‡&÷sÓ2Â6öÇVÖãÓÂ7F–6·“Ò&Wr"ÂGƒÓ#B¢FWF–Ç2æ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢'V–ÆE÷G—RÒ-	--íİíÍİòv–æF÷w2İí­"–bvWFGG"‡7—2Â&g&÷¦Vâ"ÂfÇ6R’VÇ6R-	}ı=¢r—F†öâ ¢f÷"&÷rÂ†Æ&VÂÂfÇVR’–âVçVÖW&FR€¢°¢‚-
+-ò}ı=­"Â'V–ÆE÷G—R’À¢‚-
+]İ½RMİİ½R"Â7G"‡&VçBç6W'f–6RçF‡5²'&ö÷B%Ò’’À¢‚-
+]ıí}-í’"Â&v—F‡V"æ6öÒö÷FFVÇg6Vvò×7V2ôõ¥&–6TæÇ—¦W""’À¢Ğ¢“ ¢GF²äÆ&VÂ†FWF–Ç2ÂFW‡CÖb'¶Æ&VÇÓ¢"’æw&–B‡&÷s×&÷rÂ6öÇVÖãÓÂ7F–6·“Ò&çr"ÂGƒÒƒÂ"’ÂG“Ó2¢GF²äÆ&VÂ†FWF–Ç2ÂFW‡C×fÇVRÂ7G–ÆSÒ$×WFVBåDÆ&VÂ"Âw&ÆVæwFƒÓC3’æw&–B€¢&÷s×&÷rÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂG“Ó0¢ ¢GF²äÆ&VÂ€¢6VÆbÀ¢FW‡CÒ$Ö–7&÷6ögBW†6VÂİR-]=]-òâ	-Rí}RMİİ½Rí-í-òİİ-íÂ­íÍıÍí-]Râ"À¢7G–ÆSÒ$×WFVBåDÆ&VÂ"À¢’æw&–B‡&÷sÓBÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂGƒÓ#BÂG“Òƒ"ÂB’ ¢'WGFöç2ÒGF²äg&ÖR‡6VÆbÂFF–æsÒƒ#ÂB’¢'WGFöç2æw&–B‡&÷sÓRÂ6öÇVÖãÓÂ7F–6·“Ò&R"¢GF²ä'WGFöâ€¢'WGFöç2À¢FW‡CÒ-	í-­½-Â]İ½R"À¢6öÖÖæCÖÆÖ&F¢ö÷Vå÷F‚‡&VçBç6W'f–6RçF‡5²'&ö÷B%Ò’À¢’æw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÓB¢GF²ä'WGFöâ€¢'WGFöç2À¢FW‡CÒ-	í-­½-Âv—D‡V""À¢6öÖÖæCÖÆÖ&F¢vV&'&÷w6W"æ÷Vâ‚&‡GG3¢òöv—F‡V"æ6öÒö÷FFVÇg6Vvò×7V2ôõ¥&–6TæÇ—¦W""’À¢’æw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÓB¢GF²ä'WGFöâ†'WGFöç2ÂFW‡CÒ-	}­½-Â"Â7G–ÆSÒ$66VçBåD'WGFöâ"Â6öÖÖæC×6VÆbæFW7G&÷’’æw&–B€¢&÷sÓÂ6öÇVÖãÓ"ÂGƒÓ@¢¢6VÆbæ&–æB‚#ÄW66Sâ"ÂÆÖ&FöWfVçC¢6VÆbæFW7G&÷’‚’  ¦6Æ726÷7D6FÆötVF—F÷$F–Æör‡F²åF÷ÆWfVÂ“ ¢FVbõö–æ—Eõò‡6VÆbÂ&VçC¢õ¥&–6TæÇ—¦W$Â&öGV7G3¢Æ—7Eµ&öGV7EÒ“ ¢7WW"‚’åõö–æ—Eõò‡&VçB¢6VÆbçF—FÆR‚-
+]M­-í-í-í"‚]]-íÍí-‚"¢6VÆbævVöÖWG'’‚##ƒƒsc"¢6VÆbæÖ–ç6—¦Rƒ#ÂcS¢6VÆbçG&ç6–VçB‡&VçB¢6VÆbæw&%÷6WB‚¢6VÆbæ6æ6VÆÆVBÒG'VP¢6VÆbç&öGV7G3¢Æ—7Eµ&öGV7EÒÒµĞ¢6VÆbæ'F–6ÆUö÷&FW#¢Æ—7E·7G%ÒÒµĞ¢6VÆbæ÷&FW%ö6†ævVBÒfÇ6P¢6VÆbç&öGV7EöÖÒ°¢&öGV7Bæ'F–6ÆS¢&öGV7B€¢'F–6ÆS×&öGV7Bæ'F–6ÆRÀ¢æÖS×&öGV7BææÖRÀ¢ÖFW&–Åö6÷7C×&öGV7BæÖFW&–Åö6÷7BÀ¢Æ&÷%ö6÷7C×&öGV7BæÆ&÷%ö6÷7BÀ¢7F—fS×&öGV7Bæ7F—fRÀ¢6÷'Eö÷&FW#×&öGV7Bç6÷'Eö÷&FW"À¢¢f÷"&öGV7B–â&öGV7G0¢Ğ¢6VÆbç&öGV7Eö÷&FW"Ò·&öGV7Bæ'F–6ÆRf÷"&öGV7B–â&öGV7G5Ğ¢6VÆbæ÷&–v–æÅö÷&FW"ÒÆ—7B‡6VÆbç&öGV7Eö÷&FW"¢6VÆbæ÷&–v–æÅö'F–6ÆW2Ò6WB‡6VÆbç&öGV7EöÖ¢6VÆbæ7W'&VçEö'F–6ÆS¢7G"ÂæöæRÒæöæP¢6VÆbæÆöF–ærÒfÇ6P¢6VÆbæF—'G’ÒfÇ6P ¢6VÆbæ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢6VÆbç&÷v6öæf–wW&Rƒ2ÂvV–v‡CÓ¢GF²äÆ&VÂ‡6VÆbÂFW‡CÒ-
+-í-²‚]]-íÍí-Â"Â7G–ÆSÒ%6V7F–öâåDÆ&VÂ"’æw&–B€¢&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂGƒÓ#ÂG“Òƒ‚Â"¢¢GF²äÆ&VÂ€¢6VÆbÀ¢FW‡CÒ€¢-	}ıí½İı-Rı-í}İ¢ııÍâ}M]Ââ	ıí½İò]]-íÍí-Âí-í"rÍ-]½‚-=Mí}-"â ¢-	ı]]Bí­íİ}-]½Íİ½Âí]İ]İ]Âı½ím]İRıí­m]"-R}Í]İ]İòâ ¢’À¢7G–ÆSÒ$×WFVBåDÆ&VÂ"À¢’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂGƒÓ#ÂG“ÒƒÂ’ ¢6öçG&öÇ2ÒGF²äg&ÖR‡6VÆb¢6öçG&öÇ2æw&–B‡&÷sÓ"Â6öÇVÖãÓÂ7F–6·“Ò&Wr"ÂGƒÓ#ÂG“ÒƒÂ‚’¢6öçG&öÇ2æ6öÇVÖæ6öæf–wW&Rƒ"ÂvV–v‡CÓ¢GF²äÆ&VÂ†6öçG&öÇ2ÂFW‡CÒ-	ıí£¢"’æw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÒƒÂb’¢6VÆbç6V&6…÷f"ÒF²å7G&–æuf"‚¢GF²äVçG'’†6öçG&öÇ2ÂFW‡Gf&–&ÆS×6VÆbç6V&6…÷f"Âv–GFƒÓ3"’æw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÒƒÂ"’¢6VÆbç6V&6…÷f"çG&6UöFB‚'w&—FR"ÂÆÖ&F¥ö&w3¢6VÆbå÷&Vg&W6…÷G&VR‚’¢6VÆbæ6÷VçE÷f"ÒF²å7G&–æuf"‚¢GF²äÆ&VÂ†6öçG&öÇ2ÂFW‡Gf&–&ÆS×6VÆbæ6÷VçE÷f"Â7G–ÆSÒ$×WFVBåDÆ&VÂ"’æw&–B‡&÷sÓÂ6öÇVÖãÓ"Â7F–6·“Ò'r"¢GF²ä'WGFöâ†6öçG&öÇ2ÂFW‡CÒ.(i	--]R"Â6öÖÖæCÖÆÖ&F¢6VÆbåöÖ÷fU÷6VÆV7FVB‚Ó’’æw&–B€¢&÷sÓÂ6öÇVÖãÓ2ÂGƒÓ0¢¢GF²ä'WGFöâ†6öçG&öÇ2ÂFW‡CÒ.(i2	-İr"Â6öÖÖæCÖÆÖ&F¢6VÆbåöÖ÷fU÷6VÆV7FVBƒ’’æw&–B€¢&÷sÓÂ6öÇVÖãÓBÂGƒÓ0¢¢GF²ä'WGFöâ†6öçG&öÇ2ÂFW‡CÒ-	İí-òıí}mò"Â7G–ÆSÒ$66VçBåD'WGFöâ"Â6öÖÖæC×6VÆbåöæWu÷&öGV7B’æw&–B€¢&÷sÓÂ6öÇVÖãÓRÂGƒÒƒ‚Â¢ ¢6öçF–æW"ÒGF²äg&ÖR‡6VÆb¢6öçF–æW"æw&–B‡&÷sÓ2Â6öÇVÖãÓÂ7F–6·“Ò&ç6Wr"ÂGƒÓ#¢6öçF–æW"æ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢6öçF–æW"ç&÷v6öæf–wW&RƒÂvV–v‡CÓ¢6öÇVÖç2Ò‚&'F–6ÆR"Â&æÖR"Â'F÷FÂ"Â&ÖFW&–Â"Â&Æ&÷""Â'7FGW2"¢6VÆbçG&VRÒGF²åG&VWf–Wr†6öçF–æW"Â6öÇVÖç3Ö6öÇVÖç2Â6†÷sÒ&†VF–æw2"Â6VÆV7FÖöFSÒ&'&÷w6R"¢†VF–æw2Ò²-	-­=²"Â-	İÍ]İí-İR"Â-	ıí½İò]]-íÍí-Â"Â-	Í-]²"Â-
+-=Mí}--²"Â-
+--=%Ğ¢v–GF‡2Ò³SÂ3CÂsÂSÂSÂĞ¢f÷"6öÇVÖâÂ†VF–ærÂv–GF‚–â¦—†6öÇVÖç2Â†VF–æw2Âv–GF‡2“ ¢6VÆbçG&VRæ†VF–ær†6öÇVÖâÂFW‡CÖ†VF–ær¢6VÆbçG&VRæ6öÇVÖâ€¢6öÇVÖâÀ¢v–GFƒ×v–GF‚À¢Ö–çv–GFƒÓƒÀ¢7G&WF6ƒÔfÇ6RÀ¢æ6†÷#Ò'r"–b6öÇVÖâ–â²&'F–6ÆR"Â&æÖR"Â'7FGW2'ÒVÇ6R&R"À¢¢‡67&öÆÂÒGF²å67&öÆÆ&"†6öçF–æW"Â÷&–VçCÒ&†÷&—¦öçFÂ"Â6öÖÖæC×6VÆbçG&VRç‡f–Wr¢—67&öÆÂÒGF²å67&öÆÆ&"†6öçF–æW"Â÷&–VçCÒ'fW'F–6Â"Â6öÖÖæC×6VÆbçG&VRç—f–Wr¢6VÆbçG&VRæ6öæf–wW&R‡‡67&öÆÆ6öÖÖæC×‡67&öÆÂç6WBÂ—67&öÆÆ6öÖÖæC×—67&öÆÂç6WB¢6VÆbçG&VRæw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò&ç6Wr"¢—67&öÆÂæw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò&ç2"¢‡67&öÆÂæw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò&Wr"¢6VÆbçG&VRæ&–æB‚#ÃÅG&VWf–Wu6VÆV7Cãâ"Â6VÆbåööå÷6VÆV7B¢6VÆbçG&VRæ&–æB‚#ÄF÷V&ÆRÓâ"ÂÆÖ&FöWfVçC¢6VÆbææÖUöVçG'’æfö7W5÷6WB‚’¢6VÆbçG&VRçFuö6öæf–wW&R‚&×WFVB"Âf÷&Vw&÷VæC×&VçBæ6öÆ÷'5²&×WFVB%Ò ¢VF—F÷"ÒGF²äÆ&VÄg&ÖR‡6VÆbÂFW‡CÒ-
+]M­-í-İR-½İİí’ıí}m‚"ÂFF–æsÒƒBÂ’¢VF—F÷"æw&–B‡&÷sÓBÂ6öÇVÖãÓÂ7F–6·“Ò&Wr"ÂGƒÓ#ÂG“Òƒ"Â’¢VF—F÷"æ6öÇVÖæ6öæf–wW&Rƒ2ÂvV–v‡CÓ¢6VÆbæ'F–6ÆU÷f"ÒF²å7G&–æuf"‚¢6VÆbææÖU÷f"ÒF²å7G&–æuf"‚¢6VÆbçF÷FÅ÷f"ÒF²å7G&–æuf"‚¢6VÆbæÆ&÷%÷f"ÒF²å7G&–æuf"‡fÇVSÒ#"¢6VÆbæÖFW&–Å÷f"ÒF²å7G&–æuf"‡fÇVSÒ.(	B"¢6VÆbæ7F—fU÷f"ÒF²ä&ööÆVåf"‡fÇVSÕG'VR¢GF²äÆ&VÂ†VF—F÷"ÂFW‡CÒ-	-­=³¢"’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂGƒÒƒÂb’ÂG“ÓB¢6VÆbæ'F–6ÆUöVçG'’ÒGF²äVçG'’†VF—F÷"ÂFW‡Gf&–&ÆS×6VÆbæ'F–6ÆU÷f"Âv–GFƒÓ#"¢6VÆbæ'F–6ÆUöVçG'’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂGƒÒƒÂ‚’ÂG“ÓB¢GF²äÆ&VÂ†VF—F÷"ÂFW‡CÒ-	İÍ]İí-İS¢"’æw&–B‡&÷sÓÂ6öÇVÖãÓ"Â7F–6·“Ò'r"ÂGƒÒƒÂb’ÂG“ÓB¢6VÆbææÖUöVçG'’ÒGF²äVçG'’†VF—F÷"ÂFW‡Gf&–&ÆS×6VÆbææÖU÷f"¢6VÆbææÖUöVçG'’æw&–B‡&÷sÓÂ6öÇVÖãÓ2Â7F–6·“Ò&Wr"ÂGƒÒƒÂ‚’ÂG“ÓB¢GF²ä6†V6¶'WGFöâ†VF—F÷"ÂFW‡CÒ-	­--]Ò"Âf&–&ÆS×6VÆbæ7F—fU÷f"’æw&–B‡&÷sÓÂ6öÇVÖãÓBÂ7F–6·“Ò'r"ÂG“ÓB ¢GF²äÆ&VÂ†VF—F÷"ÂFW‡CÒ-	ıí½İò]]-íÍí-ÂÂ=ã¢"’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂGƒÒƒÂb’ÂG“ÓB¢GF²äVçG'’†VF—F÷"ÂFW‡Gf&–&ÆS×6VÆbçF÷FÅ÷f"Âv–GFƒÓ#"’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂGƒÒƒÂ‚’ÂG“ÓB¢GF²äÆ&VÂ†VF—F÷"ÂFW‡CÒ-
+-=Mí}--²Â=ã¢"’æw&–B‡&÷sÓÂ6öÇVÖãÓ"Â7F–6·“Ò'r"ÂGƒÒƒÂb’ÂG“ÓB¢GF²äVçG'’†VF—F÷"ÂFW‡Gf&–&ÆS×6VÆbæÆ&÷%÷f"Âv–GFƒÓ‚’æw&–B‡&÷sÓÂ6öÇVÖãÓ2Â7F–6·“Ò'r"ÂG“ÓB¢GF²äÆ&VÂ†VF—F÷"ÂFW‡CÒ-	Í-]²}-½-]-ò--íÍ-}]­ƒ¢"’æw&–B€¢&÷sÓ"Â6öÇVÖãÓÂ6öÇVÖç7ãÓ"Â7F–6·“Ò'r"ÂG“ÒƒBÂ¢¢GF²äÆ&VÂ†VF—F÷"ÂFW‡Gf&–&ÆS×6VÆbæÖFW&–Å÷f"Â7G–ÆSÒ%6V7F–öâåDÆ&VÂ"’æw&–B€¢&÷sÓ"Â6öÇVÖãÓ"Â7F–6·“Ò'r"ÂG“ÒƒBÂ¢¢GF²ä'WGFöâ†VF—F÷"ÂFW‡CÒ-	ıÍ]İ-Â"-½m2"Â6öÖÖæC×6VÆbåö6öÖÖ—Eö7W'&VçB’æw&–B€¢&÷sÓ"Â6öÇVÖãÓBÂ7F–6·“Ò&R"ÂG“ÒƒBÂ¢ ¢f÷"f&–&ÆR–â‡6VÆbæ'F–6ÆU÷f"Â6VÆbææÖU÷f"Â6VÆbçF÷FÅ÷f"Â6VÆbæÆ&÷%÷f"“ ¢f&–&ÆRçG&6UöFB‚'w&—FR"Â6VÆbåöf–VÆEö6†ævVB¢6VÆbæ7F—fU÷f"çG&6UöFB‚'w&—FR"Â6VÆbåöf–VÆEö6†ævVB ¢'WGFöç2ÒGF²äg&ÖR‡6VÆbÂFF–æsÒƒ#ÂB’¢'WGFöç2æw&–B‡&÷sÓRÂ6öÇVÖãÓÂ7F–6·“Ò&R"¢GF²ä'WGFöâ†'WGFöç2ÂFW‡CÒ-	í-Í]İ"Â6öÖÖæC×6VÆbæFW7G&÷’’æw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÓB¢GF²ä'WGFöâ€¢'WGFöç2À¢FW‡CÒ-	ıí-]-Â‚í]İ-Âı-í}İ¢"À¢7G–ÆSÒ$66VçBåD'WGFöâ"À¢6öÖÖæC×6VÆbåöf–æ—6‚À¢’æw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÓB¢6VÆbæ&–æB‚#Ä6öçG&öÂ×3â"ÂÆÖ&FöWfVçC¢6VÆbåöf–æ—6‚‚’¢6VÆbæ&–æB‚#ÄW66Sâ"ÂÆÖ&FöWfVçC¢6VÆbæFW7G&÷’‚’ ¢6VÆbå÷&Vg&W6…÷G&VR‚¢f—'7BÒæW‡B†—FW"‡6VÆbç&öGV7EöÖ’ÂæöæR¢–bf—'7C ¢6VÆbå÷6VÆV7Eö'F–6ÆR†f—'7B¢VÇ6S ¢6VÆbåöæWu÷&öGV7B‚ ¢FVböf–VÆEö6†ævVB‡6VÆbÂ¥ö&w2’ÓâæöæS ¢–b6VÆbæÆöF–æs ¢&WGW&à¢6VÆbæF—'G’ÒG'VP¢G'“ ¢F÷FÂÒ÷'6UöçVÖ&W"‡6VÆbçF÷FÅ÷f"ævWB‚’¢Æ&÷"Ò÷'6UöçVÖ&W"‡6VÆbæÆ&÷%÷f"ævWB‚’÷"#"¢6VÆbæÖFW&–Å÷f"ç6WB…öÖöæW’‡F÷FÂÒÆ&÷"’–bF÷FÂãÒÆ&÷"ãÒVÇ6R-	ıí-]Í-R}İ}]İò"¢W†6WBfÇVTW'&÷# ¢6VÆbæÖFW&–Å÷f"ç6WB‚.(	B" ¢FVb÷&Vg&W6…÷G&VR‡6VÆb’ÓâæöæS ¢–bæ÷B†6GG"‡6VÆbÂ'G&VR"“ ¢&WGW&à¢VW'’Ò6VÆbç6V&6…÷f"ævWB‚’ç7G&—‚’æ66VföÆB‚¢6VÆV7FVBÒ6VÆbæ7W'&VçEö'F–6ÆP¢6VÆbæÆöF–ærÒG'VP¢G'“ ¢6VÆbçG&VRæFVÆWFR‚§6VÆbçG&VRævWEö6†–ÆG&Vâ‚’¢f—6–&ÆRÒ°¢6VÆbç&öGV7EöÖ¶'F–6ÆUĞ¢f÷"'F–6ÆR–â6VÆbç&öGV7Eö÷&FW ¢–b'F–6ÆR–â6VÆbç&öGV7EöÖ ¢æB€¢æ÷BVW'¢÷"VW'’–â'F–6ÆRæ66VföÆB‚¢÷"VW'’–â6VÆbç&öGV7EöÖ¶'F–6ÆUÒææÖRæ66VföÆB‚¢¢Ğ¢f÷"&öGV7B–âf—6–&ÆS ¢6VÆbçG&VRæ–ç6W'B€¢""À¢&VæB"À¢––C×&öGV7Bæ'F–6ÆRÀ¢fÇVW3Ò€¢&öGV7Bæ'F–6ÆRÀ¢&öGV7BææÖRÀ¢öÖöæW’‡&öGV7BçF÷FÅö6÷7B’À¢öÖöæW’‡&öGV7BæÖFW&–Åö6÷7B’À¢öÖöæW’‡&öGV7BæÆ&÷%ö6÷7B’À¢-	­--]Ò"–b&öGV7Bæ7F—fRVÇ6R-	]""À¢’À¢Fw3Ò‚""–b&öGV7Bæ7F—fRVÇ6R&×WFVB"Â’À¢¢6VÆbæ6÷VçE÷f"ç6WB†b-	ıí­}İã¢¶ÆVâ‡f—6–&ÆR—Òr¶ÆVâ‡6VÆbç&öGV7EöÖ—Ò"¢–b6VÆV7FVBæB6VÆbçG&VRæW†—7G2‡6VÆV7FVB“ ¢6VÆbçG&VRç6VÆV7F–öå÷6WB‡6VÆV7FVB¢6VÆbçG&VRæfö7W2‡6VÆV7FVB¢f–æÆÇ“ ¢6VÆbæÆöF–ærÒfÇ6P ¢FVböÖ÷fU÷6VÆV7FVB‡6VÆbÂF—&V7F–öã¢–çB’ÓâæöæS ¢–b6VÆbç6V&6…÷f"ævWB‚’ç7G&—‚“ ¢ÖW76vV&÷‚ç6†÷v–æfò€¢-	ıíıMí¢-í-í""À¢-	í}--Rıí¢Â}-í²Í]İı-Âıí}m‚"ıí½İíÂı­Râ"À¢&VçC×6VÆbÀ¢¢&WGW&à¢6VÆV7F–öâÒ6VÆbçG&VRç6VÆV7F–öâ‚¢–bæ÷B6VÆV7F–öã ¢ÖW76vV&÷‚ç6†÷v–æfò‚-	ıíıMí¢-í-í""Â-	-½]-Rıí}mâ"-½mR"Â&VçC×6VÆb¢&WGW&à¢–b6VÆbæF—'G’æBæ÷B6VÆbåö6öÖÖ—Eö7W'&VçB‚“ ¢&WGW&à¢'F–6ÆRÒ6VÆV7F–öå³Ğ¢–æFW‚Ò6VÆbç&öGV7Eö÷&FW"æ–æFW‚†'F–6ÆR¢F&vWBÒ–æFW‚²F—&V7F–öà¢–bF&vWBÂ÷"F&vWBãÒÆVâ‡6VÆbç&öGV7Eö÷&FW"“ ¢&WGW&à¢6VÆbç&öGV7Eö÷&FW%¶–æFW…ÒÂ6VÆbç&öGV7Eö÷&FW%·F&vWEÒÒ€¢6VÆbç&öGV7Eö÷&FW%·F&vWEÒÀ¢6VÆbç&öGV7Eö÷&FW%¶–æFW…ÒÀ¢¢6VÆbå÷&Vg&W6…÷G&VR‚¢6VÆbå÷6VÆV7Eö'F–6ÆR†'F–6ÆR ¢FVbööå÷6VÆV7B‡6VÆbÂöWfVçCÔæöæR’ÓâæöæS ¢–b6VÆbæÆöF–æs ¢&WGW&à¢6VÆV7F–öâÒ6VÆbçG&VRç6VÆV7F–öâ‚¢–bæ÷B6VÆV7F–öã ¢&WGW&à¢F&vWBÒ6VÆV7F–öå³Ğ¢–bF&vWBÓÒ6VÆbæ7W'&VçEö'F–6ÆS ¢&WGW&à¢–b6VÆbæF—'G“ ¢ç7vW"ÒÖW76vV&÷‚æ6·–W6æö6æ6VÂ€¢-	İ]í]İ]İİò-í­"À¢-	ıÍ]İ-Â}Í]İ]İò-]­=]’-í­‚ı]]Bı]]]íMíÂ¢M==í’ıí}mƒò"À¢&VçC×6VÆbÀ¢¢–bç7vW"—2æöæS ¢6VÆbå÷6VÆV7Eö'F–6ÆR‡6VÆbæ7W'&VçEö'F–6ÆR¢&WGW&à¢–bç7vW"æBæ÷B6VÆbåö6öÖÖ—Eö7W'&VçB‚“ ¢6VÆbå÷6VÆV7Eö'F–6ÆR‡6VÆbæ7W'&VçEö'F–6ÆR¢&WGW&à¢6VÆbåöÆöE÷&öGV7B‡F&vWB ¢FVb÷6VÆV7Eö'F–6ÆR‡6VÆbÂ'F–6ÆS¢7G"ÂæöæR’ÓâæöæS ¢–bæ÷B'F–6ÆS ¢6VÆbæÆöF–ærÒG'VP¢G'“ ¢6VÆbçG&VRç6VÆV7F–öå÷&VÖ÷fR‚§6VÆbçG&VRç6VÆV7F–öâ‚’¢f–æÆÇ“ ¢6VÆbæÆöF–ærÒfÇ6P¢&WGW&à¢–bæ÷B6VÆbçG&VRæW†—7G2†'F–6ÆR“ ¢&WGW&à¢6VÆbæÆöF–ærÒG'VP¢G'“ ¢6VÆbçG&VRç6VÆV7F–öå÷6WB†'F–6ÆR¢6VÆbçG&VRæfö7W2†'F–6ÆR¢6VÆbçG&VRç6VR†'F–6ÆR¢f–æÆÇ“ ¢6VÆbæÆöF–ærÒfÇ6P¢6VÆbåöÆöE÷&öGV7B†'F–6ÆR ¢FVböÆöE÷&öGV7B‡6VÆbÂ'F–6ÆS¢7G"’ÓâæöæS ¢&öGV7BÒ6VÆbç&öGV7EöÖ¶'F–6ÆUĞ¢6VÆbæÆöF–ærÒG'VP¢G'“ ¢6VÆbæ7W'&VçEö'F–6ÆRÒ'F–6ÆP¢6VÆbæ'F–6ÆU÷f"ç6WB‡&öGV7Bæ'F–6ÆR¢6VÆbææÖU÷f"ç6WB‡&öGV7BææÖR¢6VÆbçF÷FÅ÷f"ç6WB…÷Æ–åöçVÖ&W"‡&öGV7BçF÷FÅö6÷7B’¢6VÆbæÆ&÷%÷f"ç6WB…÷Æ–åöçVÖ&W"‡&öGV7BæÆ&÷%ö6÷7B’¢6VÆbæÖFW&–Å÷f"ç6WB…öÖöæW’‡&öGV7BæÖFW&–Åö6÷7B’¢6VÆbæ7F—fU÷f"ç6WB‡&öGV7Bæ7F—fR¢6VÆbæ'F–6ÆUöVçG'’æ6öæf–wW&R‡7FFSÒ&F—6&ÆVB"–b'F–6ÆR–â6VÆbæ÷&–v–æÅö'F–6ÆW2VÇ6R&æ÷&ÖÂ"¢6VÆbæF—'G’ÒfÇ6P¢f–æÆÇ“ ¢6VÆbæÆöF–ærÒfÇ6P ¢FVböæWu÷&öGV7B‡6VÆb’ÓâæöæS ¢–b6VÆbæF—'G“ ¢–bæ÷B6VÆbåö6öÖÖ—Eö7W'&VçB‚“ ¢&WGW&à¢6VÆbæÆöF–ærÒG'VP¢G'“ ¢6VÆbçG&VRç6VÆV7F–öå÷&VÖ÷fR‚§6VÆbçG&VRç6VÆV7F–öâ‚’¢6VÆbæ7W'&VçEö'F–6ÆRÒæöæP¢6VÆbæ'F–6ÆU÷f"ç6WB‚""¢6VÆbææÖU÷f"ç6WB‚""¢6VÆbçF÷FÅ÷f"ç6WB‚""¢6VÆbæÆ&÷%÷f"ç6WB‚#"¢6VÆbæÖFW&–Å÷f"ç6WB‚.(	B"¢6VÆbæ7F—fU÷f"ç6WB…G'VR¢6VÆbæ'F–6ÆUöVçG'’æ6öæf–wW&R‡7FFSÒ&æ÷&ÖÂ"¢6VÆbæF—'G’ÒfÇ6P¢f–æÆÇ“ ¢6VÆbæÆöF–ærÒfÇ6P¢6VÆbæ'F–6ÆUöVçG'’æfö7W5÷6WB‚ ¢FVbö6öÖÖ—Eö7W'&VçB‡6VÆb’Óâ&ööÃ ¢VçG'’Ò6÷7DVF—F÷$VçG'’€¢'F–6ÆS×6VÆbæ'F–6ÆU÷f"ævWB‚’À¢æÖS×6VÆbææÖU÷f"ævWB‚’À¢F÷FÅö6÷7C×6VÆbçF÷FÅ÷f"ævWB‚’À¢Æ&÷%ö6÷7C×6VÆbæÆ&÷%÷f"ævWB‚’À¢7F—fS×6VÆbæ7F—fU÷f"ævWB‚’À¢&÷uöçVÖ&W#Ò‡6VÆbç&öGV7Eö÷&FW"æ–æFW‚‡6VÆbæ7W'&VçEö'F–6ÆR’²¢–b6VÆbæ7W'&VçEö'F–6ÆR–â6VÆbç&öGV7Eö÷&FW ¢VÇ6RÆVâ‡6VÆbç&öGV7EöÖ’²À¢¢G'“ ¢&öGV7BÒ'V–ÆE÷&öGV7G5ög&öÕöVF—F÷%öVçG&–W2…¶VçG'•Ò•³Ğ¢–b&öGV7Bæ'F–6ÆRÒ6VÆbæ7W'&VçEö'F–6ÆRæB&öGV7Bæ'F–6ÆR–â6VÆbç&öGV7EöÖ ¢&—6RfÇVTW'&÷"†b-	-­=²·&öGV7Bæ'F–6ÆWÒ=mR]-Â"ı-í}İ­R"¢W†6WBW†6WF–öâ2W†3 ¢ÖW76vV&÷‚ç6†÷vW'&÷"‚-
+]]-íÍí-Â"Â7G"†W†2’Â&VçC×6VÆb¢&WGW&âfÇ6P¢&Wf–÷W5ö'F–6ÆRÒ6VÆbæ7W'&VçEö'F–6ÆP¢–b&Wf–÷W5ö'F–6ÆRæB&Wf–÷W5ö'F–6ÆRÒ&öGV7Bæ'F–6ÆRæB&Wf–÷W5ö'F–6ÆRæ÷B–â6VÆbæ÷&–v–æÅö'F–6ÆW3 ¢6VÆbç&öGV7EöÖç÷‡&Wf–÷W5ö'F–6ÆRÂæöæR¢–b&Wf–÷W5ö'F–6ÆR–â6VÆbç&öGV7Eö÷&FW# ¢6VÆbç&öGV7Eö÷&FW%·6VÆbç&öGV7Eö÷&FW"æ–æFW‚‡&Wf–÷W5ö'F–6ÆR•ÒÒ&öGV7Bæ'F–6ÆP¢VÆ–b&öGV7Bæ'F–6ÆRæ÷B–â6VÆbç&öGV7Eö÷&FW# ¢6VÆbç&öGV7Eö÷&FW"Ò–ç6W'EöEöw&÷WöVæB‡6VÆbç&öGV7Eö÷&FW"Â&öGV7Bæ'F–6ÆR¢6VÆbç&öGV7EöÖ·&öGV7Bæ'F–6ÆUÒÒ&öGV7@¢6VÆbæ7W'&VçEö'F–6ÆRÒ&öGV7Bæ'F–6ÆP¢6VÆbæF—'G’ÒfÇ6P¢6VÆbå÷&Vg&W6…÷G&VR‚¢6VÆbå÷6VÆV7Eö'F–6ÆR‡&öGV7Bæ'F–6ÆR¢&WGW&âG'VP ¢FVböf–æ—6‚‡6VÆb’ÓâæöæS ¢–b6VÆbæF—'G’æBæ÷B6VÆbåö6öÖÖ—Eö7W'&VçB‚“ ¢&WGW&à¢G'“ ¢VçG&–W2Ò°¢6÷7DVF—F÷$VçG'’€¢'F–6ÆS×&öGV7Bæ'F–6ÆRÀ¢æÖS×&öGV7BææÖRÀ¢F÷FÅö6÷7C×&öGV7BçF÷FÅö6÷7BÀ¢Æ&÷%ö6÷7C×&öGV7BæÆ&÷%ö6÷7BÀ¢7F—fS×&öGV7Bæ7F—fRÀ¢&÷uöçVÖ&W#Ö–æFW‚À¢¢f÷"–æFW‚Â&öGV7B–âVçVÖW&FR€¢‡6VÆbç&öGV7EöÖ¶'F–6ÆUÒf÷"'F–6ÆR–â6VÆbç&öGV7Eö÷&FW"’Â7F'CÓ¢¢Ğ¢6VÆbç&öGV7G2Ò'V–ÆE÷&öGV7G5ög&öÕöVF—F÷%öVçG&–W2†VçG&–W2¢6VÆbæ'F–6ÆUö÷&FW"Ò·&öGV7Bæ'F–6ÆRf÷"&öGV7B–â6VÆbç&öGV7G5Ğ¢f÷"–æFW‚Â&öGV7B–âVçVÖW&FR‡6VÆbç&öGV7G2Â7F'CÓ“ ¢&öGV7Bç6÷'Eö÷&FW"Ò–æFW€¢6VÆbæ÷&FW%ö6†ævVBÒ6VÆbæ'F–6ÆUö÷&FW"Ò6VÆbæ÷&–v–æÅö÷&FW ¢W†6WBW†6WF–öâ2W†3 ¢ÖW76vV&÷‚ç6†÷vW'&÷"‚-
+]]-íÍí-Â"Â7G"†W†2’Â&VçC×6VÆb¢&WGW&à¢6VÆbæ6æ6VÆÆVBÒfÇ6P¢6VÆbæFW7G&÷’‚  ¦6Æ726÷7D–×÷'DF–Æör‡F²åF÷ÆWfVÂ“ ¢FVbõö–æ—Eõò‡6VÆbÂ&VçC¢õ¥&–6TæÇ—¦W$Â6†ævW3¢Æ—7E´6÷7D6†ævUÒÂ6÷W&6UöæÖS¢7G"“ ¢7WW"‚’åõö–æ—Eõò‡&VçB¢6VÆbçF—FÆR‚-	ı]M--]½Íİòıí-]­]]-íÍí-‚"¢6VÆbævVöÖWG'’‚##cƒcS"¢6VÆbæÖ–ç6—¦Rƒ“ƒÂS#¢6VÆbçG&ç6–VçB‡&VçB¢6VÆbæw&%÷6WB‚¢6VÆbæ6æ6VÆÆVBÒG'VP¢6VÆbæ6†ævW2Ò6†ævW0¢6VÆbç&öGV7G5÷FõöÇ’Ò¶6†ævRç&öGV7Bf÷"6†ævR–â6†ævW2–b6†ævRæ6†ævVEĞ¢6VÆbæ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢6VÆbç&÷v6öæf–wW&Rƒ2ÂvV–v‡CÓ ¢GF²äÆ&VÂ‡6VÆbÂFW‡CÒ-	ıí-]Í-R}Í]İ]İòı]]BıÍ]İ]İ]Â"Â7G–ÆSÒ%6V7F–öâåDÆ&VÂ"’æw&–B€¢&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂGƒÓ#ÂG“Òƒ‚Â"¢¢6†ævVEö6÷VçBÒÆVâ‡6VÆbç&öGV7G5÷FõöÇ’¢æWuö6÷VçBÒ7VÒ†6†ævRç7FGW2ÓÒ-	İí-òıí}mò"f÷"6†ævR–â6†ævW2¢GF²äÆ&VÂ€¢6VÆbÀ¢FW‡CÒ€¢b-	-í}İ£¢·6÷W&6UöæÖWÒ+r-í£¢¶ÆVâ†6†ævW2—Ò+r}Í]İ]İ“¢¶6†ævVEö6÷VçGÒ+rİí-½R-í-í#¢¶æWuö6÷VçGÒâ ¢-
+-½Rí-}]-²‚R]]-íÍí-Âí-İ=-ò]r}Í]İ]İ’â ¢’À¢7G–ÆSÒ$×WFVBåDÆ&VÂ"À¢’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂGƒÓ#ÂG“ÒƒÂ’¢GF²äÆ&VÂ€¢6VÆbÀ¢FW‡CÒ-	}]½]İ½Âí-Í]}]İ²İí-½R‚}Í]İ]İİ½Rıí}m‚Â]½Â(	B-í­‚]r}Í]İ]İ’â"À¢7G–ÆSÒ$×WFVBåDÆ&VÂ"À¢’æw&–B‡&÷sÓ"Â6öÇVÖãÓÂ7F–6·“Ò'r"ÂGƒÓ#ÂG“ÒƒÂ‚’ ¢6öçF–æW"ÒGF²äg&ÖR‡6VÆb¢6öçF–æW"æw&–B‡&÷sÓ2Â6öÇVÖãÓÂ7F–6·“Ò&ç6Wr"ÂGƒÓ#¢6öçF–æW"æ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢6öçF–æW"ç&÷v6öæf–wW&RƒÂvV–v‡CÓ¢6öÇVÖç2Ò€¢&'F–6ÆR"Â&æÖR"Â&öÆE÷F÷FÂ"Â&æWu÷F÷FÂ"Â&6†ævR"À¢&öÆEöÆ&÷""Â&æWuöÆ&÷""Â&7F—fR"Â'7FGW2"À¢¢6VÆbçG&VRÒGF²åG&VWf–Wr†6öçF–æW"Â6öÇVÖç3Ö6öÇVÖç2Â6†÷sÒ&†VF–æw2"¢†VF–æw2Ò°¢-	-­=²"Â-	İÍ]İí-İR"Â-
+-òı"Â-	İí-òı"Â-	}Í]İ]İR"À¢-
+-½R-=Mí}--²"Â-	İí-½R-=Mí}--²"Â-	­--]Ò"Â-	M]--R"À¢Ğ¢v–GF‡2Ò³CÂ#ƒÂ3Â3Â3ÂcÂcÂ“ÂSĞ¢f÷"6öÇVÖâÂ†VF–ærÂv–GF‚–â¦—†6öÇVÖç2Â†VF–æw2Âv–GF‡2“ ¢6VÆbçG&VRæ†VF–ær†6öÇVÖâÂFW‡CÖ†VF–ær¢6VÆbçG&VRæ6öÇVÖâ†6öÇVÖâÂv–GFƒ×v–GF‚ÂÖ–çv–GFƒÓƒÂ7G&WF6ƒÔfÇ6RÂæ6†÷#Ò'r"–b6öÇVÖâ–â²&'F–6ÆR"Â&æÖR"Â'7FGW2'ÒVÇ6R&R"¢‡67&öÆÂÒGF²å67&öÆÆ&"†6öçF–æW"Â÷&–VçCÒ&†÷&—¦öçFÂ"Â6öÖÖæC×6VÆbçG&VRç‡f–Wr¢—67&öÆÂÒGF²å67&öÆÆ&"†6öçF–æW"Â÷&–VçCÒ'fW'F–6Â"Â6öÖÖæC×6VÆbçG&VRç—f–Wr¢6VÆbçG&VRæ6öæf–wW&R‡‡67&öÆÆ6öÖÖæC×‡67&öÆÂç6WBÂ—67&öÆÆ6öÖÖæC×—67&öÆÂç6WB¢6VÆbçG&VRæw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò&ç6Wr"¢—67&öÆÂæw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò&ç2"¢‡67&öÆÂæw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò&Wr"¢f÷"6†ævR–â6†ævW3 ¢&Wf–÷W2Ò6†ævRç&Wf–÷W0¢FrÒ&6†ævVB"–b6†ævRæ6†ævVBVÇ6R&×WFVB ¢6VÆbçG&VRæ–ç6W'B€¢""À¢&VæB"À¢fÇVW3Ò€¢6†ævRç&öGV7Bæ'F–6ÆRÀ¢6†ævRç&öGV7BææÖRÀ¢öÖöæW’‡&Wf–÷W2çF÷FÅö6÷7B’–b&Wf–÷W2VÇ6R.(	B"À¢öÖöæW’†6†ævRç&öGV7BçF÷FÅö6÷7B’À¢÷6–væVEöÖöæW’†6†ævRçF÷FÅö6†ævR’–b6†ævRçF÷FÅö6†ævR—2æ÷BæöæRVÇ6R-	İí-ò"À¢öÖöæW’‡&Wf–÷W2æÆ&÷%ö6÷7B’–b&Wf–÷W2VÇ6R.(	B"À¢öÖöæW’†6†ævRç&öGV7BæÆ&÷%ö6÷7B’À¢-	M"–b6†ævRç&öGV7Bæ7F—fRVÇ6R-	İ]""À¢6†ævRç7FGW2À¢’À¢Fw3Ò‡FrÂ’À¢¢6VÆbçG&VRçFuö6öæf–wW&R‚&6†ævVB"Âf÷&Vw&÷VæC×&VçBæ6öÆ÷'5²'÷6—F—fR%Ò¢6VÆbçG&VRçFuö6öæf–wW&R‚&×WFVB"Âf÷&Vw&÷VæC×&VçBæ6öÆ÷'5²&×WFVB%Ò ¢'WGFöç2ÒGF²äg&ÖR‡6VÆbÂFF–æsÒƒ#ÂB’¢'WGFöç2æw&–B‡&÷sÓBÂ6öÇVÖãÓÂ7F–6·“Ò&R"¢GF²ä'WGFöâ†'WGFöç2ÂFW‡CÒ-	í-Í]İ"Â6öÖÖæC×6VÆbæFW7G&÷’’æw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÓB¢Ç•ö'WGFöâÒGF²ä'WGFöâ†'WGFöç2ÂFW‡CÒ-	ıÍ]İ-Â}Í]İ]İò"Â7G–ÆSÒ$66VçBåD'WGFöâ"Â6öÖÖæC×6VÆbåöÇ’¢Ç•ö'WGFöâæw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÓB¢–bæ÷B6VÆbç&öGV7G5÷FõöÇ“ ¢Ç•ö'WGFöâæ6öæf–wW&R‡7FFSÒ&F—6&ÆVB" ¢FVböÇ’‡6VÆb’ÓâæöæS ¢–bæ÷B6VÆbç&öGV7G5÷FõöÇ“ ¢&WGW&à¢6VÆbæ6æ6VÆÆVBÒfÇ6P¢6VÆbæFW7G&÷’‚  ¦6Æ726÷7D†—7F÷'”F–Æör‡F²åF÷ÆWfVÂ“ ¢FVbõö–æ—Eõò‡6VÆbÂ&VçC¢õ¥&–6TæÇ—¦W$Â&÷w3¢Æ—7E¶F–7E·7G"Âö&¦V7EÕÒ“ ¢7WW"‚’åõö–æ—Eõò‡&VçB¢6VÆbçF—FÆR‚-	m=İ²}Í]İ]İ’]]-íÍí-‚"¢6VÆbævVöÖWG'’‚#3#ƒcS"¢6VÆbæÖ–ç6—¦Rƒ“ƒÂS¢6VÆbçG&ç6–VçB‡&VçB¢6VÆbæ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢6VÆbç&÷v6öæf–wW&Rƒ"ÂvV–v‡CÓ¢GF²äÆ&VÂ‡6VÆbÂFW‡CÒ-	m=İ²}Í]İ]İ’]]-íÍí-‚"Â7G–ÆSÒ%6V7F–öâåDÆ&VÂ"’æw&–B€¢&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂGƒÓ#ÂG“Òƒ‚Â"¢¢GF²äÆ&VÂ€¢6VÆbÀ¢FW‡CÒ-	m=İ²ıí­}½-]"=}İ½R}Í]İ]İòÂÍıí"„Å5‚‚í}MİRİí-½R-­=½í"rí-}]-í"â"À¢7G–ÆSÒ$×WFVBåDÆ&VÂ"À¢’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂGƒÓ#ÂG“ÒƒÂ’¢6öçF–æW"ÒGF²äg&ÖR‡6VÆb¢6öçF–æW"æw&–B‡&÷sÓ"Â6öÇVÖãÓÂ7F–6·“Ò&ç6Wr"ÂGƒÓ#¢6öçF–æW"æ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢6öçF–æW"ç&÷v6öæf–wW&RƒÂvV–v‡CÓ¢6öÇVÖç2Ò‚&FFR"Â&'F–6ÆR"Â&æÖR"Â&öÆE÷F÷FÂ"Â&æWu÷F÷FÂ"Â&6†ævR"Â&öÆEöÆ&÷""Â&æWuöÆ&÷""Â'6÷W&6R"¢G&VRÒGF²åG&VWf–Wr†6öçF–æW"Â6öÇVÖç3Ö6öÇVÖç2Â6†÷sÒ&†VF–æw2"¢†VF–æw2Ò°¢-	M-"Â-	-­=²"Â-	İÍ]İí-İR"Â-
+-òı"Â-	İí-òı"Â-	}Í]İ]İR"À¢-
+-½R-=Mí}--²"Â-	İí-½R-=Mí}--²"Â-	-í}İ¢"À¢Ğ¢v–GF‡2Ò³CRÂ3Â#SÂ#Â#Â#ÂSRÂSRÂ#cĞ¢f÷"6öÇVÖâÂ†VF–ærÂv–GF‚–â¦—†6öÇVÖç2Â†VF–æw2Âv–GF‡2“ ¢G&VRæ†VF–ær†6öÇVÖâÂFW‡CÖ†VF–ær¢G&VRæ6öÇVÖâ†6öÇVÖâÂv–GFƒ×v–GF‚ÂÖ–çv–GFƒÓƒÂ7G&WF6ƒÔfÇ6RÂæ6†÷#Ò'r"–b6öÇVÖâ–â²&'F–6ÆR"Â&æÖR"Â'6÷W&6R'ÒVÇ6R&R"¢‡67&öÆÂÒGF²å67&öÆÆ&"†6öçF–æW"Â÷&–VçCÒ&†÷&—¦öçFÂ"Â6öÖÖæC×G&VRç‡f–Wr¢—67&öÆÂÒGF²å67&öÆÆ&"†6öçF–æW"Â÷&–VçCÒ'fW'F–6Â"Â6öÖÖæC×G&VRç—f–Wr¢G&VRæ6öæf–wW&R‡‡67&öÆÆ6öÖÖæC×‡67&öÆÂç6WBÂ—67&öÆÆ6öÖÖæC×—67&öÆÂç6WB¢G&VRæw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò&ç6Wr"¢—67&öÆÂæw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò&ç2"¢‡67&öÆÂæw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò&Wr"¢f÷"&÷r–â&÷w3 ¢öÆEöÖFW&–ÂÒ&÷u²&öÆEöÖFW&–Åö6÷7B%Ğ¢öÆEöÆ&÷"Ò&÷u²&öÆEöÆ&÷%ö6÷7B%Ğ¢öÆE÷F÷FÂÒfÆöB†öÆEöÖFW&–Â’²fÆöB†öÆEöÆ&÷"’–böÆEöÖFW&–Â—2æ÷BæöæRæBöÆEöÆ&÷"—2æ÷BæöæRVÇ6RæöæP¢æWu÷F÷FÂÒfÆöB‡&÷u²&æWuöÖFW&–Åö6÷7B%Ò’²fÆöB‡&÷u²&æWuöÆ&÷%ö6÷7B%Ò¢G&VRæ–ç6W'B€¢""À¢&VæB"À¢fÇVW3Ò€¢7G"‡&÷u²&6†ævVEöB%Ò•³£eÒÀ¢&÷u²&'F–6ÆR%ÒÀ¢&÷u²&æWuöæÖR%ÒÀ¢öÖöæW’†öÆE÷F÷FÂ’–böÆE÷F÷FÂ—2æ÷BæöæRVÇ6R.(	B"À¢öÖöæW’†æWu÷F÷FÂ’À¢÷6–væVEöÖöæW’†æWu÷F÷FÂÒöÆE÷F÷FÂ’–böÆE÷F÷FÂ—2æ÷BæöæRVÇ6R-	İí-ò"À¢öÖöæW’†fÆöB†öÆEöÆ&÷"’’–böÆEöÆ&÷"—2æ÷BæöæRVÇ6R.(	B"À¢öÖöæW’†fÆöB‡&÷u²&æWuöÆ&÷%ö6÷7B%Ò’’À¢&÷u²&6†ævU÷6÷W&6R%ÒÀ¢’À¢¢–bæ÷B&÷w3 ¢G&VRæ–ç6W'B‚""Â&VæB"ÂfÇVW3Ò‚""Â""Â-	m=İ²ıí­ı=""’¢GF²ä'WGFöâ‡6VÆbÂFW‡CÒ-	}­½-Â"Â6öÖÖæC×6VÆbæFW7G&÷’’æw&–B‡&÷sÓ2Â6öÇVÖãÓÂ7F–6·“Ò&R"ÂGƒÓ#ÂG“ÓB  ¦6Æ72&öGV7DF–Æör‡F²åF÷ÆWfVÂ“ ¢FVbõö–æ—Eõò‡6VÆbÂ&VçC¢õ¥&–6TæÇ—¦W$ÂF—FÆS¢7G"Â&öGV7C¢&öGV7BÂæöæRÒæöæR“ ¢7WW"‚’åõö–æ—Eõò‡&VçB¢6VÆbç&W7VÇC¢&öGV7BÂæöæRÒæöæP¢6VÆbç&öGV7BÒ&öGV7@¢6VÆbçF—FÆR‡F—FÆR¢6VÆbçG&ç6–VçB‡&VçB¢6VÆbæw&%÷6WB‚¢6VÆbç&W6—¦&ÆR„fÇ6RÂfÇ6R¢6VÆbæ6öæf–wW&R†&6¶w&÷VæC×&VçBæ6öÆ÷'5²'v–æF÷r%Ò¢6VÆbæ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢6VÆbæ'F–6ÆU÷f"ÒF²å7G&–æuf"‡fÇVS×&öGV7Bæ'F–6ÆR–b&öGV7BVÇ6R""¢6VÆbææÖU÷f"ÒF²å7G&–æuf"‡fÇVS×&öGV7BææÖR–b&öGV7BVÇ6R""¢6VÆbçF÷FÅ÷f"ÒF²å7G&–æuf"‡fÇVSÕ÷Æ–åöçVÖ&W"‡&öGV7BçF÷FÅö6÷7B’–b&öGV7BVÇ6R""¢6VÆbæÆ&÷%÷f"ÒF²å7G&–æuf"‡fÇVSÕ÷Æ–åöçVÖ&W"‡&öGV7BæÆ&÷%ö6÷7B’–b&öGV7BVÇ6R#" ¢f–VÆG2Ò°¢‚-	-­=²"Â6VÆbæ'F–6ÆU÷f"’À¢‚-	İÍ]İí-İR"Â6VÆbææÖU÷f"’À¢‚-	ıí½İò]]-íÍí-ÂÂ=â"Â6VÆbçF÷FÅ÷f"’À¢‚-
+-=Mí}--²"í--RıÂ=â"Â6VÆbæÆ&÷%÷f"’À¢Ğ¢f÷"&÷rÂ†Æ&VÂÂf&–&ÆR’–âVçVÖW&FR†f–VÆG2“ ¢GF²äÆ&VÂ‡6VÆbÂFW‡CÖÆ&VÂ’æw&–B‡&÷s×&÷rÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂG“ÓbÂGƒÒƒ#"Â"’¢VçG'’ÒGF²äVçG'’‡6VÆbÂFW‡Gf&–&ÆS×f&–&ÆRÂv–GFƒÓC"¢VçG'’æw&–B‡&÷s×&÷rÂ6öÇVÖãÓÂ7F–6·“Ò&Wr"ÂG“ÓbÂGƒÒƒÂ#"’¢–b&öGV7BæB&÷rÓÒ ¢VçG'’æ6öæf–wW&R‡7FFSÒ&F—6&ÆVB"¢'WGFöç2ÒGF²äg&ÖR‡6VÆb¢'WGFöç2æw&–B‡&÷sÖÆVâ†f–VÆG2’Â6öÇVÖãÓÂ6öÇVÖç7ãÓ"Â7F–6·“Ò&R"ÂGƒÓ‚ÂG“ÒƒBÂ‚’¢GF²ä'WGFöâ†'WGFöç2ÂFW‡CÒ-	í-Í]İ"Â6öÖÖæC×6VÆbæFW7G&÷’’æw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÓB¢GF²ä'WGFöâ†'WGFöç2ÂFW‡CÒ-
+í]İ-Â"Â7G–ÆSÒ$66VçBåD'WGFöâ"Â6öÖÖæC×6VÆbå÷6fR’æw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÓB¢6VÆbæ&–æB‚#Å&WGW&ãâ"ÂÆÖ&FöWfVçC¢6VÆbå÷6fR‚’¢6VÆbæ&–æB‚#ÄW66Sâ"ÂÆÖ&FöWfVçC¢6VÆbæFW7G&÷’‚’ ¢FVb÷6fR‡6VÆb’ÓâæöæS ¢G'“ ¢'F–6ÆRÒ6VÆbæ'F–6ÆU÷f"ævWB‚’ç7G&—‚¢æÖRÒ6VÆbææÖU÷f"ævWB‚’ç7G&—‚’÷"'F–6ÆP¢F÷FÂÒ÷'6UöçVÖ&W"‡6VÆbçF÷FÅ÷f"ævWB‚’¢Æ&÷"Ò÷'6UöçVÖ&W"‡6VÆbæÆ&÷%÷f"ævWB‚’¢–bæ÷B'F–6ÆR÷"F÷FÂÂ÷"Æ&÷"Â÷"Æ&÷"âF÷FÃ ¢&—6RfÇVTW'&÷ ¢W†6WBfÇVTW'&÷# ¢ÖW76vV&÷‚ç6†÷vW'&÷"€¢-
+-í-"À¢-
+=­m-R-­=²‚­í]­-İ=â]]-íÍí-Ââ
+-=Mí}--²Mí½mİ²½-Âí"Mâıí½İí’]]-íÍí-‚â"À¢&VçC×6VÆbÀ¢¢&WGW&à¢6VÆbç&W7VÇBÒ&öGV7B€¢'F–6ÆSÖ'F–6ÆRÀ¢æÖSÖæÖRÀ¢ÖFW&–Åö6÷7C×F÷FÂÒÆ&÷"À¢Æ&÷%ö6÷7CÖÆ&÷"À¢7F—fS×6VÆbç&öGV7Bæ7F—fR–b6VÆbç&öGV7BVÇ6RG'VRÀ¢¢6VÆbæFW7G&÷’‚  ¦6Æ72Væ¶æ÷vå&öGV7G4F–Æör‡F²åF÷ÆWfVÂ“ ¢FVbõö–æ—Eõò‡6VÆbÂ&VçC¢õ¥&–6TæÇ—¦W$ÂVæ¶æ÷vã¢Æ—7EµVæ¶æ÷vå&öGV7EÒ“ ¢7WW"‚’åõö–æ—Eõò‡&VçB¢6VÆbçF—FÆR‚-	İí-½R-í-²"¢6VÆbævVöÖWG'’‚#Cƒc#"¢6VÆbçG&ç6–VçB‡&VçB¢6VÆbæw&%÷6WB‚¢6VÆbæ6æ6VÆÆVBÒG'VP¢6VÆbæ—FV×2Ò¶—FVÒæ'F–6ÆS¢—FVÒf÷"—FVÒ–âVæ¶æ÷vçĞ¢6VÆbæFV6—6–öç3¢F–7E·7G"Â&öGV7BÂæöæUÒÒ·Ğ ¢6VÆbæ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢6VÆbç&÷v6öæf–wW&Rƒ"ÂvV–v‡CÓ¢GF²äÆ&VÂ‡6VÆbÂFW‡CÒ-	"í-}]-RİM]İ²İí-½R-­=½²"Â7G–ÆSÒ%6V7F–öâåDÆ&VÂ"’æw&–B€¢&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂGƒÓ#ÂG“Òƒ‚Â"¢¢GF²äÆ&VÂ€¢6VÆbÀ¢FW‡CÒ-	M½ò-­½í}]İòİ}½]İ’=­m-R]]-íÍí-Ââ	ıíı=]İİ½’-­=²İRıíıM]"İ‚"-í-Âİ‚"İ]ı]M]½]İİ½R=ÍÍ²â"À¢7G–ÆSÒ$×WFVBåDÆ&VÂ"À¢’æw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò'r"ÂGƒÓ#ÂG“ÒƒÂ’ ¢6öçF–æW"ÒGF²äg&ÖR‡6VÆb¢6öçF–æW"æw&–B‡&÷sÓ"Â6öÇVÖãÓÂ7F–6·“Ò&ç6Wr"ÂGƒÓ#¢6öçF–æW"æ6öÇVÖæ6öæf–wW&RƒÂvV–v‡CÓ¢6öçF–æW"ç&÷v6öæf–wW&RƒÂvV–v‡CÓ¢6VÆbçG&VRÒGF²åG&VWf–Wr†6öçF–æW"Â6öÇVÖç3Ò‚&'F–6ÆR"Â&æÖR"Â'6·R"Â'6÷W&6W2"Â&FV6—6–öâ"’Â6†÷sÒ&†VF–æw2"¢†VF–æw2Ò²-	-­=²"Â-	İÍ]İí-İR"Â%4µR"Â-
+M½²"Â-
+]]İR%Ğ¢v–GF‡2Ò³SÂ#cÂ#Â3Â3Ğ¢f÷"6öÇVÖâÂ†VF–ærÂv–GF‚–â¦—‡6VÆbçG&VU²&6öÇVÖç2%ÒÂ†VF–æw2Âv–GF‡2“ ¢6VÆbçG&VRæ†VF–ær†6öÇVÖâÂFW‡CÖ†VF–ær¢6VÆbçG&VRæ6öÇVÖâ†6öÇVÖâÂv–GFƒ×v–GF‚Â7G&WF6ƒÔfÇ6RÂæ6†÷#Ò'r"¢67&öÆÂÒGF²å67&öÆÆ&"†6öçF–æW"Â÷&–VçCÒ'fW'F–6Â"Â6öÖÖæC×6VÆbçG&VRç—f–Wr¢6VÆbçG&VRæ6öæf–wW&R‡—67&öÆÆ6öÖÖæC×67&öÆÂç6WB¢6VÆbçG&VRæw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò&ç6Wr"¢67&öÆÂæw&–B‡&÷sÓÂ6öÇVÖãÓÂ7F–6·“Ò&ç2"¢f÷"—FVÒ–âVæ¶æ÷vã ¢6VÆbçG&VRæ–ç6W'B€¢""Â&VæB"Â––CÖ—FVÒæ'F–6ÆRÀ¢fÇVW3Ò†—FVÒæ'F–6ÆRÂ—FVÒææÖRÂ—FVÒç6·RÂ"Â"æ¦ö–â‡6÷'FVB†—FVÒç6÷W&6UöæÖW2’’Â-	İR-½İâ"’À¢¢6VÆbçG&VRæ&–æB‚#ÃÅG&VWf–Wu6VÆV7Cãâ"Â6VÆbå÷6VÆV7B ¢VF—F÷"ÒGF²äg&ÖR‡6VÆbÂFF–æsÒƒ#Â"’¢VF—F÷"æw&–B‡&÷sÓ2Â6öÇVÖãÓÂ7F–6·“Ò&Wr"¢GF²äÆ&VÂ†VF—F÷"ÂFW‡CÒ-	ıí½İò]]-íÍí-ÂÂ=ã¢"’æw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÒƒÂb’¢6VÆbçF÷FÅ÷f"ÒF²å7G&–æuf"‚¢GF²äVçG'’†VF—F÷"ÂFW‡Gf&–&ÆS×6VÆbçF÷FÅ÷f"Âv–GFƒÓB’æw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÒƒÂB’¢GF²äÆ&VÂ†VF—F÷"ÂFW‡CÒ-
+-=Mí}--²Â=ã¢"’æw&–B‡&÷sÓÂ6öÇVÖãÓ"ÂGƒÒƒÂb’¢6VÆbæÆ&÷%÷f"ÒF²å7G&–æuf"‡fÇVSÒ#"¢GF²äVçG'’†VF—F÷"ÂFW‡Gf&–&ÆS×6VÆbæÆ&÷%÷f"Âv–GFƒÓB’æw&–B‡&÷sÓÂ6öÇVÖãÓ2ÂGƒÒƒÂB’¢GF²ä'WGFöâ†VF—F÷"ÂFW‡CÒ-
+í}M-Âıí}mâ"Â6öÖÖæC×6VÆbåö7&VFR’æw&–B‡&÷sÓÂ6öÇVÖãÓBÂGƒÓB¢GF²ä'WGFöâ†VF—F÷"ÂFW‡CÒ-	ıíı=--Â"Â6öÖÖæC×6VÆbå÷6¶—’æw&–B‡&÷sÓÂ6öÇVÖãÓRÂGƒÓB ¢'WGFöç2ÒGF²äg&ÖR‡6VÆbÂFF–æsÒƒ#Â"’¢'WGFöç2æw&–B‡&÷sÓBÂ6öÇVÖãÓÂ7F–6·“Ò&R"¢GF²ä'WGFöâ†'WGFöç2ÂFW‡CÒ-	í-Í]İ-ÂÍıí""Â6öÖÖæC×6VÆbæFW7G&÷’’æw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÓB¢GF²ä'WGFöâ†'WGFöç2ÂFW‡CÒ-	ıíMí½m-Â}]""Â7G–ÆSÒ$66VçBåD'WGFöâ"Â6öÖÖæC×6VÆbåöf–æ—6‚’æw&–B‡&÷sÓÂ6öÇVÖãÓÂGƒÓB¢f—'7BÒæW‡B†—FW"‡6VÆbæ—FV×2’ÂæöæR¢–bf—'7C ¢6VÆbçG&VRç6VÆV7F–öå÷6WB†f—'7B¢6VÆbçG&VRæfö7W2†f—'7B ¢&÷W'G¢FVb7&VFVE÷&öGV7G2‡6VÆb’ÓâÆ—7Eµ&öGV7EÓ ¢&WGW&â¶—FVÒf÷"—FVÒ–â6VÆbæFV6—6–öç2çfÇVW2‚’–b—FVÒ—2æ÷BæöæUĞ ¢&÷W'G¢FVb6¶—VEö'F–6ÆW2‡6VÆb’Óâ6WE·7G%Ó ¢&WGW&â¶'F–6ÆRf÷"'F–6ÆRÂ&öGV7B–â6VÆbæFV6—6–öç2æ—FV×2‚’–b&öGV7B—2æöæWĞ ¢FVb÷6VÆV7FVEö'F–6ÆR‡6VÆb’Óâ7G"ÂæöæS ¢6VÆV7F–öâÒ6VÆbçG&VRç6VÆV7F–öâ‚¢&WGW&â6VÆV7F–öå³Ò–b6VÆV7F–öâVÇ6RæöæP ¢FVb÷6VÆV7B‡6VÆbÂöWfVçCÔæöæR’ÓâæöæS ¢'F–6ÆRÒ6VÆbå÷6VÆV7FVEö'F–6ÆR‚¢FV6—6–öâÒ6VÆbæFV6—6–öç2ævWB†'F–6ÆR’–b'F–6ÆRVÇ6RæöæP¢–b—6–ç7Fæ6R†FV6—6–öâÂ&öGV7B“ ¢6VÆbçF÷FÅ÷f"ç6WB…÷Æ–åöçVÖ&W"†FV6—6–öâçF÷FÅö6÷7B’¢6VÆbæÆ&÷%÷f"ç6WB…÷Æ–åöçVÖ&W"†FV6—6–öâæÆ&÷%ö6÷7B’¢VÇ6S ¢6VÆbçF÷FÅ÷f"ç6WB‚""¢6VÆbæÆ&÷%÷f"ç6WB‚#" ¢FVbö7&VFR‡6VÆb’ÓâæöæS ¢'F–6ÆRÒ6VÆbå÷6VÆV7FVEö'F–6ÆR‚¢–bæ÷B'F–6ÆS ¢&WGW&à¢G'“ ¢F÷FÂÒ÷'6UöçVÖ&W"‡6VÆbçF÷FÅ÷f"ævWB‚’¢Æ&÷"Ò÷'6UöçVÖ&W"‡6VÆbæÆ&÷%÷f"ævWB‚’¢–bF÷FÂÂ÷"Æ&÷"Â÷"Æ&÷"âF÷FÃ ¢&—6RfÇVTW'&÷ ¢W†6WBfÇVTW'&÷# ¢ÖW76vV&÷‚ç6†÷vW'&÷"‚-
+]]-íÍí-Â"Â-	ıí-]Í-Rıí½İ=â]]-íÍí-Â‚-=Mí}--²"Â&VçC×6VÆb¢&WGW&à¢—FVÒÒ6VÆbæ—FV×5¶'F–6ÆUĞ¢6VÆbæFV6—6–öç5¶'F–6ÆUÒÒ&öGV7B†'F–6ÆRÂ—FVÒææÖR÷"'F–6ÆRÂF÷FÂÒÆ&÷"ÂÆ&÷"¢6VÆbå÷6WEöFV6—6–öå÷FW‡B†'F–6ÆRÂb-
+í}M-Ã¢µöÖöæW’‡F÷FÂ—Ò"¢6VÆbå÷6VÆV7EöæW‡E÷Vç&W6öÇfVB‚ ¢FVb÷6¶—‡6VÆb’ÓâæöæS ¢'F–6ÆRÒ6VÆbå÷6VÆV7FVEö'F–6ÆR‚¢–bæ÷B'F–6ÆS ¢&WGW&à¢6VÆbæFV6—6–öç5¶'F–6ÆUÒÒæöæP¢6VÆbå÷6WEöFV6—6–öå÷FW‡B†'F–6ÆRÂ-	ıíı=--Â"¢6VÆbå÷6VÆV7EöæW‡E÷Vç&W6öÇfVB‚ ¢FVb÷6WEöFV6—6–öå÷FW‡B‡6VÆbÂ'F–6ÆS¢7G"ÂFW‡C¢7G"’ÓâæöæS ¢fÇVW2ÒÆ—7B‡6VÆbçG&VRæ—FVÒ†'F–6ÆRÂ'fÇVW2"’¢fÇVW5²ÓÒÒFW‡@¢6VÆbçG&VRæ—FVÒ†'F–6ÆRÂfÇVW3×fÇVW2 ¢FVb÷6VÆV7EöæW‡E÷Vç&W6öÇfVB‡6VÆb’ÓâæöæS ¢f÷"'F–6ÆR–â6VÆbæ—FV×3 ¢–b'F–6ÆRæ÷B–â6VÆbæFV6—6–öç3 ¢6VÆbçG&VRç6VÆV7F–öå÷6WB†'F–6ÆR¢6VÆbçG&VRæfö7W2†'F–6ÆR¢6VÆbçG&VRç6VR†'F–6ÆR¢&WGW&à ¢FVböf–æ—6‚‡6VÆb’ÓâæöæS ¢Vç&W6öÇfVBÒ¶'F–6ÆRf÷"'F–6ÆR–â6VÆbæ—FV×2–b'F–6ÆRæ÷B–â6VÆbæFV6—6–öç5Ğ¢–bVç&W6öÇfVC ¢ÖW76vV&÷‚ç6†÷wv&æ–ær€¢-	İí-½R-í-²"À¢b-	-½]-RM]--R]RM½ò¶ÆVâ‡Vç&W6öÇfVB—Òıí}m“¢í}M-Â½‚ıíı=--Ââ"À¢&VçC×6VÆbÀ¢¢&WGW&à¢6VÆbæ6æ6VÆÆVBÒfÇ6P¢6VÆbæFW7G&÷’‚  ¦FVb÷&W7VÇE÷fÇVW2‡&W7VÇC¢&öGV7E&W7VÇBÂF…÷&FS¢fÆöB’ÓâGWÆU¶ö&¦V7BÂââåÓ ¢&WGW&â€¢&W7VÇBæ'F–6ÆRÀ¢&W7VÇBææÖRÀ¢öÖöæW’‡&W7VÇBçF÷FÅö6÷7B’À¢öÖöæW’‡&W7VÇBæÖFW&–Åö6÷7B’À¢öÖöæW’‡&W7VÇBæÆ&÷%ö6÷7B’À¢öÖöæW’‡&W7VÇBæÖFW&–Å÷6öÆB’À¢öÖöæW’‡&W7VÇBæÆ&÷%÷6öÆB’À¢öÖöæW’‡&W7VÇBæ6÷7E÷6öÆB’À¢÷W&6VçB‡&W7VÇBç&öf—F&–Æ—G’‡F…÷&FR’’À¢öÖöæW’‡&W7VÇBææWE÷&öf—E÷W%÷Væ—B‡F…÷&FR’’À¢öÖöæW’‡&W7VÇBç&öf—E÷W%÷Væ—B‚’’À¢öÖöæW’‡&W7VÇBææWE÷&öf—B‡F…÷&FR’’À¢öÖöæW’‡&W7VÇBæf–ææ6–Å÷&W7VÇB’À¢öÖöæW’‡&W7VÇBæfW&vU÷&–6R‚’’–b&W7VÇBæfW&vU÷&–6R‚’—2æ÷BæöæRVÇ6R.(	B"À¢öÖöæW’‡&W7VÇBçF‚‡F…÷&FR’’À¢öÖöæW’‡&W7VÇBçF†&ÆUö–æ6öÖR’À¢öçVÖ&W"‡&W7VÇBçVæ—G2’À¢öÖöæW’‡&W7VÇBç&WfVçVUö–æ6ÇVF–æu÷ö–çG2’À¢öÖöæW’‡&W7VÇBç&WfVçVUöæõ÷ö–çG2’À¢öÖöæW’‡&W7VÇBç'FæW%÷&öw&×2’À¢öÖöæW’‡&W7VÇBçö–çG2’À¢öÖöæW’‡&W7VÇBæ6öÖÖ—76–öâ’À¢öÖöæW’‡&W7VÇBç&ö6W76–ær’À¢öÖöæW’‡&W7VÇBæFVÆ—fW'’’À¢öÖöæW’‡&W7VÇBæÆöv—7F–72’À¢öÖöæW’‡&W7VÇBç&WfW'6UöÆöv—7F–72’À¢öÖöæW’‡&W7VÇBç&WGW&ç5ö6æ6VÇ2’À¢öÖöæW’‡&W7VÇBæ7V—&–ær’À¢öÖöæW’‡&W7VÇBç7F'2’À¢öÖöæW’‡&W7VÇBç6¶v–ær’À¢öÖöæW’‡&W7VÇBæ6ö×Vç6F–öâ’À¢öÖöæW’‡&W7VÇBæ÷F†W"’À¢öÖöæW’‡&W7VÇBæf–ææ6–Å÷&W7VÇB’À¢  ¦FVb÷66Væ&–õ÷fÇVW2‡&÷s¢66Væ&–õ&÷r’ÓâGWÆU¶ö&¦V7BÂââåÓ ¢&WGW&â€¢&÷ræ'F–6ÆRÀ¢&÷rææÖRÀ¢öÖöæW’‡&÷rçVæ—Eö6÷7B’À¢öçVÖ&W"‡&÷rçVæ—G2’À¢ö÷F–öæÅöÖöæW’‡&÷ræ7W'&VçE÷&–6R’À¢ö÷F–öæÅöÖöæW’‡&÷rçÆææVE÷&–6R’À¢ö÷F–öæÅ÷W&6VçB‡&÷rç&–6Uö6†ævR’À¢ö÷F–öæÅ÷W&6VçB‡&÷rç&öf—F&–Æ—G’’À¢ö÷F–öæÅöÖöæW’‡&÷ræ÷¦öåö6÷7G5÷v—F†÷WEö6öÖÖ—76–öâ’À¢ö÷F–öæÅöÖöæW’‡&÷rçÆææVE÷&WfVçVR’À¢ö÷F–öæÅ÷W&6VçB‡&÷ræ6öÖÖ—76–öå÷&FR’À¢ö÷F–öæÅöÖöæW’‡&÷rçÆææVEö6öÖÖ—76–öâ’À¢ö÷F–öæÅöÖöæW’‡&÷rçÆææVE÷ö–çG2’À¢ö÷F–öæÅöÖöæW’‡&÷rçF†&ÆUö&6R’À¢ö÷F–öæÅöÖöæW’‡&÷rçF‚’À¢ö÷F–öæÅöÖöæW’‡&÷rç&öf—B’À¢ö÷F–öæÅöÖöæW’‡&÷rç&öf—E÷W%÷Væ—Eö&Vf÷&Uö6÷7B’À¢ö÷F–öæÅöÖöæW’‡&÷rææWE÷&öf—E÷W%÷Væ—B’À¢  ¦FVböÖöæW’‡fÇVS¢fÆöBÂæöæR’Óâ7G# ¢–bfÇVR—2æöæS ¢&WGW&â.(	B ¢&WGW&âb'·fÇVS¢Âã&gÒ(+Ò"ç&WÆ6R‚"Â"Â""  ¦FVb÷6–væVEöÖöæW’‡fÇVS¢fÆöB’Óâ7G# ¢&WGW&â‚"²"–bfÇVRâVÇ6R""’²öÖöæW’‡fÇVR  ¦FVb÷6–væVEöçVÖ&W"‡fÇVS¢fÆöB’Óâ7G# ¢&WGW&â‚"²"–bfÇVRâVÇ6R""’²öçVÖ&W"‡fÇVR  ¦FVböçVÖ&W"‡fÇVS¢fÆöB’Óâ7G# ¢&WGW&âb'·fÇVS¢Âã&gÒ"ç&WÆ6R‚"Â"Â""’ç'7G&—‚#"’ç'7G&—‚"â"  ¦FVb÷W&6VçB‡fÇVS¢fÆöB’Óâ7G# ¢&WGW&âb'·fÇVR¢¢Âã&gÒR"ç&WÆ6R‚"Â"Â""  ¦FVb÷6–væVE÷W&6VçFvU÷ö–çG2‡fÇVS¢fÆöB’Óâ7G# ¢&Vf—‚Ò"²"–bfÇVRâVÇ6R" ¢&WGW&âb'·&Vf—‡×·fÇVR¢¢Âã&gÒòíòâ"ç&WÆ6R‚"Â"Â""  ¦FVbö6ö×&—6öå÷W&6VçB†ÖWG&–3¢6ö×&—6öäÖWG&–2’Óâ7G# ¢fÇVRÒÖWG&–2æ6†ævU÷W&6Vç@¢–bfÇVR—2æöæS ¢&WGW&â#ÃR ¢–bfÇVRÓÒfÆöB‚&–æb"“ ¢&WGW&â-İí-íR}İ}]İR ¢&Vf—‚Ò"²"–bfÇVRâVÇ6R" ¢&WGW&â&Vf—‚²÷W&6VçB‡fÇVR  ¦FVbö6ö×&—6öåö·’†ÖWG&–3¢6ö×&—6öäÖWG&–2ÂÖöæW“¢&ööÂ’Óâ7G# ¢'6öÇWFRÒ÷6–væVEöÖöæW’†ÖWG&–2æ6†ævR’–bÖöæW’VÇ6R÷6–væVEöçVÖ&W"†ÖWG&–2æ6†ævR¢&WGW&âb'¶'6öÇWFWÒ+rµö6ö×&—6öå÷W&6VçB†ÖWG&–2—Ò   ¦FVbö†—5÷fÇVR‡fÇVS¢fÆöBÂÖWG&–3¢7G"’Óâ7G# ¢–bÖWG&–2ÓÒ'Væ—G2# ¢&WGW&âöçVÖ&W"‡fÇVR¢'6öÇWFRÒ'2‡fÇVR¢–b'6öÇWFRãÒóó ¢&WGW&âb'·fÇVRòóó¢ãgÒÍ½Ò ¢–b'6öÇWFRãÒó ¢&WGW&âb'·fÇVRòó¢ãgÒ-½â ¢&WGW&âb'·fÇVS¢ãgÒ   ¦FVb÷G&VæE÷fÇVR‡fÇVS¢fÆöBÂÖWG&–3¢7G"’Óâ7G# ¢&WGW&âöçVÖ&W"‡fÇVR’–bÖWG&–2ÓÒ'Væ—G2"VÇ6RöÖöæW’‡fÇVR  ¦FVb÷6†÷'E÷W&–öB‡fÇVS¢7G"’Óâ7G# ¢&WGW&âfÇVRç7Æ—B‚.(	2"Â•³Ğ  ¦FVbö÷F–öæÅöÖöæW’‡fÇVS¢fÆöBÂæöæR’Óâ7G# ¢&WGW&âöÖöæW’‡fÇVR’–bfÇVR—2æ÷BæöæRVÇ6R.(	B   ¦FVbö÷F–öæÅ÷W&6VçB‡fÇVS¢fÆöBÂæöæR’Óâ7G# ¢&WGW&â÷W&6VçB‡fÇVR’–bfÇVR—2æ÷BæöæRVÇ6R.(	B   ¦FVb÷Æ–åöçVÖ&W"‡fÇVS¢fÆöBÂæöæR’Óâ7G# ¢–bfÇVR—2æöæS ¢&WGW&â" ¢&WGW&âb'·fÇVS¢ãfgÒ"ç'7G&—‚#"’ç'7G&—‚"â"  ¦FVb÷'6UöçVÖ&W"‡fÇVS¢7G"’ÓâfÆöC ¢&WGW&âfÆöB‡fÇVRç&WÆ6R‚%ÇS"Â""’ç&WÆ6R‚""Â""’ç&WÆ6R‚"Â"Â"â"’ç&WÆ6R‚.(+Ò"Â""’ç&WÆ6R‚"R"Â""’ç7G&—‚’  ¦FVb÷W&–öE÷FW‡B‡7F'C¢7G"ÂæöæRÂVæC¢7G"ÂæöæR’Óâ7G# ¢–b7F'BæBVæC ¢&WGW&âb'µöFFUöF—7Æ’‡7F'B—Ş(	7µöFFUöF—7Æ’†VæB—Ò ¢&WGW&â-	ı]íBİRíı]M]½]Ò   ¦FVböFFUöF—7Æ’‡fÇVS¢7G"’Óâ7G# ¢'G2ÒfÇVU³£Òç7Æ—B‚"Ò"¢&WGW&â"â"æ¦ö–â‡&WfW'6VB‡'G2’’–bÆVâ‡'G2’ÓÒ2VÇ6RfÇVP  ¦FVbö&6·W÷F–ÖW7F×‡fÇVS¢7G"’Óâ7G# ¢G'“ ¢&WGW&âFFWF–ÖRæg&öÖ—6öf÷&ÖB‡fÇVR’ç7G&gF–ÖR‚"VBâVÒâU’Tƒ¢TÒ"¢W†6WBfÇVTW'&÷# ¢&WGW&âfÇVR÷"-M-İR=­}İ   ¦FVböf–ÆU÷6—¦R‡fÇVS¢–çB’Óâ7G# ¢6—¦RÒfÆöB‡fÇVR¢f÷"Væ—B–â‚-	"Â-	­	"Â-	Í	"Â-	=	"“ ¢–b6—¦RÂ#B÷"Væ—BÓÒ-	=	# ¢&WGW&âb'·6—¦S¢ãgÒ·Væ—GÒ"–bVæ—BÓÒ-	"VÇ6Rb'·6—¦S¢ãgÒ·Væ—GÒ ¢6—¦RóÒ#@¢&WGW&âb'·fÇVWÒ	   ¦FVbö6Æ7VÆF–öå÷W&–öB†6Æ7VÆF–öã¢'Vä6Æ7VÆF–öâ’Óâ7G# ¢–b6Æ7VÆF–öâçW&–öE÷7F'BæB6Æ7VÆF–öâçW&–öEöVæC ¢&WGW&âb'¶6Æ7VÆF–öâçW&–öE÷7F'C¢VBâVÒâU—Ş(	7¶6Æ7VÆF–öâçW&–öEöVæC¢VBâVÒâU—Ò ¢&WGW&â-İRíı]M]½]Ò   ¦FVböGWÆ–6FUöFW67&—F–öâ‡6÷W&6R’Óâ7G# ¢–b6÷W&6RæGWÆ–6FU÷'Våö–G3 ¢'Vç2Ò"Â"æ¦ö–â‚"2"²7G"‡fÇVR’f÷"fÇVR–â6÷W&6RæGWÆ–6FU÷'Våö–G2¢&WGW&âb.(
+"·6÷W&6RçF‚ææÖWÒ(	B=mR"}]-R·'Vç7Ò ¢&WGW&âb.(
+"·6÷W&6RçF‚ææÖWÒ(	Bí-ıM]"M==Â-½İİ½ÂM½íÂ   ¦FVböW†6ÇVFUöGWÆ–6FU÷6÷W&6W2‡6W76–öã¢–×÷'E6W76–öâ’ÓâæöæS ¢GWÆ–6FUö–G2Ò¶–B‡6÷W&6R’f÷"6÷W&6R–â6W76–öâæGWÆ–6FU÷6÷W&6W7Ğ¢6W76–öâç6÷W&6W2Ò·6÷W&6Rf÷"6÷W&6R–â6W76–öâç6÷W&6W2–b–B‡6÷W&6R’æ÷B–âGWÆ–6FUö–G5Ğ  ¦FVbö÷Vå÷F‚‡Fƒ¢F‚’ÓâæöæS ¢–b7—2çÆFf÷&ÒÓÒ'v–ã3"# ¢÷2ç7F'Ff–ÆR‡F‚’2G—S¢–væ÷&U¶GG"ÖFVf–æVEĞ¢VÆ–b7—2çÆFf÷&ÒÓÒ&F'v–â# ¢7V'&ö6W72å÷Vâ…²&÷Vâ"Â7G"‡F‚•Ò¢VÇ6S ¢7V'&ö6W72å÷Vâ…²'†FrÖ÷Vâ"Â7G"‡F‚•Ò  ¦FVb'Våö‚’ÓâæöæS ¢Òõ¥&–6TæÇ—¦W$‚¢æÖ–æÆö÷‚  ¦–bõöæÖUõòÓÒ%õöÖ–åõò# ¢'Våö‚

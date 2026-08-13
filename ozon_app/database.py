@@ -26,6 +26,7 @@ class Database:
         self._initialize()
         self._seed_defaults()
         self._ensure_product_order()
+        self._ensure_run_names()
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path)
@@ -94,6 +95,7 @@ class Database:
 
                 CREATE TABLE IF NOT EXISTS runs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    report_name TEXT,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     period_start TEXT,
                     period_end TEXT,
@@ -193,6 +195,9 @@ class Database:
             product_columns = {row[1] for row in db.execute("PRAGMA table_info(products)")}
             if "sort_order" not in product_columns:
                 db.execute("ALTER TABLE products ADD COLUMN sort_order INTEGER")
+            run_columns = {row[1] for row in db.execute("PRAGMA table_info(runs)")}
+            if "report_name" not in run_columns:
+                db.execute("ALTER TABLE runs ADD COLUMN report_name TEXT")
 
     def _seed_defaults(self) -> None:
         defaults = {
@@ -239,6 +244,18 @@ class Database:
                 for article in default_article_order(missing):
                     order = insert_at_group_end(order, article)
             self._write_product_order(db, order)
+
+    def _ensure_run_names(self) -> None:
+        with self.transaction() as db:
+            rows = db.execute(
+                "SELECT id, period_start, period_end FROM runs "
+                "WHERE report_name IS NULL OR trim(report_name) = ''"
+            ).fetchall()
+            for row in rows:
+                db.execute(
+                    "UPDATE runs SET report_name = ? WHERE id = ?",
+                    (_default_run_name(int(row["id"]), row["period_start"], row["period_end"]), row["id"]),
+                )
 
     def get_setting(self, key: str, default: str = "") -> str:
         with self.read() as db:
@@ -427,6 +444,17 @@ class Database:
                 ),
             )
             run_id = int(cursor.lastrowid)
+            db.execute(
+                "UPDATE runs SET report_name = ? WHERE id = ?",
+                (
+                    _default_run_name(
+                        run_id,
+                        _date_text(calculation.period_start),
+                        _date_text(calculation.period_end),
+                    ),
+                    run_id,
+                ),
+            )
             for source in calculation.source_files:
                 db.execute(
                     """
@@ -516,6 +544,7 @@ class Database:
                 """
                 SELECT id, created_at, period_start, period_end, source_count,
                        units, revenue, net_profit, unallocated_total, status
+                       , report_name
                 FROM runs
                 ORDER BY
                     COALESCE(period_start, period_end, substr(created_at, 1, 10)) DESC,
@@ -524,6 +553,55 @@ class Database:
                 """
             ).fetchall()
         return [RunSummary(**dict(row)) for row in rows]
+
+    def rename_run(self, run_id: int, report_name: str) -> None:
+        cleaned = " ".join(str(report_name).split())
+        if not cleaned:
+            raise ValueError("Наименование отчета не может быть пустым")
+        if len(cleaned) > 200:
+            raise ValueError("Наименование отчета не должно превышать 200 символов")
+        with self.transaction() as db:
+            cursor = db.execute(
+                "UPDATE runs SET report_name = ? WHERE id = ?",
+                (cleaned, run_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Расчет #{run_id} не найден")
+
+    def delete_run(self, run_id: int) -> int:
+        with self.transaction() as db:
+            stored_paths = [
+                str(row["stored_path"])
+                for row in db.execute(
+                    "SELECT stored_path FROM source_files WHERE run_id = ?",
+                    (run_id,),
+                ).fetchall()
+            ]
+            cursor = db.execute("DELETE FROM runs WHERE id = ?", (run_id,))
+            if cursor.rowcount == 0:
+                raise KeyError(f"Расчет #{run_id} не найден")
+
+        with self.read() as db:
+            remaining_paths = {
+                _resolved_path(str(row["stored_path"]))
+                for row in db.execute("SELECT DISTINCT stored_path FROM source_files").fetchall()
+            }
+
+        source_root = (self.path.parent / "source_files").resolve()
+        removed_files = 0
+        for stored_path in set(stored_paths):
+            candidate = _resolved_path(stored_path)
+            if candidate in remaining_paths or not _is_relative_to(candidate, source_root):
+                continue
+            try:
+                existed = candidate.is_file()
+                candidate.unlink(missing_ok=True)
+                removed_files += int(existed)
+            except OSError:
+                # The history record has already been removed. An inaccessible
+                # orphaned copy is harmless and can be cleaned up manually.
+                continue
+        return removed_files
 
     def load_calculation(self, run_id: int) -> RunCalculation:
         with self.read() as db:
@@ -654,6 +732,37 @@ def _date_text(value: date | None) -> str | None:
 
 def _parse_date(value: str | None) -> date | None:
     return date.fromisoformat(value) if value else None
+
+
+def _default_run_name(run_id: int, period_start: str | None, period_end: str | None) -> str:
+    start = _display_date(period_start)
+    end = _display_date(period_end)
+    if start and end and start != end:
+        return f"Отчет Ozon за {start}–{end}"
+    if start or end:
+        return f"Отчет Ozon за {start or end}"
+    return f"Отчет Ozon #{run_id}"
+
+
+def _display_date(value: str | None) -> str:
+    if not value:
+        return ""
+    try:
+        return date.fromisoformat(value).strftime("%d.%m.%Y")
+    except ValueError:
+        return value
+
+
+def _resolved_path(value: str) -> Path:
+    return Path(value).expanduser().resolve()
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
 
 
 def _product_result_tuple(run_id: int, item: ProductResult) -> tuple[object, ...]:
