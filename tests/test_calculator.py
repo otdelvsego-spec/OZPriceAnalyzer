@@ -20,12 +20,14 @@ def accrual(
     amount: float,
     quantity: float = 0,
     price: float = 0,
+    service_group: str = "",
+    order_id: str | None = None,
 ) -> AccrualRow:
     return AccrualRow(
         source_name="test.xlsx",
         sheet_name="Начисления",
         row_number=row,
-        accrual_id=f"order-{row}",
+        accrual_id=order_id or f"order-{row}",
         accrual_date=date(2026, 7, 1),
         accrual_type=accrual_type,
         article=article,
@@ -34,10 +36,91 @@ def accrual(
         quantity=quantity,
         seller_price=price,
         amount=amount,
+        service_group=service_group,
     )
 
 
 class CalculatorTests(unittest.TestCase):
+    def test_return_components_do_not_reduce_units_twice(self) -> None:
+        rows = [
+            accrual(2, "Выручка", "A-1", 840, 6, 175, "Продажи", "order-1"),
+            accrual(3, "Программы партнёров", "A-1", 8.4, 6, 175, "Продажи", "order-1"),
+            accrual(4, "Баллы за скидки", "A-1", 201.6, 6, 175, "Продажи", "order-1"),
+            accrual(5, "Возврат выручки", "A-1", -840, 6, -175, "Возвраты", "order-1"),
+            accrual(6, "Программы партнёров", "A-1", -8.4, 6, -175, "Возвраты", "order-1"),
+            accrual(7, "Баллы за скидки", "A-1", -201.6, 6, -175, "Возвраты", "order-1"),
+        ]
+        source = ParsedSource(
+            path=Path("test.xlsx"),
+            file_hash="abc",
+            report_type="ACCRUAL",
+            sheet_name="Начисления",
+            header_row=1,
+            accrual_rows=rows,
+        )
+
+        result = calculate_run([source], {"A-1": Product("A-1", "Товар", 10, 2)}, 0.04)
+
+        self.assertEqual(result.products[0].units, 0)
+        self.assertAlmostEqual(result.products[0].financial_result, 0)
+
+    def test_return_from_earlier_period_does_not_create_a_fake_sale(self) -> None:
+        rows = [
+            accrual(2, "Возврат выручки", "A-1", -2_285.7, 10, -274, "Возвраты", "old-order"),
+            accrual(3, "Программы партнёров", "A-1", -22.9, 10, -274, "Возвраты", "old-order"),
+            accrual(4, "Баллы за скидки", "A-1", -431.4, 10, -274, "Возвраты", "old-order"),
+        ]
+        source = ParsedSource(
+            path=Path("test.xlsx"),
+            file_hash="abc",
+            report_type="ACCRUAL",
+            sheet_name="Начисления",
+            header_row=1,
+            accrual_rows=rows,
+        )
+
+        result = calculate_run([source], {"A-1": Product("A-1", "Товар", 10, 2)}, 0.04)
+
+        self.assertEqual(result.products[0].units, -10)
+
+    def test_different_prices_in_one_order_are_counted_separately(self) -> None:
+        rows = [
+            accrual(2, "Выручка", "A-1", 100, 1, 100, "Продажи", "mixed-price"),
+            accrual(3, "Выручка", "A-1", 300, 1, 300, "Продажи", "mixed-price"),
+        ]
+        source = ParsedSource(
+            path=Path("test.xlsx"),
+            file_hash="abc",
+            report_type="ACCRUAL",
+            sheet_name="Начисления",
+            header_row=1,
+            accrual_rows=rows,
+        )
+
+        result = calculate_run([source], {"A-1": Product("A-1", "Товар", 10, 2)}, 0.04)
+
+        self.assertEqual(result.products[0].units, 2)
+
+    def test_old_report_without_service_group_ignores_negative_return_components(self) -> None:
+        rows = [
+            accrual(2, "Выручка", "A-1", 80, 1, 100, order_id="legacy"),
+            accrual(3, "Баллы за скидки", "A-1", 20, 1, 100, order_id="legacy"),
+            accrual(4, "Возврат выручки", "A-1", -80, 1, -100, order_id="legacy"),
+            accrual(5, "Баллы за скидки", "A-1", -20, 1, -100, order_id="legacy"),
+        ]
+        source = ParsedSource(
+            path=Path("legacy.xlsx"),
+            file_hash="abc",
+            report_type="ACCRUAL",
+            sheet_name="Начисления",
+            header_row=1,
+            accrual_rows=rows,
+        )
+
+        result = calculate_run([source], {"A-1": Product("A-1", "Товар", 10, 2)}, 0.04)
+
+        self.assertEqual(result.products[0].units, 0)
+
     def test_mixed_type_is_distributed_by_each_row(self) -> None:
         source = ParsedSource(
             path=Path("test.xlsx"),

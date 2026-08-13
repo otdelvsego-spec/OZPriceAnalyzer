@@ -152,6 +152,8 @@ class HistoryRecalculationTests(unittest.TestCase):
             self.assertEqual(repair.replaced_runs, 1)
             self.assertEqual(repair.recovered_product_rows, 1)
             self.assertAlmostEqual(repair.financial_result_delta, -7.5)
+            self.assertAlmostEqual(repair.units_delta, 0)
+            self.assertAlmostEqual(repair.net_profit_delta, -7.5)
             new_id = repair.old_to_new[old_id]
             run = service.db.list_runs()[0]
             self.assertEqual(run.id, new_id)

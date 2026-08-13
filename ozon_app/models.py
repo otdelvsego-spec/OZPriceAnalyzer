@@ -35,6 +35,7 @@ class AccrualRow:
     quantity: float
     seller_price: float
     amount: float
+    service_group: str = ""
 
 
 @dataclass(slots=True)

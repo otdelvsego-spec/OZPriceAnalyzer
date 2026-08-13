@@ -203,6 +203,7 @@ def _parse_accrual(ws, header_row: int, parsed: ParsedSource) -> None:
         )
     sku_column = _find_exact(columns, "SKU")
     name_column = _find_exact(columns, "Название товара")
+    service_group_column = _find_exact(columns, "Группа услуг")
     dates: list[date] = []
     for row_number in range(header_row + 1, _sheet_max_row(ws) + 1):
         accrual_type = display_text(ws.cell(row_number, positions["type"]).value)
@@ -225,6 +226,11 @@ def _parse_accrual(ws, header_row: int, parsed: ParsedSource) -> None:
                 quantity=as_float(ws.cell(row_number, positions["quantity"]).value),
                 seller_price=as_float(ws.cell(row_number, positions["price"]).value),
                 amount=as_float(ws.cell(row_number, positions["amount"]).value),
+                service_group=(
+                    display_text(ws.cell(row_number, service_group_column).value)
+                    if service_group_column
+                    else ""
+                ),
             )
         )
     if not parsed.accrual_rows:

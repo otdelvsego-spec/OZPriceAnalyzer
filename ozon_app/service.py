@@ -118,6 +118,8 @@ class HistoryRecalculationResult:
     recovered_product_rows: int
     financial_result_delta: float
     skipped_articles: int
+    units_delta: float = 0.0
+    net_profit_delta: float = 0.0
     old_to_new: dict[int, int] = field(default_factory=dict)
 
 
@@ -267,6 +269,8 @@ class AppService:
         plans: list[tuple[int, RunCalculation, dict[str, float], str]] = []
         recovered_rows = 0
         financial_delta = 0.0
+        units_delta = 0.0
+        net_profit_delta = 0.0
         skipped_count = 0
 
         # Parse and calculate every report before replacing a single history row.
@@ -341,10 +345,11 @@ class AppService:
                         previous is None or not _result_has_activity(previous)
                     ):
                         recovered_rows += 1
-                financial_delta += (
-                    calculation.totals()["financial_result"]
-                    - old.totals()["financial_result"]
-                )
+                new_totals = calculation.totals()
+                old_totals = old.totals()
+                financial_delta += new_totals["financial_result"] - old_totals["financial_result"]
+                units_delta += new_totals["units"] - old_totals["units"]
+                net_profit_delta += new_totals["net_profit"] - old_totals["net_profit"]
                 skipped_count += len(calculation.skipped_articles)
                 plans.append(
                     (run.id, calculation, self.db.planned_prices(run.id), run.created_at)
@@ -368,6 +373,8 @@ class AppService:
             recovered_product_rows=recovered_rows,
             financial_result_delta=financial_delta,
             skipped_articles=skipped_count,
+            units_delta=units_delta,
+            net_profit_delta=net_profit_delta,
             old_to_new=old_to_new,
         )
 

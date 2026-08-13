@@ -6,7 +6,7 @@ from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 
 from .excel_reader import all_rows, normalize_text
-from .models import ParsedSource, Product, ProductResult, RunCalculation, ScenarioRow, UnknownProduct
+from .models import AccrualRow, ParsedSource, Product, ProductResult, RunCalculation, ScenarioRow, UnknownProduct
 
 
 class CalculationError(ValueError):
@@ -15,6 +15,31 @@ class CalculationError(ValueError):
 
 def _type_key(value: str) -> str:
     return normalize_text(value).replace("ё", "е")
+
+
+_SALE_COMPONENT_TYPES = {
+    _type_key("Выручка"),
+    _type_key("Программы партнёров"),
+    _type_key("Баллы за скидки"),
+}
+_SALES_SERVICE_GROUP = _type_key("Продажи")
+
+
+def _is_sale_component(row: AccrualRow, type_key: str) -> bool:
+    """Return True only for components that belong to an actual sale.
+
+    Ozon repeats partner-program and points rows in the ``Возвраты``
+    service group with negative amounts.  Treating those rows as sales and then
+    subtracting ``Возврат выручки`` quantity counts the same return twice.
+    Older saved reports may not expose ``Группа услуг``; for them a positive
+    amount is the safest compatible indication of a sale component.
+    """
+    if type_key not in _SALE_COMPONENT_TYPES:
+        return False
+    group_key = _type_key(row.service_group)
+    if group_key:
+        return group_key == _SALES_SERVICE_GROUP
+    return row.amount > 0
 
 
 def distribution_status(with_article: int, without_article: int, empty: str = "НЕТ ДАННЫХ") -> str:
@@ -160,7 +185,7 @@ def calculate_run(
     skipped_detail: dict[str, str] = {}
     skipped_accrual_amounts: dict[str, float] = defaultdict(float)
     skipped_realization_amounts: dict[str, float] = defaultdict(float)
-    sales_orders: dict[tuple[str, str], list[float]] = {}
+    sales_orders: dict[tuple[str, str, float], list[float]] = {}
     returns_by_article: dict[str, float] = defaultdict(float)
     accrual_revenue_keys: set[tuple[str, str]] = set()
     unallocated_total = 0.0
@@ -200,17 +225,16 @@ def calculate_run(
                     sku_map[row.sku] = row.article
 
             key = _type_key(row.accrual_type)
-            if key in {_type_key("Выручка"), _type_key("Программы партнёров"), _type_key("Баллы за скидки")}:
+            if _is_sale_component(row, key):
                 if row.accrual_id and row.sku:
                     accrual_revenue_keys.add((row.sku, normalize_text(row.accrual_id)))
                 order_id = row.accrual_id or f"{row.source_name}#{row.row_number}"
-                order_key = (order_id, row.article)
-                order = sales_orders.setdefault(order_key, [0.0, 0.0, 0.0])
+                seller_price = round(abs(row.seller_price), 6)
+                order_key = (order_id, row.article, seller_price)
+                order = sales_orders.setdefault(order_key, [0.0, 0.0])
                 order[0] += row.amount
-                if abs(row.seller_price) > 0:
-                    order[1] = abs(row.seller_price)
                 if key == _type_key("Выручка"):
-                    order[2] += abs(row.quantity)
+                    order[1] += abs(row.quantity)
             elif key == _type_key("Возврат выручки"):
                 returns_by_article[row.article] += abs(row.quantity)
         else:
@@ -219,7 +243,7 @@ def calculate_run(
             item[1] = int(item[1]) + 1
             item[2] = float(item[2]) + row.amount
 
-    for (_, article), (amount, seller_price, source_quantity) in sales_orders.items():
+    for (_, article, seller_price), (amount, source_quantity) in sales_orders.items():
         if article not in results:
             continue
         if seller_price > 0:
