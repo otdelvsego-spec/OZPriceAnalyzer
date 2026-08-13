@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from ozon_app.database import Database
@@ -33,7 +34,7 @@ class HistoryManagementTests(unittest.TestCase):
     def test_existing_database_gets_report_names_without_losing_runs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "old.sqlite3"
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db:
                 db.execute(
                     """
                     CREATE TABLE runs (
