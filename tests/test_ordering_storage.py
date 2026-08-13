@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 from ozon_app.config import (
@@ -60,7 +61,7 @@ class ProductOrderingTests(unittest.TestCase):
     def test_existing_database_without_sort_column_is_upgraded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "old.sqlite3"
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db:
                 db.execute(
                     """
                     CREATE TABLE products (
@@ -78,6 +79,7 @@ class ProductOrderingTests(unittest.TestCase):
                     "INSERT INTO products(article, name) VALUES (?, ?)",
                     [("Бант 02", "Бант"), ("ГС2", "ГС"), ("БРГС10", "БРГС")],
                 )
+                db.commit()
             database = Database(path)
             self.assertEqual(
                 [product.article for product in database.list_products()],
