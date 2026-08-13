@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import tempfile
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -111,6 +112,15 @@ class ImportBatch:
         ]
 
 
+@dataclass(slots=True)
+class HistoryRecalculationResult:
+    replaced_runs: int
+    recovered_product_rows: int
+    financial_result_delta: float
+    skipped_articles: int
+    old_to_new: dict[int, int] = field(default_factory=dict)
+
+
 class AppService:
     def __init__(self, base_dir: Path | None = None):
         self.paths = ensure_app_dirs(base_dir)
@@ -203,10 +213,11 @@ class AppService:
         tax_rate = float(self.db.get_setting("tax_rate", "0.04"))
         if tax_rate < 0 or tax_rate > 1:
             raise ValueError("Налоговая ставка должна быть от 0 до 100%")
-        product_map = self.db.product_map(active_only=True)
+        # Archived products remain valid calculation targets when their article
+        # is present in an imported source row.
+        product_map = self.db.product_map(active_only=False)
         for product in created_products or []:
-            if product.active:
-                product_map[product.article] = product
+            product_map[product.article] = product
 
         # Calculate every period before changing history. A malformed later month
         # therefore cannot leave a normally failed batch half-created.
@@ -245,6 +256,144 @@ class AppService:
     def latest_run_id(self) -> int | None:
         runs = self.db.list_runs()
         return runs[-1].id if runs else None
+
+    def recalculate_history(self) -> HistoryRecalculationResult:
+        """Rebuild saved runs from stored XLSX while preserving historical inputs."""
+        runs = self.db.list_runs()
+        if not runs:
+            return HistoryRecalculationResult(0, 0, 0.0, 0)
+
+        current_products = self.db.product_map(active_only=False)
+        plans: list[tuple[int, RunCalculation, dict[str, float], str]] = []
+        recovered_rows = 0
+        financial_delta = 0.0
+        skipped_count = 0
+
+        # Parse and calculate every report before replacing a single history row.
+        # A missing or damaged source therefore leaves the whole history untouched.
+        with tempfile.TemporaryDirectory(prefix="ozprice_history_recalc_") as temp_name:
+            temp_root = Path(temp_name)
+            for run in runs:
+                old = self.db.load_calculation(run.id)
+                source_records = self.db.list_source_files(run.id)
+                if not source_records:
+                    raise ValueError(
+                        f"У отчета «{run.report_name}» нет сохраненных исходных файлов. "
+                        "История не изменена."
+                    )
+
+                run_root = temp_root / str(run.id)
+                run_root.mkdir(parents=True)
+                parsed_sources: list[ParsedSource] = []
+                for index, record in enumerate(source_records, start=1):
+                    stored_path = Path(str(record["stored_path"]))
+                    if not stored_path.is_file():
+                        raise ValueError(
+                            f"Не найден сохраненный исходный файл «{record['original_name']}» "
+                            f"для отчета «{run.report_name}». История не изменена."
+                        )
+                    original_name = Path(str(record["original_name"])).name
+                    destination = run_root / original_name
+                    if destination.exists():
+                        destination = run_root / f"{index}_{original_name}"
+                    shutil.copy2(stored_path, destination)
+                    source = parse_report(destination)
+                    source.duplicate_run_ids = self.db.find_runs_by_hash(source.file_hash)
+                    parsed_sources.append(source)
+
+                historical_products = {
+                    item.article: Product(
+                        article=item.article,
+                        name=item.name,
+                        material_cost=item.material_cost,
+                        labor_cost=item.labor_cost,
+                        active=True,
+                        category=item.category,
+                    )
+                    for item in old.products
+                }
+                referenced_articles = {
+                    row.article
+                    for source in parsed_sources
+                    for row in source.accrual_rows
+                    if row.article
+                } | {
+                    row.raw_article
+                    for source in parsed_sources
+                    for row in source.realization_rows
+                    if row.raw_article
+                }
+                for article in referenced_articles:
+                    if article not in historical_products and article in current_products:
+                        historical_products[article] = current_products[article]
+
+                calculation = calculate_run(
+                    parsed_sources,
+                    historical_products,
+                    tax_rate=old.tax_rate,
+                )
+                calculation.source_period_warnings = list(old.source_period_warnings)
+
+                old_by_article = {item.article: item for item in old.products}
+                for item in calculation.products:
+                    previous = old_by_article.get(item.article)
+                    if _result_has_activity(item) and (
+                        previous is None or not _result_has_activity(previous)
+                    ):
+                        recovered_rows += 1
+                financial_delta += (
+                    calculation.totals()["financial_result"]
+                    - old.totals()["financial_result"]
+                )
+                skipped_count += len(calculation.skipped_articles)
+                plans.append(
+                    (run.id, calculation, self.db.planned_prices(run.id), run.created_at)
+                )
+
+            old_to_new: dict[int, int] = {}
+            for old_id, calculation, planned_prices, created_at in plans:
+                stored_paths = self._store_source_files(calculation.source_files)
+                new_id = self.db.save_run(
+                    calculation,
+                    stored_paths,
+                    replace_run_ids=[old_id],
+                )
+                self.db.set_run_created_at(new_id, created_at)
+                for article, price in planned_prices.items():
+                    self.db.save_planned_price(new_id, article, price)
+                old_to_new[old_id] = new_id
+
+        return HistoryRecalculationResult(
+            replaced_runs=len(plans),
+            recovered_product_rows=recovered_rows,
+            financial_result_delta=financial_delta,
+            skipped_articles=skipped_count,
+            old_to_new=old_to_new,
+        )
+
+
+def _result_has_activity(item) -> bool:
+    return any(
+        abs(value) > 0.000001
+        for value in (
+            item.units,
+            item.revenue_no_points,
+            item.partner_programs,
+            item.points,
+            item.commission,
+            item.processing,
+            item.delivery,
+            item.logistics,
+            item.reverse_logistics,
+            item.returns_cancels,
+            item.acquiring,
+            item.stars,
+            item.packaging,
+            item.compensation,
+            item.other,
+            item.financial_result,
+        )
+    )
 
 
 def _month_list(months: set[tuple[int, int]]) -> str:

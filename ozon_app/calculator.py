@@ -130,7 +130,20 @@ def calculate_run(
     skipped_articles: set[str] | None = None,
 ) -> RunCalculation:
     skipped_articles = skipped_articles or set()
-    active_products = {key: value for key, value in products.items() if value.active}
+    accrual_rows, realization_rows = all_rows(sources)
+    referenced_articles = {
+        row.article for row in accrual_rows if row.article
+    } | {
+        row.raw_article for row in realization_rows if row.raw_article
+    }
+    # An archived catalog item can still have a legitimate charge (for example,
+    # acquiring, logistics or return processing).  Its rows must not disappear
+    # merely because there were no sales or the item was archived after the sale.
+    calculation_products = {
+        key: value
+        for key, value in products.items()
+        if (value.active or key in referenced_articles) and key not in skipped_articles
+    }
     results = {
         article: ProductResult(
             article=product.article,
@@ -139,17 +152,20 @@ def calculate_run(
             labor_cost=product.labor_cost,
             category=product.category,
         )
-        for article, product in active_products.items()
+        for article, product in calculation_products.items()
     }
-    accrual_rows, realization_rows = all_rows(sources)
-    sku_map, sku_conflicts = build_sku_map(accrual_rows, set(active_products))
+    sku_map, sku_conflicts = build_sku_map(accrual_rows, set(calculation_products))
     current_stats: dict[str, list[object]] = {}
     breakdown: dict[str, list[object]] = {}
     skipped_detail: dict[str, str] = {}
+    skipped_accrual_amounts: dict[str, float] = defaultdict(float)
+    skipped_realization_amounts: dict[str, float] = defaultdict(float)
     sales_orders: dict[tuple[str, str], list[float]] = {}
     returns_by_article: dict[str, float] = defaultdict(float)
     accrual_revenue_keys: set[tuple[str, str]] = set()
     unallocated_total = 0.0
+    allocated_accrual_total = 0.0
+    skipped_accrual_total = 0.0
 
     dates = [row.accrual_date for row in accrual_rows if row.accrual_date]
     period_start: date | None = min(dates) if dates else None
@@ -166,9 +182,12 @@ def calculate_run(
                     row.article,
                     f"{row.article} — {row.product_name or row.article} ({row.source_name}, строка {row.row_number})",
                 )
+                skipped_accrual_amounts[row.article] += row.amount
+                skipped_accrual_total += row.amount
                 continue
             result = results[row.article]
             result.financial_result += row.amount
+            allocated_accrual_total += row.amount
             field_name, _ = accrual_category(row.accrual_type)
             setattr(result, field_name, getattr(result, field_name) + row.amount)
 
@@ -242,11 +261,16 @@ def calculate_run(
         if not article and row.raw_article in results:
             article = row.raw_article
         if not article or article in skipped_articles:
-            candidate = article or row.raw_article
+            candidate = (
+                article
+                or row.raw_article
+                or (f"SKU {row.sku}" if row.sku else "Неопознанный товар")
+            )
             skipped_detail.setdefault(
                 candidate,
                 f"{candidate} — {row.product_name or candidate} ({row.source_name}, строка {row.row_number})",
             )
+            skipped_realization_amounts[candidate] += row.amount
             continue
         result = results[article]
         result.units += row.quantity
@@ -254,6 +278,30 @@ def calculate_run(
         result.financial_result += row.amount
         realization_revenue += row.amount
         realization_units += row.quantity
+
+    source_accrual_total = sum(row.amount for row in accrual_rows)
+    allocation_difference = (
+        source_accrual_total
+        - allocated_accrual_total
+        - unallocated_total
+        - skipped_accrual_total
+    )
+    if abs(allocation_difference) > 0.01:
+        raise CalculationError(
+            "Не сошелся контроль распределения начислений: "
+            f"расхождение {allocation_difference:.2f} руб."
+        )
+
+    for article, message in list(skipped_detail.items()):
+        details: list[str] = []
+        accrual_amount = skipped_accrual_amounts.get(article, 0.0)
+        realization_amount = skipped_realization_amounts.get(article, 0.0)
+        if abs(accrual_amount) > 0.000001:
+            details.append(f"начисления: {_money_ru(accrual_amount)}")
+        if abs(realization_amount) > 0.000001:
+            details.append(f"выкупленная выручка: {_money_ru(realization_amount)}")
+        if details:
+            skipped_detail[article] = f"{message}; пропущенная сумма — {', '.join(details)}"
 
     stats = {
         str(values[0]): (int(values[1]), int(values[2]))
@@ -351,6 +399,10 @@ def calculate_scenario(result: ProductResult, tax_rate: float, planned_price: fl
 
 def _round_half_up(value: float) -> float:
     return float(Decimal(str(value)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def _money_ru(value: float) -> str:
+    return f"{value:,.2f}".replace(",", " ").replace(".", ",") + " руб."
 
 
 def clone_result(result: ProductResult) -> ProductResult:

@@ -93,6 +93,34 @@ class CalculatorTests(unittest.TestCase):
 
         self.assertEqual(result.unallocated_total, 0)
         self.assertIn("UNKNOWN", result.skipped_articles)
+        self.assertIn("-100,00 руб.", result.skipped_articles["UNKNOWN"])
+
+    def test_archived_product_keeps_charges_even_without_sales(self) -> None:
+        source = ParsedSource(
+            path=Path("test.xlsx"),
+            file_hash="abc",
+            report_type="ACCRUAL",
+            sheet_name="Начисления",
+            header_row=1,
+            accrual_rows=[accrual(2, "Эквайринг", "ARCHIVE-1", -7.5)],
+        )
+        products = {
+            "ARCHIVE-1": Product(
+                "ARCHIVE-1", "Архивный тестовый товар", 50, 50, active=False
+            ),
+            "Архив без строк": Product(
+                "Архив без строк", "Старый товар", 10, 5, active=False
+            ),
+        }
+
+        result = calculate_run([source], products, 0.04)
+
+        self.assertEqual([item.article for item in result.products], ["ARCHIVE-1"])
+        item = result.products[0]
+        self.assertEqual(item.units, 0)
+        self.assertAlmostEqual(item.acquiring, -7.5)
+        self.assertAlmostEqual(item.financial_result, -7.5)
+        self.assertAlmostEqual(item.net_profit(0.04), -7.5)
 
     def test_scenario_matches_v11_formula_chain(self) -> None:
         product = ProductResult(

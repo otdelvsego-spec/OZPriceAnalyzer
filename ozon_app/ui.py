@@ -737,6 +737,11 @@ class OZPriceAnalyzerApp(tk.Tk):
             text="Восстановить / перенести",
             command=self.restore_application_backup,
         ).grid(row=0, column=1, padx=4)
+        ttk.Button(
+            backup_actions,
+            text="Пересчитать историю",
+            command=self.recalculate_saved_history,
+        ).grid(row=0, column=2, padx=4)
 
         product_header = ttk.Frame(self.settings_tab)
         product_header.grid(row=2, column=0, sticky="ew", pady=(6, 8))
@@ -1757,6 +1762,70 @@ class OZPriceAnalyzerApp(tk.Tk):
             )
         except Exception as exc:
             messagebox.showerror("Резервная копия", str(exc), parent=self)
+        finally:
+            self.configure(cursor="")
+            self.status_var.set(self._current_run_status())
+
+    def recalculate_saved_history(self) -> None:
+        runs = self.db.list_runs()
+        if not runs:
+            messagebox.showinfo(
+                "Перерасчет истории",
+                "В истории пока нет сохраненных отчетов.",
+                parent=self,
+            )
+            return
+        confirmed = messagebox.askyesno(
+            "Пересчитать историю",
+            f"Будут заново рассчитаны все сохраненные отчеты: {len(runs)}.\n\n"
+            "Используются сохраненные копии исходных XLSX. Начисления известных "
+            "артикулов будут учтены даже для архивных товаров и товаров без продаж.\n\n"
+            "Наименования отчетов, историческая себестоимость и плановые цены сохранятся. "
+            "Перед перерасчетом приложение автоматически создаст резервную копию. "
+            "Продолжить?",
+            parent=self,
+        )
+        if not confirmed:
+            return
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = (
+            self.service.paths["backups"]
+            / f"Автокопия_перед_перерасчетом_{stamp}.ozbackup"
+        )
+        self.configure(cursor="watch")
+        self.status_var.set("Проверка исходных файлов и перерасчет истории…")
+        self.update_idletasks()
+        try:
+            create_backup(self.service.paths["root"], backup_path)
+            old_current_id = self.current_run_id
+            old_overview_ids = set(self.overview_run_ids)
+            result = self.service.recalculate_history()
+            self.current_run_id = result.old_to_new.get(old_current_id, old_current_id)
+            self.overview_run_ids = {
+                result.old_to_new.get(run_id, run_id)
+                for run_id in old_overview_ids
+            }
+            self.current_calculation = None
+            self.overview_calculation = None
+            self.refresh_all()
+            messagebox.showinfo(
+                "Перерасчет завершен",
+                f"Пересчитано отчетов: {result.replaced_runs}.\n"
+                f"Восстановлено товарных строк с движением: {result.recovered_product_rows}.\n"
+                f"Изменение финансового результата товаров: "
+                f"{_money(result.financial_result_delta)}.\n"
+                f"Неизвестных пропущенных артикулов: {result.skipped_articles}.\n\n"
+                f"Резервная копия до перерасчета:\n{backup_path}",
+                parent=self,
+            )
+        except Exception as exc:
+            messagebox.showerror(
+                "Перерасчет истории",
+                f"Историю не удалось пересчитать:\n{exc}\n\n"
+                f"Резервная копия до операции: {backup_path}",
+                parent=self,
+            )
         finally:
             self.configure(cursor="")
             self.status_var.set(self._current_run_status())

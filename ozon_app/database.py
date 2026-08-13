@@ -677,6 +677,15 @@ class Database:
             if cursor.rowcount == 0:
                 raise KeyError(f"Расчет #{run_id} не найден")
 
+    def set_run_created_at(self, run_id: int, created_at: str) -> None:
+        with self.transaction() as db:
+            cursor = db.execute(
+                "UPDATE runs SET created_at = ? WHERE id = ?",
+                (created_at, run_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Расчет #{run_id} не найден")
+
     def delete_run(self, run_id: int) -> int:
         with self.transaction() as db:
             stored_paths = [
