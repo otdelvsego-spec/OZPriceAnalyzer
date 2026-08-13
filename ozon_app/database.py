@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sqlite3
 from collections import Counter
 from contextlib import contextmanager
@@ -9,7 +8,7 @@ from pathlib import Path
 from typing import Iterator
 
 from .calculator import distribution_status, guide_target
-from .config import DEFAULT_TAX_RATE, resource_path
+from .config import DEFAULT_TAX_RATE
 from .excel_reader import normalize_text
 from .models import ParsedSource, Product, ProductResult, RunCalculation, RunSummary
 from .ordering import default_article_order, insert_at_group_end
@@ -68,6 +67,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS products (
                     article TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT '',
                     material_cost REAL NOT NULL DEFAULT 0,
                     labor_cost REAL NOT NULL DEFAULT 0,
                     active INTEGER NOT NULL DEFAULT 1,
@@ -82,6 +82,8 @@ class Database:
                     article TEXT NOT NULL,
                     old_name TEXT,
                     new_name TEXT NOT NULL,
+                    old_category TEXT,
+                    new_category TEXT NOT NULL DEFAULT '',
                     old_material_cost REAL,
                     new_material_cost REAL NOT NULL,
                     old_labor_cost REAL,
@@ -137,6 +139,7 @@ class Database:
                     run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
                     article TEXT NOT NULL,
                     name TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT '',
                     material_cost REAL NOT NULL,
                     labor_cost REAL NOT NULL,
                     units REAL NOT NULL,
@@ -195,6 +198,20 @@ class Database:
             product_columns = {row[1] for row in db.execute("PRAGMA table_info(products)")}
             if "sort_order" not in product_columns:
                 db.execute("ALTER TABLE products ADD COLUMN sort_order INTEGER")
+            if "category" not in product_columns:
+                db.execute("ALTER TABLE products ADD COLUMN category TEXT NOT NULL DEFAULT ''")
+            history_columns = {row[1] for row in db.execute("PRAGMA table_info(product_cost_history)")}
+            if "old_category" not in history_columns:
+                db.execute("ALTER TABLE product_cost_history ADD COLUMN old_category TEXT")
+            if "new_category" not in history_columns:
+                db.execute(
+                    "ALTER TABLE product_cost_history ADD COLUMN new_category TEXT NOT NULL DEFAULT ''"
+                )
+            result_columns = {row[1] for row in db.execute("PRAGMA table_info(product_results)")}
+            if "category" not in result_columns:
+                db.execute(
+                    "ALTER TABLE product_results ADD COLUMN category TEXT NOT NULL DEFAULT ''"
+                )
             run_columns = {row[1] for row in db.execute("PRAGMA table_info(runs)")}
             if "report_name" not in run_columns:
                 db.execute("ALTER TABLE runs ADD COLUMN report_name TEXT")
@@ -209,22 +226,6 @@ class Database:
         with self.transaction() as db:
             for key, value in defaults.items():
                 db.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (key, value))
-            if db.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
-                seed_path = resource_path("products_seed.json")
-                if seed_path.exists():
-                    for item in json.loads(seed_path.read_text(encoding="utf-8")):
-                        db.execute(
-                            """
-                            INSERT OR IGNORE INTO products(article, name, material_cost, labor_cost)
-                            VALUES (?, ?, ?, ?)
-                            """,
-                            (
-                                item["article"],
-                                item["name"],
-                                float(item.get("material_cost", 0)),
-                                float(item.get("labor_cost", 0)),
-                            ),
-                        )
 
     def _ensure_product_order(self) -> None:
         with self.transaction() as db:
@@ -273,7 +274,7 @@ class Database:
             )
 
     def list_products(self, active_only: bool = False) -> list[Product]:
-        sql = "SELECT article, name, material_cost, labor_cost, active, sort_order FROM products"
+        sql = "SELECT article, name, category, material_cost, labor_cost, active, sort_order FROM products"
         parameters: tuple[object, ...] = ()
         if active_only:
             sql += " WHERE active = 1"
@@ -288,6 +289,7 @@ class Database:
                 labor_cost=float(row["labor_cost"]),
                 active=bool(row["active"]),
                 sort_order=int(row["sort_order"]) if row["sort_order"] is not None else None,
+                category=str(row["category"] or ""),
             )
             for row in rows
         ]
@@ -317,11 +319,12 @@ class Database:
                 article = product.article.strip()
                 name = product.name.strip() or article
                 old = db.execute(
-                    "SELECT name, material_cost, labor_cost, active FROM products WHERE article = ?",
+                    "SELECT name, category, material_cost, labor_cost, active FROM products WHERE article = ?",
                     (article,),
                 ).fetchone()
                 is_changed = old is None or (
                     old["name"] != name
+                    or str(old["category"] or "") != product.category.strip()
                     or abs(float(old["material_cost"]) - product.material_cost) >= 0.005
                     or abs(float(old["labor_cost"]) - product.labor_cost) >= 0.005
                     or bool(old["active"]) != product.active
@@ -334,14 +337,17 @@ class Database:
                 db.execute(
                     """
                     INSERT INTO product_cost_history(
-                        article, old_name, new_name, old_material_cost, new_material_cost,
+                        article, old_name, new_name, old_category, new_category,
+                        old_material_cost, new_material_cost,
                         old_labor_cost, new_labor_cost, old_active, new_active, change_source
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         article,
                         old["name"] if old else None,
                         name,
+                        str(old["category"] or "") if old else None,
+                        product.category.strip(),
                         float(old["material_cost"]) if old else None,
                         product.material_cost,
                         float(old["labor_cost"]) if old else None,
@@ -353,16 +359,30 @@ class Database:
                 )
                 db.execute(
                     """
-                    INSERT INTO products(article, name, material_cost, labor_cost, active)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO products(article, name, category, material_cost, labor_cost, active)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     ON CONFLICT(article) DO UPDATE SET
                         name = excluded.name,
+                        category = excluded.category,
                         material_cost = excluded.material_cost,
                         labor_cost = excluded.labor_cost,
                         active = excluded.active,
                         updated_at = CURRENT_TIMESTAMP
                     """,
-                    (article, name, product.material_cost, product.labor_cost, 1 if product.active else 0),
+                    (
+                        article,
+                        name,
+                        product.category.strip(),
+                        product.material_cost,
+                        product.labor_cost,
+                        1 if product.active else 0,
+                    ),
+                )
+                # Категория — текущая классификация товара, а не расчетный показатель.
+                # Обновляем ее во всей истории, не затрагивая сохраненную себестоимость и суммы.
+                db.execute(
+                    "UPDATE product_results SET category = ? WHERE article = ?",
+                    (product.category.strip(), article),
                 )
             if new_articles:
                 current = [
@@ -385,6 +405,13 @@ class Database:
                 raise ValueError("Порядок должен содержать все товары справочника")
             self._write_product_order(db, articles)
 
+    def clear_products(self) -> int:
+        """Delete the editable product catalog without changing saved report snapshots."""
+        with self.transaction() as db:
+            count = int(db.execute("SELECT COUNT(*) FROM products").fetchone()[0])
+            db.execute("DELETE FROM products")
+        return count
+
     @staticmethod
     def _write_product_order(db: sqlite3.Connection, articles: list[str]) -> None:
         db.executemany(
@@ -397,6 +424,7 @@ class Database:
             rows = db.execute(
                 """
                 SELECT changed_at, article, old_name, new_name,
+                       old_category, new_category,
                        old_material_cost, new_material_cost,
                        old_labor_cost, new_labor_cost,
                        old_active, new_active, change_source
@@ -538,8 +566,13 @@ class Database:
             for item in calculation.products:
                 db.execute(
                     """
-                    INSERT INTO product_results VALUES (
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    INSERT INTO product_results(
+                        run_id, article, name, category, material_cost, labor_cost, units,
+                        revenue_no_points, partner_programs, points, commission, processing,
+                        delivery, logistics, reverse_logistics, returns_cancels, acquiring,
+                        stars, packaging, compensation, other, financial_result
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                     )
                     """,
                     _product_result_tuple(run_id, item),
@@ -857,6 +890,7 @@ def _product_result_tuple(run_id: int, item: ProductResult) -> tuple[object, ...
         run_id,
         item.article,
         item.name,
+        item.category,
         item.material_cost,
         item.labor_cost,
         item.units,
@@ -882,6 +916,7 @@ def _row_to_product_result(row: sqlite3.Row) -> ProductResult:
     return ProductResult(
         article=row["article"],
         name=row["name"],
+        category=str(row["category"] or ""),
         material_cost=float(row["material_cost"]),
         labor_cost=float(row["labor_cost"]),
         units=float(row["units"]),

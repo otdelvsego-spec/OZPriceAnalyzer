@@ -33,15 +33,26 @@ class ProductOrderingTests(unittest.TestCase):
             ["БРГС2", "БРГС10", "ГС3", "ГС20", "Бант 2", "Бант 10", "Другое"],
         )
 
-    def test_database_initial_order_and_manual_order_are_persistent(self) -> None:
+    def test_new_database_starts_with_empty_catalog(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "app.sqlite3"
             database = Database(path)
+            self.assertEqual(database.list_products(), [])
+
+    def test_manual_order_is_persistent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "app.sqlite3"
+            database = Database(path)
+            database.save_products(
+                [
+                    Product("БРГС2", "БРГС 2"),
+                    Product("БРГС10", "БРГС 10"),
+                    Product("ГС3", "ГС 3"),
+                    Product("Бант 02", "Бант 02"),
+                ],
+                source="Тест",
+            )
             initial = [product.article for product in database.list_products()]
-            self.assertTrue(initial[:8] == default_article_order(initial)[:8])
-            self.assertTrue(all(article.startswith("БРГС") for article in initial[:8]))
-            self.assertTrue(all(article.startswith("ГС") for article in initial[8:14]))
-            self.assertTrue(all(article.casefold().startswith("бант") for article in initial[14:]))
 
             changed = list(initial)
             changed[0], changed[1] = changed[1], changed[0]
@@ -52,6 +63,14 @@ class ProductOrderingTests(unittest.TestCase):
     def test_new_product_is_inserted_at_end_of_its_group(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Database(Path(directory) / "app.sqlite3")
+            database.save_products(
+                [
+                    Product("БРГС1", "БРГС"),
+                    Product("ГС1", "ГС"),
+                    Product("Бант 01", "Бант"),
+                ],
+                source="Тест",
+            )
             database.save_product(Product("ГС999", "Новый ГС", 10, 2))
             articles = [product.article for product in database.list_products()]
             position = articles.index("ГС999")

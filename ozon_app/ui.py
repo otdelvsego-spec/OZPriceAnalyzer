@@ -42,6 +42,18 @@ TREND_METRICS = {
     "Продажи, шт.": "units",
     "Нераспределенные доходы / расходы": "unallocated",
 }
+CATEGORY_ALL = "Все категории"
+CATEGORY_EMPTY = "Без категории"
+SORT_NONE = "Без сортировки"
+SORT_METRICS = (
+    SORT_NONE,
+    "Доходность",
+    "Чистая прибыль",
+    "Выручка",
+    "Количество продаж",
+)
+SORT_ASCENDING = "По возрастанию (А-Я)"
+SORT_DESCENDING = "По убыванию (Я-А)"
 
 
 class OZPriceAnalyzerApp(tk.Tk):
@@ -146,7 +158,7 @@ class OZPriceAnalyzerApp(tk.Tk):
 
     def _build_overview_tab(self) -> None:
         self.overview_tab.columnconfigure(0, weight=1)
-        self.overview_tab.rowconfigure(2, weight=1)
+        self.overview_tab.rowconfigure(3, weight=1)
         ttk.Label(self.overview_tab, text="Итоговый отчет", style="Section.TLabel").grid(
             row=0, column=0, sticky="w", pady=(10, 8)
         )
@@ -172,15 +184,53 @@ class OZPriceAnalyzerApp(tk.Tk):
                 row=1, column=0, sticky="w", pady=(5, 0)
             )
 
+        filters = ttk.Frame(self.overview_tab)
+        filters.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        filters.columnconfigure(10, weight=1)
+        ttk.Label(filters, text="Категория:").grid(row=0, column=0, padx=(0, 6))
+        self.overview_category_var = tk.StringVar(value=CATEGORY_ALL)
+        self.overview_category_combo = ttk.Combobox(
+            filters, textvariable=self.overview_category_var, state="readonly", width=24
+        )
+        self.overview_category_combo.grid(row=0, column=1, padx=(0, 14))
+        self.overview_category_combo.bind("<<ComboboxSelected>>", lambda _event: self._populate_overview())
+        ttk.Label(filters, text="Артикул:").grid(row=0, column=2, padx=(0, 6))
+        self.overview_article_var = tk.StringVar()
+        overview_search = ttk.Entry(filters, textvariable=self.overview_article_var, width=20)
+        overview_search.grid(row=0, column=3, padx=(0, 14))
+        overview_search.bind("<KeyRelease>", lambda _event: self._populate_overview())
+        ttk.Label(filters, text="Сортировать:").grid(row=0, column=4, padx=(0, 6))
+        self.overview_sort_var = tk.StringVar(value=SORT_NONE)
+        overview_sort = ttk.Combobox(
+            filters, textvariable=self.overview_sort_var, values=SORT_METRICS, state="readonly", width=21
+        )
+        overview_sort.grid(row=0, column=5, padx=(0, 8))
+        overview_sort.bind("<<ComboboxSelected>>", lambda _event: self._populate_overview())
+        self.overview_sort_direction_var = tk.StringVar(value=SORT_ASCENDING)
+        overview_direction = ttk.Combobox(
+            filters,
+            textvariable=self.overview_sort_direction_var,
+            values=(SORT_ASCENDING, SORT_DESCENDING),
+            state="readonly",
+            width=24,
+        )
+        overview_direction.grid(row=0, column=6, padx=(0, 8))
+        overview_direction.bind("<<ComboboxSelected>>", lambda _event: self._populate_overview())
+        ttk.Button(filters, text="Сбросить", command=self._reset_overview_filters).grid(row=0, column=7)
+        self.overview_count_var = tk.StringVar()
+        ttk.Label(filters, textvariable=self.overview_count_var, style="Muted.TLabel").grid(
+            row=0, column=10, sticky="e"
+        )
+
         columns = [
-            "article", "name", "unit_cost", "material", "labor", "material_sold", "labor_sold", "cost_sold",
+            "article", "name", "category", "unit_cost", "material", "labor", "material_sold", "labor_sold", "cost_sold",
             "profitability", "net_unit", "profit_unit", "net_total", "profit_total", "avg_price", "tax",
             "taxable", "units", "revenue", "revenue_no_points", "partner", "points", "commission", "processing",
             "delivery", "logistics", "reverse", "returns", "acquiring", "stars", "packaging", "compensation",
             "other", "financial_result",
         ]
         headings = [
-            "Артикул", "Наименование", "Итого с/с", "Материал", "Трудозатраты", "Материал проданного",
+            "Артикул", "Наименование", "Категория", "Итого с/с", "Материал", "Трудозатраты", "Материал проданного",
             "Трудозатраты проданного", "С/с проданного", "Доходность", "Чистая прибыль на ед.",
             "Прибыль от продаж на ед.", "Чистая прибыль всего", "Прибыль от продаж всего", "Средняя цена",
             "Налог", "Налогооблагаемый доход", "Продажи", "Выручка с баллами", "Выручка без баллов",
@@ -188,7 +238,9 @@ class OZPriceAnalyzerApp(tk.Tk):
             "Логистика", "Обратная логистика", "Возвраты/отмены", "Эквайринг", "Звездные товары",
             "Упаковка и материалы", "Компенсации Ozon", "Прочие начисления", "Финрезультат Ozon",
         ]
-        self.overview_tree = self._create_tree(self.overview_tab, columns, headings, row=2, widths=[120, 230] + [125] * 31)
+        self.overview_tree = self._create_tree(
+            self.overview_tab, columns, headings, row=3, widths=[120, 230, 190] + [125] * 31
+        )
 
     def _build_sources_tab(self) -> None:
         self.sources_tab.columnconfigure(0, weight=1)
@@ -288,7 +340,7 @@ class OZPriceAnalyzerApp(tk.Tk):
 
     def _build_scenario_tab(self) -> None:
         self.scenario_tab.columnconfigure(0, weight=1)
-        self.scenario_tab.rowconfigure(3, weight=1)
+        self.scenario_tab.rowconfigure(4, weight=1)
         ttk.Label(self.scenario_tab, text="Доходность при плановой цене", style="Section.TLabel").grid(
             row=0, column=0, sticky="w", pady=(10, 2)
         )
@@ -318,17 +370,55 @@ class OZPriceAnalyzerApp(tk.Tk):
         )
         ttk.Button(scenario_top, text="Сбросить цены", command=self.reset_scenario).grid(row=0, column=7, padx=(12, 0))
 
+        filters = ttk.Frame(self.scenario_tab)
+        filters.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        filters.columnconfigure(10, weight=1)
+        ttk.Label(filters, text="Категория:").grid(row=0, column=0, padx=(0, 6))
+        self.scenario_category_var = tk.StringVar(value=CATEGORY_ALL)
+        self.scenario_category_combo = ttk.Combobox(
+            filters, textvariable=self.scenario_category_var, state="readonly", width=24
+        )
+        self.scenario_category_combo.grid(row=0, column=1, padx=(0, 14))
+        self.scenario_category_combo.bind("<<ComboboxSelected>>", lambda _event: self._populate_scenario())
+        ttk.Label(filters, text="Артикул:").grid(row=0, column=2, padx=(0, 6))
+        self.scenario_article_var = tk.StringVar()
+        scenario_search = ttk.Entry(filters, textvariable=self.scenario_article_var, width=20)
+        scenario_search.grid(row=0, column=3, padx=(0, 14))
+        scenario_search.bind("<KeyRelease>", lambda _event: self._populate_scenario())
+        ttk.Label(filters, text="Сортировать:").grid(row=0, column=4, padx=(0, 6))
+        self.scenario_sort_var = tk.StringVar(value=SORT_NONE)
+        scenario_sort = ttk.Combobox(
+            filters, textvariable=self.scenario_sort_var, values=SORT_METRICS, state="readonly", width=21
+        )
+        scenario_sort.grid(row=0, column=5, padx=(0, 8))
+        scenario_sort.bind("<<ComboboxSelected>>", lambda _event: self._populate_scenario())
+        self.scenario_sort_direction_var = tk.StringVar(value=SORT_ASCENDING)
+        scenario_direction = ttk.Combobox(
+            filters,
+            textvariable=self.scenario_sort_direction_var,
+            values=(SORT_ASCENDING, SORT_DESCENDING),
+            state="readonly",
+            width=24,
+        )
+        scenario_direction.grid(row=0, column=6, padx=(0, 8))
+        scenario_direction.bind("<<ComboboxSelected>>", lambda _event: self._populate_scenario())
+        ttk.Button(filters, text="Сбросить", command=self._reset_scenario_filters).grid(row=0, column=7)
+        self.scenario_count_var = tk.StringVar()
+        ttk.Label(filters, textvariable=self.scenario_count_var, style="Muted.TLabel").grid(
+            row=0, column=10, sticky="e"
+        )
+
         self.scenario_tree = self._create_tree(
             self.scenario_tab,
-            ["article", "name", "cost", "units", "current_price", "planned_price", "change", "profitability", "other_costs", "planned_revenue", "commission_rate", "commission", "points", "taxable", "tax", "profit", "profit_unit", "net_unit"],
-            ["Артикул", "Наименование", "Себестоимость", "Продажи", "Текущая цена", "Плановая цена", "Изменение", "Доходность", "Затраты Ozon без комиссии", "Плановая выручка", "Средняя комиссия", "Плановая комиссия", "Плановые баллы", "Налоговая база", "Налог", "Прибыль от продаж", "Прибыль/ед. до с/с", "Чистая прибыль/ед."],
-            row=3,
-            widths=[120, 230] + [135] * 16,
+            ["article", "name", "category", "cost", "units", "current_price", "planned_price", "change", "profitability", "other_costs", "planned_revenue", "commission_rate", "commission", "points", "taxable", "tax", "profit", "profit_unit", "net_unit", "net_total"],
+            ["Артикул", "Наименование", "Категория", "Себестоимость", "Продажи", "Текущая цена", "Плановая цена", "Изменение", "Доходность", "Затраты Ozon без комиссии", "Плановая выручка", "Средняя комиссия", "Плановая комиссия", "Плановые баллы", "Налоговая база", "Налог", "Прибыль от продаж", "Прибыль/ед. до с/с", "Чистая прибыль/ед.", "Чистая прибыль всего"],
+            row=4,
+            widths=[120, 230, 190] + [135] * 17,
         )
         self.scenario_tree.bind("<<TreeviewSelect>>", self._on_scenario_selected)
 
         self.scenario_kpi_frame = ttk.Frame(self.scenario_tab)
-        self.scenario_kpi_frame.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        self.scenario_kpi_frame.grid(row=5, column=0, sticky="ew", pady=(10, 0))
         for column in range(4):
             self.scenario_kpi_frame.columnconfigure(column, weight=1)
         self.scenario_kpi_vars: dict[str, tk.StringVar] = {}
@@ -596,7 +686,7 @@ class OZPriceAnalyzerApp(tk.Tk):
         ttk.Button(product_header, text="Журнал изменений", command=self.show_cost_history).grid(row=0, column=5, padx=4)
         ttk.Label(
             product_header,
-            text="Основной способ — заполнение прямо в приложении. XLSX нужен только для обмена или резервной копии.",
+            text="При первом запуске справочник пуст. Загрузите XLSX, затем редактируйте товары прямо в приложении.",
             style="Muted.TLabel",
         ).grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 8))
 
@@ -625,12 +715,15 @@ class OZPriceAnalyzerApp(tk.Tk):
         )
         ttk.Button(filters, text="Выгрузить XLSX", command=self.export_product_catalog).grid(row=0, column=6, padx=4)
         ttk.Button(filters, text="Загрузить XLSX", command=self.import_product_catalog).grid(row=0, column=7, padx=4)
+        ttk.Button(filters, text="Очистить справочник", command=self.clear_product_catalog).grid(
+            row=0, column=8, padx=(12, 4)
+        )
         self.products_tree = self._create_tree(
             self.settings_tab,
-            ["article", "name", "total", "material", "labor", "status"],
-            ["Артикул", "Наименование", "Полная себестоимость", "Материал", "Трудозатраты", "Статус"],
+            ["article", "name", "category", "total", "material", "labor", "status"],
+            ["Артикул", "Наименование", "Категория", "Полная себестоимость", "Материал", "Трудозатраты", "Статус"],
             row=3,
-            widths=[150, 360, 180, 150, 150, 110],
+            widths=[150, 320, 220, 180, 150, 150, 110],
         )
         self.products_tree.bind("<Double-1>", lambda _event: self.edit_product())
 
@@ -737,6 +830,8 @@ class OZPriceAnalyzerApp(tk.Tk):
             variable.set("—")
         for variable in self.scenario_kpi_vars.values():
             variable.set("—")
+        self.overview_count_var.set("")
+        self.scenario_count_var.set("")
 
     def _populate_overview(self) -> None:
         calculation = self.current_calculation
@@ -750,12 +845,33 @@ class OZPriceAnalyzerApp(tk.Tk):
         self.kpi_vars["units"].set(_number(totals["units"]))
         self.kpi_vars["unallocated"].set(_money(totals["unallocated"]))
         self.kpi_vars["files"].set(str(len(self.db.list_source_files(calculation.run_id or 0))))
+        _set_category_choices(
+            self.overview_category_combo,
+            self.overview_category_var,
+            (result.category for result in calculation.products),
+        )
+        visible = filter_product_results(
+            calculation.products,
+            calculation.tax_rate,
+            category=self.overview_category_var.get(),
+            article_query=self.overview_article_var.get(),
+            sort_metric=self.overview_sort_var.get(),
+            descending=self.overview_sort_direction_var.get() == SORT_DESCENDING,
+        )
         self.overview_tree.delete(*self.overview_tree.get_children())
-        for result in calculation.products:
+        for result in visible:
             values = _result_values(result, calculation.tax_rate)
             tag = "negative" if result.net_profit(calculation.tax_rate) < 0 else "positive"
             self.overview_tree.insert("", "end", iid=result.article, values=values, tags=(tag,))
+        self.overview_count_var.set(f"Показано: {len(visible)} из {len(calculation.products)}")
         self._configure_value_tags(self.overview_tree)
+
+    def _reset_overview_filters(self) -> None:
+        self.overview_category_var.set(CATEGORY_ALL)
+        self.overview_article_var.set("")
+        self.overview_sort_var.set(SORT_NONE)
+        self.overview_sort_direction_var.set(SORT_ASCENDING)
+        self._populate_overview()
 
     def _populate_sources(self) -> None:
         if self.current_run_id is None:
@@ -917,22 +1033,47 @@ class OZPriceAnalyzerApp(tk.Tk):
         planned_revenue_total = 0.0
         planned_net_total = 0.0
         planned_cost_total = 0.0
+        scenarios: list[ScenarioRow] = []
         for result in calculation.products:
             scenario = calculate_scenario(result, calculation.tax_rate, prices.get(result.article))
+            scenarios.append(scenario)
             self.scenario_rows[result.article] = scenario
-            tag = "negative" if (scenario.net_profit_per_unit or 0) < 0 else "positive"
-            self.scenario_tree.insert("", "end", iid=result.article, values=_scenario_values(scenario), tags=(tag,))
             if scenario.planned_revenue is not None:
                 planned_revenue_total += scenario.planned_revenue
             if scenario.net_profit_per_unit is not None:
                 planned_net_total += scenario.net_profit_per_unit * scenario.units
                 planned_cost_total += scenario.unit_cost * scenario.units
+        _set_category_choices(
+            self.scenario_category_combo,
+            self.scenario_category_var,
+            (row.category for row in scenarios),
+        )
+        visible = filter_scenario_rows(
+            scenarios,
+            category=self.scenario_category_var.get(),
+            article_query=self.scenario_article_var.get(),
+            sort_metric=self.scenario_sort_var.get(),
+            descending=self.scenario_sort_direction_var.get() == SORT_DESCENDING,
+        )
+        for scenario in visible:
+            tag = "negative" if (scenario.net_profit_per_unit or 0) < 0 else "positive"
+            self.scenario_tree.insert(
+                "", "end", iid=scenario.article, values=_scenario_values(scenario), tags=(tag,)
+            )
         totals = calculation.totals()
         self.scenario_kpi_vars["current_revenue"].set(_money(totals["revenue"]))
         self.scenario_kpi_vars["planned_revenue"].set(_money(planned_revenue_total))
         self.scenario_kpi_vars["planned_net"].set(_money(planned_net_total))
         self.scenario_kpi_vars["planned_margin"].set(_percent(planned_net_total / planned_cost_total if planned_cost_total else 0))
+        self.scenario_count_var.set(f"Показано: {len(visible)} из {len(scenarios)}")
         self._configure_value_tags(self.scenario_tree)
+
+    def _reset_scenario_filters(self) -> None:
+        self.scenario_category_var.set(CATEGORY_ALL)
+        self.scenario_article_var.set("")
+        self.scenario_sort_var.set(SORT_NONE)
+        self.scenario_sort_direction_var.set(SORT_ASCENDING)
+        self._populate_scenario()
 
     def _on_scenario_selected(self, _event=None) -> None:
         selection = self.scenario_tree.selection()
@@ -1344,7 +1485,12 @@ class OZPriceAnalyzerApp(tk.Tk):
         visible = [
             product
             for product in products
-            if (not query or query in product.article.casefold() or query in product.name.casefold())
+            if (
+                not query
+                or query in product.article.casefold()
+                or query in product.name.casefold()
+                or query in product.category.casefold()
+            )
             and (status == "Все" or (status == "Активные" and product.active) or (status == "Архив" and not product.active))
         ]
         for product in visible:
@@ -1353,7 +1499,8 @@ class OZPriceAnalyzerApp(tk.Tk):
                 "end",
                 iid=product.article,
                 values=(
-                    product.article, product.name, _money(product.total_cost), _money(product.material_cost),
+                    product.article, product.name, product.category or CATEGORY_EMPTY,
+                    _money(product.total_cost), _money(product.material_cost),
                     _money(product.labor_cost), "Активен" if product.active else "Архив",
                 ),
                 tags=("" if product.active else "muted",),
@@ -1361,6 +1508,13 @@ class OZPriceAnalyzerApp(tk.Tk):
         if hasattr(self, "product_count_var"):
             self.product_count_var.set(f"Показано: {len(visible)} из {len(products)}")
         self._configure_value_tags(self.products_tree)
+
+    def _refresh_after_catalog_change(self) -> None:
+        self.refresh_products()
+        if self.current_run_id is not None:
+            self.current_calculation = self.db.load_calculation(self.current_run_id)
+            self._populate_overview()
+            self._populate_scenario()
 
     def open_cost_catalog_editor(self) -> None:
         dialog = CostCatalogEditorDialog(self, self.db.list_products())
@@ -1382,13 +1536,14 @@ class OZPriceAnalyzerApp(tk.Tk):
         try:
             changed = self.db.save_products(products_to_apply, source="Редактор приложения")
             self.db.reorder_products(dialog.article_order)
-            self.refresh_products()
+            self._refresh_after_catalog_change()
             order_text = " Порядок позиций сохранен." if dialog.order_changed else ""
             messagebox.showinfo(
                 "Себестоимость сохранена",
                 f"Применено изменений: {changed}.\n"
                 f"{order_text}\n"
-                "Новые значения используются со следующего расчета. Старые отчеты не изменены.",
+                "Новая себестоимость используется со следующего расчета; числовые показатели истории не меняются. "
+                "Категория обновляется во всех сохраненных отчетах.",
                 parent=self,
             )
         except Exception as exc:
@@ -1584,15 +1739,41 @@ class OZPriceAnalyzerApp(tk.Tk):
             if dialog.cancelled:
                 return
             changed = self.db.save_products(dialog.products_to_apply, source=f"Импорт: {Path(source).name}")
-            self.refresh_products()
+            self._refresh_after_catalog_change()
             messagebox.showinfo(
                 "Импорт себестоимости",
                 f"Применено изменений: {changed}.\n"
-                "Сохраненные ранее расчеты не изменены; новые значения используются со следующего расчета.",
+                "Себестоимость применяется со следующего расчета; числовые показатели истории не меняются. "
+                "Категории обновлены во всех сохраненных отчетах.",
                 parent=self,
             )
         except Exception as exc:
             messagebox.showerror("Импорт себестоимости", str(exc), parent=self)
+
+    def clear_product_catalog(self) -> None:
+        count = len(self.db.list_products())
+        if not count:
+            messagebox.showinfo("Справочник себестоимости", "Справочник уже пуст", parent=self)
+            return
+        confirmed = messagebox.askyesno(
+            "Очистить справочник?",
+            f"Будут удалены все позиции текущего справочника: {count}.\n\n"
+            "Сохраненные отчеты и их показатели останутся без изменений. "
+            "Новые отчеты нельзя будет полноценно рассчитать, пока вы не загрузите XLSX "
+            "или не создадите товары заново.\n\n"
+            "Отменить это действие нельзя. Продолжить?",
+            icon="warning",
+            parent=self,
+        )
+        if not confirmed:
+            return
+        removed = self.db.clear_products()
+        self._refresh_after_catalog_change()
+        messagebox.showinfo(
+            "Справочник очищен",
+            f"Удалено позиций: {removed}. Сохраненные отчеты не изменены.",
+            parent=self,
+        )
 
     def show_cost_history(self) -> None:
         CostHistoryDialog(self, self.db.list_product_cost_history())
@@ -1603,7 +1784,7 @@ class OZPriceAnalyzerApp(tk.Tk):
         if dialog.result:
             try:
                 self.db.save_product(dialog.result)
-                self.refresh_products()
+                self._refresh_after_catalog_change()
             except Exception as exc:
                 messagebox.showerror("Товар", str(exc), parent=self)
 
@@ -1618,7 +1799,7 @@ class OZPriceAnalyzerApp(tk.Tk):
         if dialog.result:
             try:
                 self.db.save_product(dialog.result)
-                self.refresh_products()
+                self._refresh_after_catalog_change()
             except Exception as exc:
                 messagebox.showerror("Товар", str(exc), parent=self)
 
@@ -1629,7 +1810,7 @@ class OZPriceAnalyzerApp(tk.Tk):
         product = self.db.product_map(active_only=False)[selection[0]]
         product.active = not product.active
         self.db.save_product(product)
-        self.refresh_products()
+        self._refresh_after_catalog_change()
 
     def save_settings(self) -> None:
         try:
@@ -2073,6 +2254,7 @@ class CostCatalogEditorDialog(tk.Toplevel):
                 labor_cost=product.labor_cost,
                 active=product.active,
                 sort_order=product.sort_order,
+                category=product.category,
             )
             for product in products
         }
@@ -2120,10 +2302,10 @@ class CostCatalogEditorDialog(tk.Toplevel):
         container.grid(row=3, column=0, sticky="nsew", padx=20)
         container.columnconfigure(0, weight=1)
         container.rowconfigure(0, weight=1)
-        columns = ("article", "name", "total", "material", "labor", "status")
+        columns = ("article", "name", "category", "total", "material", "labor", "status")
         self.tree = ttk.Treeview(container, columns=columns, show="headings", selectmode="browse")
-        headings = ["Артикул", "Наименование", "Полная себестоимость", "Материал", "Трудозатраты", "Статус"]
-        widths = [150, 340, 170, 150, 150, 100]
+        headings = ["Артикул", "Наименование", "Категория", "Полная себестоимость", "Материал", "Трудозатраты", "Статус"]
+        widths = [150, 300, 220, 170, 150, 150, 100]
         for column, heading, width in zip(columns, headings, widths):
             self.tree.heading(column, text=heading)
             self.tree.column(
@@ -2131,7 +2313,7 @@ class CostCatalogEditorDialog(tk.Toplevel):
                 width=width,
                 minwidth=80,
                 stretch=False,
-                anchor="w" if column in {"article", "name", "status"} else "e",
+                anchor="w" if column in {"article", "name", "category", "status"} else "e",
             )
         xscroll = ttk.Scrollbar(container, orient="horizontal", command=self.tree.xview)
         yscroll = ttk.Scrollbar(container, orient="vertical", command=self.tree.yview)
@@ -2148,6 +2330,7 @@ class CostCatalogEditorDialog(tk.Toplevel):
         editor.columnconfigure(3, weight=1)
         self.article_var = tk.StringVar()
         self.name_var = tk.StringVar()
+        self.category_var = tk.StringVar()
         self.total_var = tk.StringVar()
         self.labor_var = tk.StringVar(value="0")
         self.material_var = tk.StringVar(value="—")
@@ -2160,21 +2343,25 @@ class CostCatalogEditorDialog(tk.Toplevel):
         self.name_entry.grid(row=0, column=3, sticky="ew", padx=(0, 18), pady=4)
         ttk.Checkbutton(editor, text="Активен", variable=self.active_var).grid(row=0, column=4, sticky="w", pady=4)
 
-        ttk.Label(editor, text="Полная себестоимость, руб.:").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=4)
-        ttk.Entry(editor, textvariable=self.total_var, width=22).grid(row=1, column=1, sticky="w", padx=(0, 18), pady=4)
-        ttk.Label(editor, text="Трудозатраты, руб.:").grid(row=1, column=2, sticky="w", padx=(0, 6), pady=4)
-        ttk.Entry(editor, textvariable=self.labor_var, width=18).grid(row=1, column=3, sticky="w", pady=4)
+        ttk.Label(editor, text="Категория:").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=4)
+        ttk.Entry(editor, textvariable=self.category_var).grid(
+            row=1, column=1, columnspan=3, sticky="ew", padx=(0, 18), pady=4
+        )
+        ttk.Label(editor, text="Полная себестоимость, руб.:").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=4)
+        ttk.Entry(editor, textvariable=self.total_var, width=22).grid(row=2, column=1, sticky="w", padx=(0, 18), pady=4)
+        ttk.Label(editor, text="Трудозатраты, руб.:").grid(row=2, column=2, sticky="w", padx=(0, 6), pady=4)
+        ttk.Entry(editor, textvariable=self.labor_var, width=18).grid(row=2, column=3, sticky="w", pady=4)
         ttk.Label(editor, text="Материал рассчитывается автоматически:").grid(
-            row=2, column=0, columnspan=2, sticky="w", pady=(4, 0)
+            row=3, column=0, columnspan=2, sticky="w", pady=(4, 0)
         )
         ttk.Label(editor, textvariable=self.material_var, style="Section.TLabel").grid(
-            row=2, column=2, sticky="w", pady=(4, 0)
+            row=3, column=2, sticky="w", pady=(4, 0)
         )
         ttk.Button(editor, text="Применить в таблицу", command=self._commit_current).grid(
-            row=2, column=4, sticky="e", pady=(4, 0)
+            row=3, column=4, sticky="e", pady=(4, 0)
         )
 
-        for variable in (self.article_var, self.name_var, self.total_var, self.labor_var):
+        for variable in (self.article_var, self.name_var, self.category_var, self.total_var, self.labor_var):
             variable.trace_add("write", self._field_changed)
         self.active_var.trace_add("write", self._field_changed)
 
@@ -2224,6 +2411,7 @@ class CostCatalogEditorDialog(tk.Toplevel):
                     not query
                     or query in article.casefold()
                     or query in self.product_map[article].name.casefold()
+                    or query in self.product_map[article].category.casefold()
                 )
             ]
             for product in visible:
@@ -2234,6 +2422,7 @@ class CostCatalogEditorDialog(tk.Toplevel):
                     values=(
                         product.article,
                         product.name,
+                        product.category or CATEGORY_EMPTY,
                         _money(product.total_cost),
                         _money(product.material_cost),
                         _money(product.labor_cost),
@@ -2323,6 +2512,7 @@ class CostCatalogEditorDialog(tk.Toplevel):
             self.current_article = article
             self.article_var.set(product.article)
             self.name_var.set(product.name)
+            self.category_var.set(product.category)
             self.total_var.set(_plain_number(product.total_cost))
             self.labor_var.set(_plain_number(product.labor_cost))
             self.material_var.set(_money(product.material_cost))
@@ -2342,6 +2532,7 @@ class CostCatalogEditorDialog(tk.Toplevel):
             self.current_article = None
             self.article_var.set("")
             self.name_var.set("")
+            self.category_var.set("")
             self.total_var.set("")
             self.labor_var.set("0")
             self.material_var.set("—")
@@ -2359,6 +2550,7 @@ class CostCatalogEditorDialog(tk.Toplevel):
             total_cost=self.total_var.get(),
             labor_cost=self.labor_var.get(),
             active=self.active_var.get(),
+            category=self.category_var.get(),
             row_number=(self.product_order.index(self.current_article) + 1)
             if self.current_article in self.product_order
             else len(self.product_map) + 1,
@@ -2396,6 +2588,7 @@ class CostCatalogEditorDialog(tk.Toplevel):
                     labor_cost=product.labor_cost,
                     active=product.active,
                     row_number=index,
+                    category=product.category,
                 )
                 for index, product in enumerate(
                     (self.product_map[article] for article in self.product_order), start=1
@@ -2451,18 +2644,18 @@ class CostImportDialog(tk.Toplevel):
         container.columnconfigure(0, weight=1)
         container.rowconfigure(0, weight=1)
         columns = (
-            "article", "name", "old_total", "new_total", "change",
+            "article", "name", "old_category", "new_category", "old_total", "new_total", "change",
             "old_labor", "new_labor", "active", "status",
         )
         self.tree = ttk.Treeview(container, columns=columns, show="headings")
         headings = [
-            "Артикул", "Наименование", "Старая с/с", "Новая с/с", "Изменение",
+            "Артикул", "Наименование", "Старая категория", "Новая категория", "Старая с/с", "Новая с/с", "Изменение",
             "Старые трудозатраты", "Новые трудозатраты", "Активен", "Действие",
         ]
-        widths = [140, 280, 130, 130, 130, 160, 160, 90, 150]
+        widths = [140, 260, 180, 180, 130, 130, 130, 160, 160, 90, 150]
         for column, heading, width in zip(columns, headings, widths):
             self.tree.heading(column, text=heading)
-            self.tree.column(column, width=width, minwidth=80, stretch=False, anchor="w" if column in {"article", "name", "status"} else "e")
+            self.tree.column(column, width=width, minwidth=80, stretch=False, anchor="w" if column in {"article", "name", "old_category", "new_category", "status"} else "e")
         xscroll = ttk.Scrollbar(container, orient="horizontal", command=self.tree.xview)
         yscroll = ttk.Scrollbar(container, orient="vertical", command=self.tree.yview)
         self.tree.configure(xscrollcommand=xscroll.set, yscrollcommand=yscroll.set)
@@ -2478,6 +2671,8 @@ class CostImportDialog(tk.Toplevel):
                 values=(
                     change.product.article,
                     change.product.name,
+                    (previous.category or CATEGORY_EMPTY) if previous else "—",
+                    change.product.category or CATEGORY_EMPTY,
                     _money(previous.total_cost) if previous else "—",
                     _money(change.product.total_cost),
                     _signed_money(change.total_change) if change.total_change is not None else "Новая",
@@ -2527,13 +2722,13 @@ class CostHistoryDialog(tk.Toplevel):
         container.grid(row=2, column=0, sticky="nsew", padx=20)
         container.columnconfigure(0, weight=1)
         container.rowconfigure(0, weight=1)
-        columns = ("date", "article", "name", "old_total", "new_total", "change", "old_labor", "new_labor", "source")
+        columns = ("date", "article", "name", "old_category", "new_category", "old_total", "new_total", "change", "old_labor", "new_labor", "source")
         tree = ttk.Treeview(container, columns=columns, show="headings")
         headings = [
-            "Дата", "Артикул", "Наименование", "Старая с/с", "Новая с/с", "Изменение",
+            "Дата", "Артикул", "Наименование", "Старая категория", "Новая категория", "Старая с/с", "Новая с/с", "Изменение",
             "Старые трудозатраты", "Новые трудозатраты", "Источник",
         ]
-        widths = [145, 130, 250, 120, 120, 120, 155, 155, 260]
+        widths = [145, 130, 240, 180, 180, 120, 120, 120, 155, 155, 260]
         for column, heading, width in zip(columns, headings, widths):
             tree.heading(column, text=heading)
             tree.column(column, width=width, minwidth=80, stretch=False, anchor="w" if column in {"article", "name", "source"} else "e")
@@ -2555,6 +2750,8 @@ class CostHistoryDialog(tk.Toplevel):
                     str(row["changed_at"])[:16],
                     row["article"],
                     row["new_name"],
+                    row["old_category"] or "—",
+                    row["new_category"] or CATEGORY_EMPTY,
                     _money(old_total) if old_total is not None else "—",
                     _money(new_total),
                     _signed_money(new_total - old_total) if old_total is not None else "Новая",
@@ -2581,12 +2778,14 @@ class ProductDialog(tk.Toplevel):
         self.columnconfigure(1, weight=1)
         self.article_var = tk.StringVar(value=product.article if product else "")
         self.name_var = tk.StringVar(value=product.name if product else "")
+        self.category_var = tk.StringVar(value=product.category if product else "")
         self.total_var = tk.StringVar(value=_plain_number(product.total_cost) if product else "")
         self.labor_var = tk.StringVar(value=_plain_number(product.labor_cost) if product else "0")
 
         fields = [
             ("Артикул", self.article_var),
             ("Наименование", self.name_var),
+            ("Категория", self.category_var),
             ("Полная себестоимость, руб.", self.total_var),
             ("Трудозатраты в составе с/с, руб.", self.labor_var),
         ]
@@ -2624,6 +2823,7 @@ class ProductDialog(tk.Toplevel):
             material_cost=total - labor,
             labor_cost=labor,
             active=self.product.active if self.product else True,
+            category=self.category_var.get().strip(),
         )
         self.destroy()
 
@@ -2679,6 +2879,11 @@ class UnknownProductsDialog(tk.Toplevel):
         ttk.Label(editor, text="Трудозатраты, руб.:").grid(row=0, column=2, padx=(0, 6))
         self.labor_var = tk.StringVar(value="0")
         ttk.Entry(editor, textvariable=self.labor_var, width=14).grid(row=0, column=3, padx=(0, 14))
+        ttk.Label(editor, text="Категория:").grid(row=1, column=0, padx=(0, 6), pady=(8, 0))
+        self.category_var = tk.StringVar()
+        ttk.Entry(editor, textvariable=self.category_var, width=42).grid(
+            row=1, column=1, columnspan=3, sticky="ew", padx=(0, 14), pady=(8, 0)
+        )
         ttk.Button(editor, text="Создать позицию", command=self._create).grid(row=0, column=4, padx=4)
         ttk.Button(editor, text="Пропустить", command=self._skip).grid(row=0, column=5, padx=4)
 
@@ -2709,9 +2914,11 @@ class UnknownProductsDialog(tk.Toplevel):
         if isinstance(decision, Product):
             self.total_var.set(_plain_number(decision.total_cost))
             self.labor_var.set(_plain_number(decision.labor_cost))
+            self.category_var.set(decision.category)
         else:
             self.total_var.set("")
             self.labor_var.set("0")
+            self.category_var.set("")
 
     def _create(self) -> None:
         article = self._selected_article()
@@ -2726,7 +2933,13 @@ class UnknownProductsDialog(tk.Toplevel):
             messagebox.showerror("Себестоимость", "Проверьте полную себестоимость и трудозатраты", parent=self)
             return
         item = self.items[article]
-        self.decisions[article] = Product(article, item.name or article, total - labor, labor)
+        self.decisions[article] = Product(
+            article,
+            item.name or article,
+            total - labor,
+            labor,
+            category=self.category_var.get().strip(),
+        )
         self._set_decision_text(article, f"Создать: {_money(total)}")
         self._select_next_unresolved()
 
@@ -2768,6 +2981,7 @@ def _result_values(result: ProductResult, tax_rate: float) -> tuple[object, ...]
     return (
         result.article,
         result.name,
+        result.category or CATEGORY_EMPTY,
         _money(result.total_cost),
         _money(result.material_cost),
         _money(result.labor_cost),
@@ -2806,6 +3020,7 @@ def _scenario_values(row: ScenarioRow) -> tuple[object, ...]:
     return (
         row.article,
         row.name,
+        row.category or CATEGORY_EMPTY,
         _money(row.unit_cost),
         _number(row.units),
         _optional_money(row.current_price),
@@ -2822,7 +3037,84 @@ def _scenario_values(row: ScenarioRow) -> tuple[object, ...]:
         _optional_money(row.profit),
         _optional_money(row.profit_per_unit_before_cost),
         _optional_money(row.net_profit_per_unit),
+        _optional_money(row.net_profit_total),
     )
+
+
+def filter_product_results(
+    rows: list[ProductResult],
+    tax_rate: float,
+    *,
+    category: str = CATEGORY_ALL,
+    article_query: str = "",
+    sort_metric: str = SORT_NONE,
+    descending: bool = False,
+) -> list[ProductResult]:
+    visible = _filter_rows(rows, category, article_query)
+    metrics = {
+        "Доходность": lambda row: row.profitability(tax_rate),
+        "Чистая прибыль": lambda row: row.net_profit(tax_rate),
+        "Выручка": lambda row: row.revenue_including_points,
+        "Количество продаж": lambda row: row.units,
+    }
+    return _sort_rows(visible, metrics.get(sort_metric), descending)
+
+
+def filter_scenario_rows(
+    rows: list[ScenarioRow],
+    *,
+    category: str = CATEGORY_ALL,
+    article_query: str = "",
+    sort_metric: str = SORT_NONE,
+    descending: bool = False,
+) -> list[ScenarioRow]:
+    visible = _filter_rows(rows, category, article_query)
+    metrics = {
+        "Доходность": lambda row: row.profitability,
+        "Чистая прибыль": lambda row: row.net_profit_total,
+        "Выручка": lambda row: row.planned_revenue,
+        "Количество продаж": lambda row: row.units,
+    }
+    return _sort_rows(visible, metrics.get(sort_metric), descending)
+
+
+def _filter_rows(rows, category: str, article_query: str):
+    query = article_query.strip().casefold()
+    return [
+        row
+        for row in rows
+        if (category == CATEGORY_ALL or _category_label(row.category) == category)
+        and (not query or query in row.article.casefold())
+    ]
+
+
+def _sort_rows(rows, metric, descending: bool):
+    if metric is None:
+        return list(rows)
+    measured: list[tuple[float, object]] = []
+    missing: list[object] = []
+    for row in rows:
+        value = metric(row)
+        if value is None:
+            missing.append(row)
+        else:
+            measured.append((float(value), row))
+    measured.sort(key=lambda pair: (pair[0], pair[1].article.casefold()), reverse=descending)
+    return [row for _value, row in measured] + missing
+
+
+def _category_label(value: str) -> str:
+    return value.strip() or CATEGORY_EMPTY
+
+
+def _set_category_choices(combo: ttk.Combobox, variable: tk.StringVar, categories) -> None:
+    values = [CATEGORY_ALL] + sorted(
+        {_category_label(str(value or "")) for value in categories},
+        key=str.casefold,
+    )
+    combo["values"] = values
+    if variable.get() not in values:
+        variable.set(CATEGORY_ALL)
 
 
 def _money(value: float | None) -> str:

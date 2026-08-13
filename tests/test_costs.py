@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 
 from ozon_app.costs import (
     CostCatalogError,
@@ -23,8 +23,8 @@ class CostCatalogTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source_products = [
-                Product("A-001", "Товар A", material_cost=80, labor_cost=20, active=True),
-                Product("B-002", "Товар B", material_cost=45, labor_cost=5, active=False),
+                Product("A-001", "Товар A", material_cost=80, labor_cost=20, active=True, category="Категория A"),
+                Product("B-002", "Товар B", material_cost=45, labor_cost=5, active=False, category="Категория B"),
             ]
             path = export_cost_catalog(source_products, root / "costs.xlsx")
             imported = read_cost_catalog(path)
@@ -32,6 +32,7 @@ class CostCatalogTests(unittest.TestCase):
             self.assertEqual([product.article for product in imported], ["A-001", "B-002"])
             self.assertEqual(imported[0].total_cost, 100)
             self.assertEqual(imported[0].labor_cost, 20)
+            self.assertEqual(imported[0].category, "Категория A")
             self.assertFalse(imported[1].active)
 
             existing = {"A-001": Product("A-001", "Товар A", material_cost=70, labor_cost=20)}
@@ -50,9 +51,9 @@ class CostCatalogTests(unittest.TestCase):
             path = export_cost_catalog([], Path(directory) / "invalid.xlsx")
             workbook = load_workbook(path)
             ws = workbook["Себестоимость"]
-            ws["A5"], ws["B5"], ws["C5"], ws["D5"] = "A", "Товар", 100, 120
-            ws["A6"], ws["B6"], ws["C6"], ws["D6"] = "A", "Дубль", 100, 20
-            ws["A7"], ws["B7"], ws["C7"], ws["D7"] = "B", "Неверные трудозатраты", 100, "нет данных"
+            ws["A5"], ws["B5"], ws["D5"], ws["E5"] = "A", "Товар", 100, 120
+            ws["A6"], ws["B6"], ws["D6"], ws["E6"] = "A", "Дубль", 100, 20
+            ws["A7"], ws["B7"], ws["D7"], ws["E7"] = "B", "Неверные трудозатраты", 100, "нет данных"
             workbook.save(path)
             workbook.close()
 
@@ -66,7 +67,7 @@ class CostCatalogTests(unittest.TestCase):
         products = build_products_from_editor_entries(
             [
                 CostEditorEntry("A-001", "Товар A", "125,50", "25,50", True, 1),
-                CostEditorEntry("B-002", "", 80, "", False, 2),
+                CostEditorEntry("B-002", "", 80, "", False, 2, category="Категория B"),
             ]
         )
 
@@ -74,6 +75,31 @@ class CostCatalogTests(unittest.TestCase):
         self.assertEqual(products[0].labor_cost, 25.5)
         self.assertEqual(products[1].name, "B-002")
         self.assertFalse(products[1].active)
+        self.assertEqual(products[1].category, "Категория B")
+
+    def test_old_xlsx_without_category_remains_compatible(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "old_catalog.xlsx"
+            workbook = Workbook()
+            ws = workbook.active
+            ws.title = "Себестоимость"
+            ws.append(
+                [
+                    "Артикул",
+                    "Наименование",
+                    "Полная себестоимость, руб.",
+                    "Трудозатраты, руб.",
+                    "Активен",
+                ]
+            )
+            ws.append(["OLD-1", "Старый товар", 120, 20, "Да"])
+            workbook.save(path)
+            workbook.close()
+
+            imported = read_cost_catalog(path)
+            self.assertEqual(len(imported), 1)
+            self.assertEqual(imported[0].category, "")
+            self.assertEqual(imported[0].total_cost, 120)
 
     def test_rejects_invalid_application_entries_together(self) -> None:
         entries = [

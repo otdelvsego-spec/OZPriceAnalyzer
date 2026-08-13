@@ -137,6 +137,7 @@ def calculate_run(
             name=product.name,
             material_cost=product.material_cost,
             labor_cost=product.labor_cost,
+            category=product.category,
         )
         for article, product in active_products.items()
     }
@@ -289,6 +290,7 @@ def calculate_scenario(result: ProductResult, tax_rate: float, planned_price: fl
         return ScenarioRow(
             article=result.article,
             name=result.name,
+            category=result.category,
             unit_cost=result.total_cost,
             units=result.units,
             current_price=current_price,
@@ -327,6 +329,7 @@ def calculate_scenario(result: ProductResult, tax_rate: float, planned_price: fl
     return ScenarioRow(
         article=result.article,
         name=result.name,
+        category=result.category,
         unit_cost=result.total_cost,
         units=result.units,
         current_price=current_price,
@@ -352,4 +355,3 @@ def _round_half_up(value: float) -> float:
 
 def clone_result(result: ProductResult) -> ProductResult:
     return replace(result)
-

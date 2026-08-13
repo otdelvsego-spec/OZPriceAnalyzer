@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import copy
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +46,7 @@ class CostEditorEntry:
     labor_cost: object
     active: bool
     row_number: int
+    category: object = ""
 
 
 def build_products_from_editor_entries(entries: Iterable[CostEditorEntry]) -> list[Product]:
@@ -54,6 +56,7 @@ def build_products_from_editor_entries(entries: Iterable[CostEditorEntry]) -> li
     for entry in entries:
         article = display_text(entry.article)
         name = display_text(entry.name)
+        category = display_text(entry.category)
         total_value = entry.total_cost
         labor_value = entry.labor_cost
         if not article and not name and total_value in (None, "") and labor_value in (None, ""):
@@ -86,6 +89,7 @@ def build_products_from_editor_entries(entries: Iterable[CostEditorEntry]) -> li
                 material_cost=total - labor,
                 labor_cost=labor,
                 active=entry.active,
+                category=category,
             )
         )
     if errors:
@@ -113,6 +117,7 @@ def read_cost_catalog(path: str | Path) -> list[Product]:
             "total": columns[normalize_text("Полная себестоимость, руб.")],
             "labor": columns[normalize_text("Трудозатраты, руб.")],
         }
+        category_column = columns.get(normalize_text("Категория"), 0)
         active_column = columns.get(normalize_text("Активен"), 0)
         entries: list[CostEditorEntry] = []
         for row_number in range(header_row + 1, int(ws.max_row or header_row) + 1):
@@ -130,6 +135,7 @@ def read_cost_catalog(path: str | Path) -> list[Product]:
                     labor_cost=labor_value,
                     active=_active_value(ws.cell(row_number, active_column).value) if active_column else True,
                     row_number=row_number,
+                    category=display_text(ws.cell(row_number, category_column).value) if category_column else "",
                 )
             )
         return build_products_from_editor_entries(entries)
@@ -158,19 +164,33 @@ def export_cost_catalog(products: list[Product], destination: str | Path) -> Pat
     workbook = load_workbook(template)
     ws = workbook["Себестоимость"]
     reserved_last_row = max(204, 4 + len(products))
+    template_row = 5
+    for row_number in range(int(ws.max_row or template_row) + 1, reserved_last_row + 1):
+        for column in range(1, 9):
+            source_cell = ws.cell(template_row, column)
+            target_cell = ws.cell(row_number, column)
+            target_cell._style = copy(source_cell._style)
+            target_cell.number_format = source_cell.number_format
+            target_cell.alignment = copy(source_cell.alignment)
+            target_cell.protection = copy(source_cell.protection)
+        ws.row_dimensions[row_number].height = ws.row_dimensions[template_row].height
     for row_number in range(5, reserved_last_row + 1):
-        for column in (1, 2, 3, 4, 6, 7):
+        for column in (1, 2, 3, 4, 5, 7, 8):
             ws.cell(row_number, column).value = None
-        ws.cell(row_number, 5).value = f'=IF(OR(C{row_number}="",D{row_number}=""),"",C{row_number}-D{row_number})'
+        ws.cell(row_number, 6).value = f'=IF(OR(D{row_number}="",E{row_number}=""),"",D{row_number}-E{row_number})'
     for row_number, product in enumerate(products, start=5):
         ws.cell(row_number, 1).value = product.article
         ws.cell(row_number, 2).value = product.name
-        ws.cell(row_number, 3).value = product.total_cost
-        ws.cell(row_number, 4).value = product.labor_cost
-        ws.cell(row_number, 6).value = "Да" if product.active else "Нет"
+        ws.cell(row_number, 3).value = product.category
+        ws.cell(row_number, 4).value = product.total_cost
+        ws.cell(row_number, 5).value = product.labor_cost
+        ws.cell(row_number, 7).value = "Да" if product.active else "Нет"
     ws["A3"] = f"Выгружено: {datetime.now():%d.%m.%Y %H:%M}"
     if ws.tables:
-        next(iter(ws.tables.values())).ref = f"A4:G{reserved_last_row}"
+        next(iter(ws.tables.values())).ref = f"A4:H{reserved_last_row}"
+    for validation in ws.data_validations.dataValidation:
+        if "G5" in str(validation.sqref):
+            validation.sqref = f"G5:G{reserved_last_row}"
     output = Path(destination).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(output)
@@ -207,6 +227,7 @@ def _active_value(value: object) -> bool:
 def _same_product(first: Product, second: Product) -> bool:
     return (
         first.name.strip() == second.name.strip()
+        and first.category.strip() == second.category.strip()
         and abs(first.material_cost - second.material_cost) < 0.005
         and abs(first.labor_cost - second.labor_cost) < 0.005
         and first.active == second.active

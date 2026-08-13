@@ -14,6 +14,7 @@ class Product:
     labor_cost: float = 0.0
     active: bool = True
     sort_order: int | None = None
+    category: str = ""
 
     @property
     def total_cost(self) -> float:
@@ -88,6 +89,7 @@ class ProductResult:
     name: str
     material_cost: float
     labor_cost: float
+    category: str = ""
     units: float = 0.0
     revenue_no_points: float = 0.0
     partner_programs: float = 0.0
@@ -183,6 +185,7 @@ class RunCalculation:
 class ScenarioRow:
     article: str
     name: str
+    category: str
     unit_cost: float
     units: float
     current_price: float | None
@@ -199,6 +202,12 @@ class ScenarioRow:
     profit: float | None
     profit_per_unit_before_cost: float | None
     net_profit_per_unit: float | None
+
+    @property
+    def net_profit_total(self) -> float | None:
+        if self.net_profit_per_unit is None:
+            return None
+        return self.net_profit_per_unit * self.units
 
 
 @dataclass(slots=True)

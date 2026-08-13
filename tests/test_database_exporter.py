@@ -8,7 +8,7 @@ from openpyxl import load_workbook
 
 from ozon_app.database import Database
 from ozon_app.exporter import export_run
-from ozon_app.models import ParsedSource, ProductResult, RunCalculation
+from ozon_app.models import ParsedSource, Product, ProductResult, RunCalculation
 
 
 class DatabaseExporterTests(unittest.TestCase):
@@ -35,6 +35,7 @@ class DatabaseExporterTests(unittest.TestCase):
                         name="Товар",
                         material_cost=70,
                         labor_cost=30,
+                        category="Старая категория",
                         units=2,
                         revenue_no_points=500,
                         commission=-100,
@@ -51,7 +52,15 @@ class DatabaseExporterTests(unittest.TestCase):
             loaded = database.load_calculation(run_id)
             self.assertEqual(loaded.products[0].material_cost, 70)
             self.assertEqual(loaded.products[0].labor_cost, 30)
+            self.assertEqual(loaded.products[0].category, "Старая категория")
             self.assertEqual(loaded.unallocated_total, -50)
+
+            database.save_product(
+                Product("A-1", "Товар", material_cost=999, labor_cost=1, category="Новая категория")
+            )
+            refreshed = database.load_calculation(run_id)
+            self.assertEqual(refreshed.products[0].category, "Новая категория")
+            self.assertEqual(refreshed.products[0].material_cost, 70)
 
             destination = root / "result.xlsx"
             export_run(database, run_id, destination)
