@@ -300,16 +300,23 @@ class OZPriceAnalyzerApp(tk.Tk):
 
         scenario_top = ttk.Frame(self.scenario_tab)
         scenario_top.grid(row=2, column=0, sticky="ew", pady=(0, 10))
-        scenario_top.columnconfigure(5, weight=1)
+        scenario_top.columnconfigure(6, weight=1)
         ttk.Label(scenario_top, text="Плановая цена выбранного товара:").grid(row=0, column=0, padx=(0, 6))
         self.planned_price_var = tk.StringVar()
         ttk.Entry(scenario_top, textvariable=self.planned_price_var, width=16).grid(row=0, column=1, padx=(0, 6))
         ttk.Button(scenario_top, text="Применить", command=self.apply_planned_price).grid(row=0, column=2, padx=(0, 18))
-        ttk.Label(scenario_top, text="Изменить все цены на, %:").grid(row=0, column=3, padx=(0, 6))
+        ttk.Label(scenario_top, text="Изменить цену на, %:").grid(row=0, column=3, padx=(0, 6))
         self.batch_percent_var = tk.StringVar(value="5")
         ttk.Entry(scenario_top, textvariable=self.batch_percent_var, width=10).grid(row=0, column=4, padx=(0, 6))
-        ttk.Button(scenario_top, text="Применить ко всем", command=self.apply_batch_percent).grid(row=0, column=5, sticky="w")
-        ttk.Button(scenario_top, text="Сбросить цены", command=self.reset_scenario).grid(row=0, column=6, padx=(12, 0))
+        ttk.Button(
+            scenario_top,
+            text="Применить к выбранному",
+            command=self.apply_selected_percent,
+        ).grid(row=0, column=5, sticky="w", padx=(0, 6))
+        ttk.Button(scenario_top, text="Применить ко всем", command=self.apply_batch_percent).grid(
+            row=0, column=6, sticky="w"
+        )
+        ttk.Button(scenario_top, text="Сбросить цены", command=self.reset_scenario).grid(row=0, column=7, padx=(12, 0))
 
         self.scenario_tree = self._create_tree(
             self.scenario_tab,
@@ -955,18 +962,49 @@ class OZPriceAnalyzerApp(tk.Tk):
     def apply_batch_percent(self) -> None:
         if self.current_run_id is None or self.current_calculation is None:
             return
-        try:
-            percent = _parse_number(self.batch_percent_var.get()) / 100
-            if percent <= -1:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("Изменение цен", "Введите процент больше -100", parent=self)
+        percent = self._scenario_percent()
+        if percent is None:
             return
         for result in self.current_calculation.products:
             current = result.average_price()
             if current is not None:
                 self.db.save_planned_price(self.current_run_id, result.article, current * (1 + percent))
         self._populate_scenario()
+
+    def apply_selected_percent(self) -> None:
+        if self.current_run_id is None:
+            return
+        selection = self.scenario_tree.selection()
+        if not selection:
+            messagebox.showinfo("Изменение цены", "Сначала выберите товар в таблице", parent=self)
+            return
+        article = selection[0]
+        row = self.scenario_rows.get(article)
+        if row is None or row.current_price is None:
+            messagebox.showinfo(
+                "Изменение цены",
+                "Для выбранного товара нет текущей средней цены",
+                parent=self,
+            )
+            return
+        percent = self._scenario_percent()
+        if percent is None:
+            return
+        self.db.save_planned_price(self.current_run_id, article, row.current_price * (1 + percent))
+        self._populate_scenario()
+        self.scenario_tree.selection_set(article)
+        self.scenario_tree.focus(article)
+        self.scenario_tree.see(article)
+
+    def _scenario_percent(self) -> float | None:
+        try:
+            percent = _parse_number(self.batch_percent_var.get()) / 100
+            if percent <= -1:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Изменение цен", "Введите процент больше -100", parent=self)
+            return None
+        return percent
 
     def reset_scenario(self) -> None:
         if self.current_run_id is None:
