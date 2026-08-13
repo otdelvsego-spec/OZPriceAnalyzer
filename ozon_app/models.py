@@ -13,6 +13,7 @@ class Product:
     material_cost: float = 0.0
     labor_cost: float = 0.0
     active: bool = True
+    sort_order: int | None = None
 
     @property
     def total_cost(self) -> float:
@@ -219,4 +220,3 @@ def as_serializable(value: Any) -> Any:
     if isinstance(value, date):
         return value.isoformat()
     return value
-

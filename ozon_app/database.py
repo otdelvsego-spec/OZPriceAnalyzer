@@ -12,6 +12,7 @@ from .calculator import distribution_status, guide_target
 from .config import DEFAULT_TAX_RATE, resource_path
 from .excel_reader import normalize_text
 from .models import ParsedSource, Product, ProductResult, RunCalculation, RunSummary
+from .ordering import default_article_order, insert_at_group_end
 
 
 def _normalized_accrual_type(value: str) -> str:
@@ -24,6 +25,7 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
         self._seed_defaults()
+        self._ensure_product_order()
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path)
@@ -68,6 +70,7 @@ class Database:
                     material_cost REAL NOT NULL DEFAULT 0,
                     labor_cost REAL NOT NULL DEFAULT 0,
                     active INTEGER NOT NULL DEFAULT 1,
+                    sort_order INTEGER,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
@@ -187,6 +190,9 @@ class Database:
                 );
                 """
             )
+            product_columns = {row[1] for row in db.execute("PRAGMA table_info(products)")}
+            if "sort_order" not in product_columns:
+                db.execute("ALTER TABLE products ADD COLUMN sort_order INTEGER")
 
     def _seed_defaults(self) -> None:
         defaults = {
@@ -216,6 +222,24 @@ class Database:
                             ),
                         )
 
+    def _ensure_product_order(self) -> None:
+        with self.transaction() as db:
+            rows = db.execute("SELECT article, sort_order FROM products").fetchall()
+            if not rows or all(row["sort_order"] is not None for row in rows):
+                return
+            positioned = sorted(
+                (row for row in rows if row["sort_order"] is not None),
+                key=lambda row: (int(row["sort_order"]), str(row["article"]).casefold()),
+            )
+            order = [str(row["article"]) for row in positioned]
+            missing = [str(row["article"]) for row in rows if row["sort_order"] is None]
+            if not order:
+                order = default_article_order(missing)
+            else:
+                for article in default_article_order(missing):
+                    order = insert_at_group_end(order, article)
+            self._write_product_order(db, order)
+
     def get_setting(self, key: str, default: str = "") -> str:
         with self.read() as db:
             row = db.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
@@ -230,11 +254,11 @@ class Database:
             )
 
     def list_products(self, active_only: bool = False) -> list[Product]:
-        sql = "SELECT article, name, material_cost, labor_cost, active FROM products"
+        sql = "SELECT article, name, material_cost, labor_cost, active, sort_order FROM products"
         parameters: tuple[object, ...] = ()
         if active_only:
             sql += " WHERE active = 1"
-        sql += " ORDER BY article COLLATE NOCASE"
+        sql += " ORDER BY sort_order, article COLLATE NOCASE"
         with self.read() as db:
             rows = db.execute(sql, parameters).fetchall()
         return [
@@ -244,6 +268,7 @@ class Database:
                 material_cost=float(row["material_cost"]),
                 labor_cost=float(row["labor_cost"]),
                 active=bool(row["active"]),
+                sort_order=int(row["sort_order"]) if row["sort_order"] is not None else None,
             )
             for row in rows
         ]
@@ -267,6 +292,7 @@ class Database:
             if product.material_cost < 0 or product.labor_cost < 0:
                 raise ValueError("Себестоимость не может быть отрицательной")
         changed = 0
+        new_articles: list[str] = []
         with self.transaction() as db:
             for product in products:
                 article = product.article.strip()
@@ -283,6 +309,8 @@ class Database:
                 )
                 if not is_changed:
                     continue
+                if old is None:
+                    new_articles.append(article)
                 changed += 1
                 db.execute(
                     """
@@ -317,7 +345,33 @@ class Database:
                     """,
                     (article, name, product.material_cost, product.labor_cost, 1 if product.active else 0),
                 )
+            if new_articles:
+                current = [
+                    str(row[0])
+                    for row in db.execute(
+                        "SELECT article FROM products WHERE sort_order IS NOT NULL ORDER BY sort_order, article COLLATE NOCASE"
+                    )
+                ]
+                for article in default_article_order(new_articles):
+                    current = insert_at_group_end(current, article)
+                self._write_product_order(db, current)
         return changed
+
+    def reorder_products(self, articles: list[str]) -> None:
+        if len(articles) != len(set(articles)):
+            raise ValueError("В порядке товаров повторяется артикул")
+        with self.transaction() as db:
+            existing = {str(row[0]) for row in db.execute("SELECT article FROM products")}
+            if set(articles) != existing:
+                raise ValueError("Порядок должен содержать все товары справочника")
+            self._write_product_order(db, articles)
+
+    @staticmethod
+    def _write_product_order(db: sqlite3.Connection, articles: list[str]) -> None:
+        db.executemany(
+            "UPDATE products SET sort_order = ? WHERE article = ?",
+            [(index, article) for index, article in enumerate(articles, start=1)],
+        )
 
     def list_product_cost_history(self, limit: int = 500) -> list[dict[str, object]]:
         with self.read() as db:
@@ -462,7 +516,11 @@ class Database:
                 """
                 SELECT id, created_at, period_start, period_end, source_count,
                        units, revenue, net_profit, unallocated_total, status
-                FROM runs ORDER BY id DESC
+                FROM runs
+                ORDER BY
+                    COALESCE(period_start, period_end, substr(created_at, 1, 10)) DESC,
+                    COALESCE(period_end, period_start, substr(created_at, 1, 10)) DESC,
+                    id DESC
                 """
             ).fetchall()
         return [RunSummary(**dict(row)) for row in rows]

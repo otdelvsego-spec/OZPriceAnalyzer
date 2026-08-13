@@ -22,12 +22,14 @@ from .costs import (
     export_cost_catalog,
     read_cost_catalog,
 )
-from .config import APP_TITLE, APP_VERSION
+from .config import APP_TITLE, APP_VERSION, save_storage_location
 from .database import Database
 from .excel_reader import REPORT_REALIZATION, preview_sheet, workbook_sheet_names
 from .exporter import export_run, suggested_export_name
 from .models import Product, ProductResult, RunCalculation, ScenarioRow, UnknownProduct
+from .ordering import insert_at_group_end
 from .service import AppService, ImportSession
+from .storage import migrate_storage
 from .theme import apply_theme
 from .trends import TrendPoint, build_trend_points, chart_bounds
 
@@ -510,9 +512,21 @@ class OZPriceAnalyzerApp(tk.Tk):
             row=2, column=1, sticky="w", pady=5
         )
         ttk.Label(settings, text="Хранилище:").grid(row=2, column=2, sticky="w", padx=(24, 8), pady=5)
-        ttk.Label(settings, text=str(self.service.paths["root"]), style="Muted.TLabel").grid(
-            row=2, column=3, sticky="w", pady=5
+        storage_controls = ttk.Frame(settings)
+        storage_controls.grid(row=2, column=3, sticky="ew", pady=5)
+        storage_controls.columnconfigure(0, weight=1)
+        self.storage_path_var = tk.StringVar(value=str(self.service.paths["root"]))
+        ttk.Entry(storage_controls, textvariable=self.storage_path_var, state="readonly", width=48).grid(
+            row=0, column=0, sticky="ew", padx=(0, 6)
         )
+        ttk.Button(storage_controls, text="Изменить…", command=self.choose_storage_folder).grid(
+            row=0, column=1, padx=3
+        )
+        ttk.Button(
+            storage_controls,
+            text="Открыть",
+            command=lambda: _open_path(self.service.paths["root"]),
+        ).grid(row=0, column=2, padx=(3, 0))
         ttk.Button(settings, text="Сохранить настройки", style="Accent.TButton", command=self.save_settings).grid(
             row=3, column=0, columnspan=4, sticky="w", pady=(10, 0)
         )
@@ -1165,19 +1179,25 @@ class OZPriceAnalyzerApp(tk.Tk):
             return
         changes = build_cost_changes(dialog.products, self.db.product_map(active_only=False))
         changed_products = [change.product for change in changes if change.changed]
-        if not changed_products:
+        if not changed_products and not dialog.order_changed:
             messagebox.showinfo("Себестоимость", "Изменений нет", parent=self)
             return
-        preview = CostImportDialog(self, changes, "Редактор приложения")
-        self.wait_window(preview)
-        if preview.cancelled:
-            return
+        products_to_apply: list[Product] = []
+        if changed_products:
+            preview = CostImportDialog(self, changes, "Редактор приложения")
+            self.wait_window(preview)
+            if preview.cancelled:
+                return
+            products_to_apply = preview.products_to_apply
         try:
-            changed = self.db.save_products(preview.products_to_apply, source="Редактор приложения")
+            changed = self.db.save_products(products_to_apply, source="Редактор приложения")
+            self.db.reorder_products(dialog.article_order)
             self.refresh_products()
+            order_text = " Порядок позиций сохранен." if dialog.order_changed else ""
             messagebox.showinfo(
                 "Себестоимость сохранена",
                 f"Применено изменений: {changed}.\n"
+                f"{order_text}\n"
                 "Новые значения используются со следующего расчета. Старые отчеты не изменены.",
                 parent=self,
             )
@@ -1217,6 +1237,58 @@ class OZPriceAnalyzerApp(tk.Tk):
 
     def show_about(self) -> None:
         AboutDialog(self)
+
+    def choose_storage_folder(self) -> None:
+        selected = filedialog.askdirectory(
+            title="Выберите пустую папку для хранилища OZ Price Analyzer",
+            initialdir=str(self.service.paths["root"].parent),
+            mustexist=True,
+            parent=self,
+        )
+        if not selected:
+            return
+        destination = Path(selected).expanduser().resolve()
+        source = self.service.paths["root"].resolve()
+        if destination == source:
+            messagebox.showinfo("Хранилище", "Эта папка уже используется", parent=self)
+            return
+        confirmed = messagebox.askyesno(
+            "Перенести хранилище",
+            f"Текущая папка:\n{source}\n\nНовая папка:\n{destination}\n\n"
+            "В новую папку будут скопированы история, себестоимость, исходные отчеты, "
+            "экспорты и резервные копии. Старая папка останется как дополнительная страховочная копия. "
+            "Продолжить?",
+            parent=self,
+        )
+        if not confirmed:
+            return
+        self.configure(cursor="watch")
+        self.status_var.set("Перенос хранилища…")
+        self.update_idletasks()
+        try:
+            result = migrate_storage(source, destination)
+            save_storage_location(destination)
+            self.service = AppService(destination)
+            self.db = self.service.db
+            self.current_run_id = None
+            self.current_calculation = None
+            self.storage_path_var.set(str(destination))
+            self._reload_settings_after_restore()
+            self.refresh_all()
+            messagebox.showinfo(
+                "Хранилище перенесено",
+                f"Новое хранилище:\n{destination}\n\n"
+                f"Расчетов: {result.backup_info.run_count}\n"
+                f"Товаров: {result.backup_info.product_count}\n"
+                f"Исходных отчетов: {result.backup_info.source_count}\n\n"
+                f"Старая папка сохранена:\n{source}",
+                parent=self,
+            )
+        except Exception as exc:
+            messagebox.showerror("Перенос хранилища", str(exc), parent=self)
+        finally:
+            self.configure(cursor="")
+            self.status_var.set("Готово" if self.current_run_id is None else f"Открыт расчет #{self.current_run_id}")
 
     def restore_application_backup(self) -> None:
         source = filedialog.askopenfilename(
@@ -1282,6 +1354,8 @@ class OZPriceAnalyzerApp(tk.Tk):
         )
         self.warn_realization_var.set(self.db.get_setting("warn_without_realization", "1") == "1")
         self.preview_rows_var.set(self.db.get_setting("preview_rows", "500"))
+        if hasattr(self, "storage_path_var"):
+            self.storage_path_var.set(str(self.service.paths["root"]))
         self._preview_theme()
 
     def export_product_catalog(self) -> None:
@@ -1606,6 +1680,8 @@ class CostCatalogEditorDialog(tk.Toplevel):
         self.grab_set()
         self.cancelled = True
         self.products: list[Product] = []
+        self.article_order: list[str] = []
+        self.order_changed = False
         self.product_map = {
             product.article: Product(
                 article=product.article,
@@ -1613,9 +1689,12 @@ class CostCatalogEditorDialog(tk.Toplevel):
                 material_cost=product.material_cost,
                 labor_cost=product.labor_cost,
                 active=product.active,
+                sort_order=product.sort_order,
             )
             for product in products
         }
+        self.product_order = [product.article for product in products]
+        self.original_order = list(self.product_order)
         self.original_articles = set(self.product_map)
         self.current_article: str | None = None
         self.loading = False
@@ -1644,8 +1723,14 @@ class CostCatalogEditorDialog(tk.Toplevel):
         self.search_var.trace_add("write", lambda *_args: self._refresh_tree())
         self.count_var = tk.StringVar()
         ttk.Label(controls, textvariable=self.count_var, style="Muted.TLabel").grid(row=0, column=2, sticky="w")
+        ttk.Button(controls, text="↑ Вверх", command=lambda: self._move_selected(-1)).grid(
+            row=0, column=3, padx=3
+        )
+        ttk.Button(controls, text="↓ Вниз", command=lambda: self._move_selected(1)).grid(
+            row=0, column=4, padx=3
+        )
         ttk.Button(controls, text="Новая позиция", style="Accent.TButton", command=self._new_product).grid(
-            row=0, column=3
+            row=0, column=5, padx=(8, 0)
         )
 
         container = ttk.Frame(self)
@@ -1749,9 +1834,14 @@ class CostCatalogEditorDialog(tk.Toplevel):
         try:
             self.tree.delete(*self.tree.get_children())
             visible = [
-                product
-                for product in sorted(self.product_map.values(), key=lambda item: item.article.casefold())
-                if not query or query in product.article.casefold() or query in product.name.casefold()
+                self.product_map[article]
+                for article in self.product_order
+                if article in self.product_map
+                and (
+                    not query
+                    or query in article.casefold()
+                    or query in self.product_map[article].name.casefold()
+                )
             ]
             for product in visible:
                 self.tree.insert(
@@ -1774,6 +1864,32 @@ class CostCatalogEditorDialog(tk.Toplevel):
                 self.tree.focus(selected)
         finally:
             self.loading = False
+
+    def _move_selected(self, direction: int) -> None:
+        if self.search_var.get().strip():
+            messagebox.showinfo(
+                "Порядок товаров",
+                "Очистите поиск, чтобы менять позиции в полном списке.",
+                parent=self,
+            )
+            return
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showinfo("Порядок товаров", "Выберите позицию в таблице", parent=self)
+            return
+        if self.dirty and not self._commit_current():
+            return
+        article = selection[0]
+        index = self.product_order.index(article)
+        target = index + direction
+        if target < 0 or target >= len(self.product_order):
+            return
+        self.product_order[index], self.product_order[target] = (
+            self.product_order[target],
+            self.product_order[index],
+        )
+        self._refresh_tree()
+        self._select_article(article)
 
     def _on_select(self, _event=None) -> None:
         if self.loading:
@@ -1860,8 +1976,8 @@ class CostCatalogEditorDialog(tk.Toplevel):
             total_cost=self.total_var.get(),
             labor_cost=self.labor_var.get(),
             active=self.active_var.get(),
-            row_number=(list(sorted(self.product_map)).index(self.current_article) + 1)
-            if self.current_article in self.product_map
+            row_number=(self.product_order.index(self.current_article) + 1)
+            if self.current_article in self.product_order
             else len(self.product_map) + 1,
         )
         try:
@@ -1874,6 +1990,10 @@ class CostCatalogEditorDialog(tk.Toplevel):
         previous_article = self.current_article
         if previous_article and previous_article != product.article and previous_article not in self.original_articles:
             self.product_map.pop(previous_article, None)
+            if previous_article in self.product_order:
+                self.product_order[self.product_order.index(previous_article)] = product.article
+        elif product.article not in self.product_order:
+            self.product_order = insert_at_group_end(self.product_order, product.article)
         self.product_map[product.article] = product
         self.current_article = product.article
         self.dirty = False
@@ -1895,10 +2015,14 @@ class CostCatalogEditorDialog(tk.Toplevel):
                     row_number=index,
                 )
                 for index, product in enumerate(
-                    sorted(self.product_map.values(), key=lambda item: item.article.casefold()), start=1
+                    (self.product_map[article] for article in self.product_order), start=1
                 )
             ]
             self.products = build_products_from_editor_entries(entries)
+            self.article_order = [product.article for product in self.products]
+            for index, product in enumerate(self.products, start=1):
+                product.sort_order = index
+            self.order_changed = self.article_order != self.original_order
         except Exception as exc:
             messagebox.showerror("Себестоимость", str(exc), parent=self)
             return
