@@ -54,6 +54,7 @@ class OZPriceAnalyzerApp(tk.Tk):
         self.current_run_id: int | None = None
         self.current_calculation: RunCalculation | None = None
         self.run_display_to_id: dict[str, int] = {}
+        self.run_number_by_id: dict[int, int] = {}
         self.source_by_iid: dict[str, dict[str, object]] = {}
         self.preview_headers: list[str] = []
         self.preview_rows: list[list[str]] = []
@@ -129,7 +130,7 @@ class OZPriceAnalyzerApp(tk.Tk):
 
         actions = ttk.Frame(header)
         actions.grid(row=0, column=1, rowspan=2, sticky="e")
-        ttk.Label(actions, text="Расчет:", style="Muted.TLabel").grid(row=0, column=0, padx=(0, 6))
+        ttk.Label(actions, text="Отчет:", style="Muted.TLabel").grid(row=0, column=0, padx=(0, 6))
         self.run_var = tk.StringVar()
         self.run_combo = ttk.Combobox(actions, textvariable=self.run_var, state="readonly", width=32)
         self.run_combo.grid(row=0, column=1, padx=(0, 12))
@@ -393,7 +394,7 @@ class OZPriceAnalyzerApp(tk.Tk):
             self.trend_tab,
             ["run", "period", "units", "revenue", "revenue_change", "net", "net_change", "unallocated"],
             [
-                "Расчет", "Период", "Продажи", "Выручка", "Изменение выручки",
+                "№ отчета", "Период", "Продажи", "Выручка", "Изменение выручки",
                 "Чистая прибыль", "Изменение прибыли", "Нераспределенные",
             ],
             row=5,
@@ -643,10 +644,11 @@ class OZPriceAnalyzerApp(tk.Tk):
     def refresh_runs(self) -> None:
         runs = self.db.list_runs()
         self.run_display_to_id.clear()
+        self.run_number_by_id = _run_positions(runs)
         values: list[str] = []
         for run in runs:
             period = _period_text(run.period_start, run.period_end)
-            display = f"#{run.id} · {run.report_name} · {period}"
+            display = f"№{self.run_number_by_id[run.id]} · {run.report_name} · {period}"
             values.append(display)
             self.run_display_to_id[display] = run.id
         self.run_combo["values"] = values
@@ -682,12 +684,25 @@ class OZPriceAnalyzerApp(tk.Tk):
         self._populate_guide()
         self._populate_scenario()
         self._populate_quality()
-        self.status_var.set(f"Открыт расчет #{run_id}: {_calculation_period(self.current_calculation)}")
+        self.status_var.set(
+            f"Открыт отчет №{self._run_number(run_id)}: {_calculation_period(self.current_calculation)}"
+        )
 
     def _on_run_selected(self, _event=None) -> None:
         run_id = self.run_display_to_id.get(self.run_var.get())
         if run_id is not None:
             self.select_run(run_id)
+
+    def _run_number(self, run_id: int | None) -> str:
+        if run_id is None:
+            return "—"
+        number = self.run_number_by_id.get(run_id)
+        return str(number) if number is not None else "—"
+
+    def _current_run_status(self) -> str:
+        if self.current_run_id is None:
+            return "Готово"
+        return f"Открыт отчет №{self._run_number(self.current_run_id)}"
 
     def _clear_current_view(self) -> None:
         self.current_run_id = None
@@ -930,13 +945,16 @@ class OZPriceAnalyzerApp(tk.Tk):
             selection = self.history_tree.selection()
             selected_run_id = int(selection[0]) if selection else self.current_run_id
         self.history_tree.delete(*self.history_tree.get_children())
-        for run in self.db.list_runs():
+        runs = self.db.list_runs()
+        self.run_number_by_id = _run_positions(runs)
+        for run in runs:
             self.history_tree.insert(
                 "",
                 "end",
                 iid=str(run.id),
                 values=(
-                    run.id, run.report_name, _period_text(run.period_start, run.period_end), run.created_at[:16], run.source_count,
+                    self.run_number_by_id[run.id], run.report_name,
+                    _period_text(run.period_start, run.period_end), run.created_at[:16], run.source_count,
                     _number(run.units), _money(run.revenue), _money(run.net_profit), _money(run.unallocated_total), run.status,
                 ),
             )
@@ -974,7 +992,7 @@ class OZPriceAnalyzerApp(tk.Tk):
             return
         self.refresh_runs()
         self.refresh_history(run_id)
-        self.status_var.set(f"Отчет #{run_id} переименован")
+        self.status_var.set(f"Отчет №{self._run_number(run_id)} переименован")
 
     def delete_history_run(self) -> None:
         selection = self.history_tree.selection()
@@ -1003,7 +1021,7 @@ class OZPriceAnalyzerApp(tk.Tk):
             self.current_calculation = None
         self.refresh_runs()
         suffix = f"; удалено копий исходных файлов: {removed_files}" if removed_files else ""
-        self.status_var.set(f"Отчет #{run_id} удален{suffix}")
+        self.status_var.set(f"Отчет удален{suffix}")
 
     def refresh_trends(self, runs=None) -> None:
         self.trend_points = build_trend_points(list(runs) if runs is not None else self.db.list_runs())
@@ -1018,7 +1036,7 @@ class OZPriceAnalyzerApp(tk.Tk):
                 "end",
                 iid=str(point.run_id),
                 values=(
-                    f"#{point.run_id}",
+                    self._run_number(point.run_id),
                     point.label,
                     _number(point.units),
                     _money(point.revenue),
@@ -1109,7 +1127,10 @@ class OZPriceAnalyzerApp(tk.Tk):
         if (x - event.x) ** 2 + (y - event.y) ** 2 > 225:
             return
         metric = TREND_METRICS.get(self.trend_metric_var.get(), "revenue")
-        text = f"Расчет #{point.run_id}\n{point.label}\n{_trend_value(point.value(metric), metric)}"
+        text = (
+            f"Отчет №{self._run_number(point.run_id)}\n"
+            f"{point.label}\n{_trend_value(point.value(metric), metric)}"
+        )
         text_x = min(max(x + 12, 80), max(self.trend_canvas.winfo_width() - 150, 80))
         text_y = max(y - 58, 8)
         box = self.trend_canvas.create_text(
@@ -1190,7 +1211,9 @@ class OZPriceAnalyzerApp(tk.Tk):
                 tags=(tag,),
             )
         self._configure_value_tags(self.comparison_tree)
-        self.status_var.set(f"Сравнение расчетов #{first_id} и #{second_id}")
+        self.status_var.set(
+            f"Сравнение отчетов №{self._run_number(first_id)} и №{self._run_number(second_id)}"
+        )
 
     def _clear_comparison(self, message: str) -> None:
         if not hasattr(self, "comparison_tree"):
@@ -1303,7 +1326,7 @@ class OZPriceAnalyzerApp(tk.Tk):
             messagebox.showerror("Резервная копия", str(exc), parent=self)
         finally:
             self.configure(cursor="")
-            self.status_var.set("Готово" if self.current_run_id is None else f"Открыт расчет #{self.current_run_id}")
+            self.status_var.set(self._current_run_status())
 
     def show_about(self) -> None:
         AboutDialog(self)
@@ -1358,7 +1381,7 @@ class OZPriceAnalyzerApp(tk.Tk):
             messagebox.showerror("Перенос хранилища", str(exc), parent=self)
         finally:
             self.configure(cursor="")
-            self.status_var.set("Готово" if self.current_run_id is None else f"Открыт расчет #{self.current_run_id}")
+            self.status_var.set(self._current_run_status())
 
     def restore_application_backup(self) -> None:
         source = filedialog.askopenfilename(
@@ -1376,7 +1399,7 @@ class OZPriceAnalyzerApp(tk.Tk):
             info = inspect_backup(source)
         except Exception as exc:
             self.configure(cursor="")
-            self.status_var.set("Готово" if self.current_run_id is None else f"Открыт расчет #{self.current_run_id}")
+            self.status_var.set(self._current_run_status())
             messagebox.showerror("Восстановление", str(exc), parent=self)
             return
         self.configure(cursor="")
@@ -1391,7 +1414,7 @@ class OZPriceAnalyzerApp(tk.Tk):
             parent=self,
         )
         if not confirmed:
-            self.status_var.set("Готово" if self.current_run_id is None else f"Открыт расчет #{self.current_run_id}")
+            self.status_var.set(self._current_run_status())
             return
         self.configure(cursor="watch")
         self.status_var.set("Восстановление истории…")
@@ -1414,7 +1437,7 @@ class OZPriceAnalyzerApp(tk.Tk):
             messagebox.showerror("Восстановление", str(exc), parent=self)
         finally:
             self.configure(cursor="")
-            self.status_var.set("Готово" if self.current_run_id is None else f"Открыт расчет #{self.current_run_id}")
+            self.status_var.set(self._current_run_status())
 
     def _reload_settings_after_restore(self) -> None:
         self.theme_var.set(THEME_VALUES.get(self.db.get_setting("theme", "system"), "Системная"))
@@ -1613,7 +1636,7 @@ class OZPriceAnalyzerApp(tk.Tk):
             self.refresh_all()
             messagebox.showinfo(
                 "Расчет готов",
-                f"Создан расчет #{calculation.run_id}.\n"
+                f"Создан отчет №{self._run_number(calculation.run_id)}.\n"
                 f"Период: {_calculation_period(calculation)}\n"
                 f"Выручка по выкупленным товарам: {_money(calculation.realization_revenue)}",
                 parent=self,
@@ -1623,13 +1646,15 @@ class OZPriceAnalyzerApp(tk.Tk):
         finally:
             self.import_in_progress = False
             self.configure(cursor="")
-            self.status_var.set("Готово" if self.current_run_id is None else f"Открыт расчет #{self.current_run_id}")
+            self.status_var.set(self._current_run_status())
 
     def _handle_duplicates(self, session: ImportSession) -> bool:
         if not session.duplicate_sources:
             return True
         policy = self.db.get_setting("duplicate_policy", "ask")
-        names = "\n".join(_duplicate_description(source) for source in session.duplicate_sources)
+        names = "\n".join(
+            _duplicate_description(source, self.run_number_by_id) for source in session.duplicate_sources
+        )
         if policy == "allow":
             return True
         if policy == "skip":
@@ -2624,9 +2649,17 @@ def _calculation_period(calculation: RunCalculation) -> str:
     return "не определен"
 
 
-def _duplicate_description(source) -> str:
+def _run_positions(runs) -> dict[int, int]:
+    return {run.id: position for position, run in enumerate(runs, start=1)}
+
+
+def _duplicate_description(source, run_numbers: dict[int, int] | None = None) -> str:
     if source.duplicate_run_ids:
-        runs = ", ".join("#" + str(value) for value in source.duplicate_run_ids)
+        numbers = run_numbers or {}
+        runs = ", ".join(
+            f"№{numbers[value]}" if value in numbers else "сохраненном отчете"
+            for value in source.duplicate_run_ids
+        )
         return f"• {source.path.name} — уже в расчетах {runs}"
     return f"• {source.path.name} — совпадает с другим выбранным файлом"
 

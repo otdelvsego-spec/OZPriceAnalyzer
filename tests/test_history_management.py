@@ -8,10 +8,19 @@ from pathlib import Path
 
 from ozon_app.database import Database
 from ozon_app.models import RunCalculation
-from ozon_app.ui import OZPriceAnalyzerApp
+from ozon_app.ui import OZPriceAnalyzerApp, _run_positions
 
 
 class HistoryManagementTests(unittest.TestCase):
+    def test_visible_report_numbers_follow_current_list_positions(self) -> None:
+        class RunStub:
+            def __init__(self, run_id: int):
+                self.id = run_id
+
+        self.assertEqual(_run_positions([RunStub(9)]), {9: 1})
+        self.assertEqual(_run_positions([RunStub(12), RunStub(9), RunStub(4)]), {12: 1, 9: 2, 4: 3})
+        self.assertEqual(_run_positions([RunStub(12), RunStub(4)]), {12: 1, 4: 2})
+
     def test_history_selection_requests_quality_for_highlighted_run(self) -> None:
         class SelectedTree:
             @staticmethod
@@ -90,12 +99,34 @@ class HistoryManagementTests(unittest.TestCase):
                 ),
                 {},
             )
-            self.assertEqual(database.list_runs()[0].report_name, f"Отчет Ozon #{run_id}")
+            self.assertEqual(database.list_runs()[0].report_name, "Отчет Ozon без периода")
 
             database.rename_run(run_id, "  Июльский   отчет  ")
             self.assertEqual(Database(path).list_runs()[0].report_name, "Июльский отчет")
             with self.assertRaises(ValueError):
                 database.rename_run(run_id, "   ")
+
+    def test_legacy_automatic_id_name_is_removed_on_upgrade(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "app.sqlite3"
+            database = Database(path)
+            run_id = database.save_run(
+                RunCalculation(
+                    run_id=None,
+                    period_start=None,
+                    period_end=None,
+                    tax_rate=0.04,
+                    products=[],
+                    unallocated_total=0,
+                    unallocated={},
+                    accrual_stats={},
+                ),
+                {},
+            )
+            with database.transaction() as db:
+                db.execute("UPDATE runs SET report_name = ? WHERE id = ?", (f"Отчет Ozon #{run_id}", run_id))
+
+            self.assertEqual(Database(path).list_runs()[0].report_name, "Отчет Ozon без периода")
 
     def test_delete_cascades_and_keeps_shared_source_until_last_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -137,6 +168,7 @@ class HistoryManagementTests(unittest.TestCase):
                         0,
                     )
             self.assertEqual([run.id for run in database.list_runs()], [second_id])
+            self.assertEqual(_run_positions(database.list_runs()), {second_id: 1})
 
             self.assertEqual(database.delete_run(second_id), 1)
             self.assertFalse(source.exists())

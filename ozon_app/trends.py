@@ -65,7 +65,7 @@ def _period_label(run: RunSummary) -> str:
     try:
         return datetime.fromisoformat(run.created_at).strftime("%d.%m.%Y")
     except ValueError:
-        return f"Расчет #{run.id}"
+        return run.report_name or "Период не определен"
 
 
 def _display_date(value: str) -> str:

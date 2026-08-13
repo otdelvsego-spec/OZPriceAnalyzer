@@ -248,10 +248,13 @@ class Database:
     def _ensure_run_names(self) -> None:
         with self.transaction() as db:
             rows = db.execute(
-                "SELECT id, period_start, period_end FROM runs "
-                "WHERE report_name IS NULL OR trim(report_name) = ''"
+                "SELECT id, report_name, period_start, period_end FROM runs"
             ).fetchall()
             for row in rows:
+                current_name = str(row["report_name"] or "").strip()
+                legacy_name = f"Отчет Ozon #{int(row['id'])}"
+                if current_name and current_name != legacy_name:
+                    continue
                 db.execute(
                     "UPDATE runs SET report_name = ? WHERE id = ?",
                     (_default_run_name(int(row["id"]), row["period_start"], row["period_end"]), row["id"]),
@@ -524,11 +527,18 @@ class Database:
                     (run_id, "Расчет выполнен без RealizationReportCIS; выручка может быть неполной"),
                 )
             hash_counts = Counter(source.file_hash for source in calculation.source_files)
+            run_names = {
+                int(row["id"]): str(row["report_name"])
+                for row in db.execute("SELECT id, report_name FROM runs").fetchall()
+            }
             for source in calculation.source_files:
                 if source.duplicate_run_ids or hash_counts[source.file_hash] > 1:
                     details = (
                         "ранее использовался в "
-                        + ", ".join(f"#{value}" for value in source.duplicate_run_ids)
+                        + ", ".join(
+                            f"«{run_names[value]}»" if value in run_names else "сохраненном отчете"
+                            for value in source.duplicate_run_ids
+                        )
                         if source.duplicate_run_ids
                         else "повторно выбран в текущем запуске"
                     )
@@ -741,7 +751,7 @@ def _default_run_name(run_id: int, period_start: str | None, period_end: str | N
         return f"Отчет Ozon за {start}–{end}"
     if start or end:
         return f"Отчет Ozon за {start or end}"
-    return f"Отчет Ozon #{run_id}"
+    return "Отчет Ozon без периода"
 
 
 def _display_date(value: str | None) -> str:
