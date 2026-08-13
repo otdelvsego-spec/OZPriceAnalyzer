@@ -66,7 +66,8 @@ class OZPriceAnalyzerApp(tk.Tk):
         self.title(f"{APP_TITLE} {APP_VERSION}")
         self.geometry("1540x920")
         self.minsize(1180, 720)
-        self.option_add("*Font", "Segoe UI 10")
+        # A Tk font family containing spaces must be grouped as one Tcl list item.
+        self.option_add("*Font", "{Segoe UI} 10")
         self._build_ui()
         self.refresh_all()
 

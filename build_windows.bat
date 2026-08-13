@@ -20,6 +20,10 @@ if errorlevel 1 exit /b 1
 pyinstaller --noconfirm --clean OZPriceAnalyzer.spec
 if errorlevel 1 exit /b 1
 
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke_test_windows.ps1 ^
+  -ExecutablePath dist\OZPriceAnalyzer\OZPriceAnalyzer.exe
+if errorlevel 1 exit /b 1
+
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\sign_windows.ps1 ^
   -ExecutablePath dist\OZPriceAnalyzer\OZPriceAnalyzer.exe
 if errorlevel 1 exit /b 1

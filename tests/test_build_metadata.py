@@ -59,6 +59,7 @@ class BuildMetadataTests(unittest.TestCase):
         workflow = (PROJECT_ROOT / ".github/workflows/windows-build.yml").read_text(encoding="utf-8")
         self.assertIn("actions/upload-artifact@v4", workflow)
         self.assertIn("OZPriceAnalyzer-Windows-x64", workflow)
+        self.assertIn("smoke_test_windows.ps1", workflow)
 
 
 if __name__ == "__main__":

@@ -46,6 +46,10 @@ jobs:
           pyinstaller --noconfirm --clean OZPriceAnalyzer.spec
           Copy-Item README_WINDOWS.txt "dist/OZPriceAnalyzer/Прочтите_перед_запуском.txt"
 
+      - name: Smoke-test built executable
+        shell: pwsh
+        run: ./scripts/smoke_test_windows.ps1 -ExecutablePath "dist/OZPriceAnalyzer/OZPriceAnalyzer.exe"
+
       - name: Sign executable when certificate is configured
         shell: pwsh
         env:
