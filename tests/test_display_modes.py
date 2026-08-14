@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from ozon_app.display_modes import fitted_window_size, resolve_ui_scale
+from ozon_app.resizable_layout import _minimum_upper_height
 
 
 class DisplayModeTests(unittest.TestCase):
@@ -19,6 +20,11 @@ class DisplayModeTests(unittest.TestCase):
     def test_window_size_never_uses_desktop_sized_minimum_on_small_screen(self) -> None:
         self.assertEqual(fitted_window_size(1366, 768), (1318, 688, 1180, 608))
         self.assertEqual(fitted_window_size(1920, 1080), (1540, 920, 1180, 720))
+
+    def test_protected_settings_rows_cannot_be_collapsed_by_splitter(self) -> None:
+        self.assertEqual(_minimum_upper_height(265, []), 265)
+        self.assertEqual(_minimum_upper_height(212, [24, 220, 92]), 348)
+        self.assertEqual(_minimum_upper_height(400, [24, 220, 92]), 400)
 
 
 if __name__ == "__main__":
