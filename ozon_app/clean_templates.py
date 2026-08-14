@@ -79,7 +79,6 @@ def _build_report_template(output: Path) -> None:
     ws = wb.active
     ws.title = "КонсОтчет"
     ws["A1"] = "OZ Price Analyzer — итоговый отчет"
-    ws.merge_cells("A1:AY1")
     ws["A1"].font = Font(size=16, bold=True)
     ws["B5"] = "Период: будет заполнен при экспорте"
     ws["H3"] = "Нераспределенные доходы / расходы"
