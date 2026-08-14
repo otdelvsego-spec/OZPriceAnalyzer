@@ -1,4 +1,4 @@
-from ozon_app.controls_always_visible import run_app
+from ozon_app.heading_tooltips import run_app
 
 
 if __name__ == "__main__":
