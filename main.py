@@ -1,4 +1,4 @@
-from ozon_app.catalog_controls_fix import run_app
+from ozon_app.controls_always_visible import run_app
 
 
 if __name__ == "__main__":
