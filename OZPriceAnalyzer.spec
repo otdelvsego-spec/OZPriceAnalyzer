@@ -4,14 +4,13 @@ from pathlib import Path
 
 
 project_root = Path(SPECPATH).resolve()
-resources = project_root / "ozon_app" / "resources"
 version_info = project_root / "build" / "windows_version_info.txt"
 
 analysis = Analysis(
     [str(project_root / "main.py")],
     pathex=[str(project_root)],
     binaries=[],
-    datas=[(str(resources), "ozon_app/resources")],
+    datas=[],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

@@ -71,6 +71,11 @@ def application_data_dir() -> Path:
 
 
 def resource_path(name: str) -> Path:
+    if name in {"cost_template.xlsx", "report_template.xlsx"}:
+        from .clean_templates import ensure_clean_template
+
+        generated = application_data_dir() / "generated_resources" / name
+        return ensure_clean_template(name, generated)
     bundle_root = getattr(sys, "_MEIPASS", None)
     if bundle_root:
         return Path(bundle_root) / "ozon_app" / "resources" / name
