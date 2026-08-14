@@ -1,4 +1,4 @@
-from ozon_app.resizable_layout import run_app
+from ozon_app.display_modes import run_app
 
 
 if __name__ == "__main__":

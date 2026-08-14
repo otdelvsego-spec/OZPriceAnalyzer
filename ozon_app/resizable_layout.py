@@ -20,10 +20,16 @@ class _GridSplitter:
         self.min_table = min_table
         self.compact = compact
         self.dragging = False
+        self.suspended = False
         self.table_height: int | None = None
+        self._control_column = 1
 
-        self.handle = ttk.Separator(parent, orient="horizontal")
-        self.handle.grid(row=row, column=0, sticky="ew", pady=4)
+        self.bar = ttk.Frame(parent)
+        self.bar.grid(row=row, column=0, sticky="ew", pady=2)
+        self.bar.columnconfigure(0, weight=1)
+
+        self.handle = ttk.Separator(self.bar, orient="horizontal")
+        self.handle.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         self.handle.configure(cursor="sb_v_double_arrow")
         self.handle.bind("<ButtonPress-1>", self._start)
         self.handle.bind("<B1-Motion>", self._move)
@@ -31,7 +37,20 @@ class _GridSplitter:
         parent.bind("<Configure>", self._on_configure, add="+")
         owner.after_idle(self._initialize)
 
+    def add_button(self, text: str, command) -> ttk.Button:
+        button = ttk.Button(
+            self.bar,
+            text=text,
+            style="TableTool.TButton",
+            command=command,
+        )
+        button.grid(row=0, column=self._control_column, padx=(4, 0))
+        self._control_column += 1
+        return button
+
     def _initialize(self):
+        if self.suspended:
+            return
         total = self.parent.winfo_height()
         if total <= 1:
             self.owner.after(40, self._initialize)
@@ -40,10 +59,11 @@ class _GridSplitter:
         self._apply()
 
     def _start(self, _event):
-        self.dragging = True
+        if not self.suspended:
+            self.dragging = True
 
     def _move(self, event):
-        if not self.dragging:
+        if not self.dragging or self.suspended:
             return
         y = event.y_root - self.parent.winfo_rooty()
         total = self.parent.winfo_height()
@@ -56,10 +76,12 @@ class _GridSplitter:
         self._apply()
 
     def _on_configure(self, _event):
-        if self.table_height is not None:
+        if self.table_height is not None and not self.suspended:
             self.owner.after_idle(self._apply)
 
     def _apply(self):
+        if self.suspended:
+            return
         total = self.parent.winfo_height()
         if total <= 1 or self.table_height is None:
             return
@@ -90,7 +112,7 @@ def _move_tree_container(tree: ttk.Treeview, *, row: int) -> None:
 
 
 class ResizableOZPriceAnalyzerApp(OZPriceAnalyzerApp):
-    """v0.5.3 layout: draggable table height on Overview, Scenario and Settings."""
+    """v0.5.3+ layout: draggable table height on Overview, Scenario and Settings."""
 
     def _build_overview_tab(self) -> None:
         super()._build_overview_tab()
