@@ -1,4 +1,4 @@
-from ozon_app.shutdown_all_windows import run_app
+from ozon_app.history_batch_export import run_app
 
 
 if __name__ == "__main__":
