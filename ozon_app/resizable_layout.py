@@ -14,7 +14,12 @@ def _minimum_upper_height(configured: int, protected_heights) -> int:
 
 
 class _GridSplitter:
-    """Draggable separator that gives a table a controlled pixel height."""
+    """Static table toolbar that keeps controls separate from the table.
+
+    The component intentionally preserves the historical API used by display
+    modes, but vertical dragging is disabled. The table simply expands into the
+    remaining grid space, so it cannot be dragged over buttons or filters.
+    """
 
     def __init__(self, owner, parent, *, row: int, table_row: int, absorb_row: int,
                  min_upper: int, min_table: int, compact=None, protected_rows=()):
@@ -36,12 +41,11 @@ class _GridSplitter:
         self.bar.grid(row=row, column=0, sticky="ew", pady=2)
         self.bar.columnconfigure(0, weight=1)
 
+        # This is now a visual separator only. It is deliberately not bound to
+        # mouse events and does not show a resize cursor.
         self.handle = ttk.Separator(self.bar, orient="horizontal")
         self.handle.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        self.handle.configure(cursor="sb_v_double_arrow")
-        self.handle.bind("<ButtonPress-1>", self._start)
-        self.handle.bind("<B1-Motion>", self._move)
-        self.handle.bind("<ButtonRelease-1>", self._finish)
+
         parent.bind("<Configure>", self._on_configure, add="+")
         owner.after_idle(self._initialize)
 
@@ -84,42 +88,39 @@ class _GridSplitter:
         if total <= 1:
             self.owner.after(40, self._initialize)
             return
-        self.table_height = max(self.min_table, total - self._effective_min_upper())
         self._apply()
 
+    # Kept as no-ops for backwards compatibility with code that may still call
+    # these methods. Table height is no longer user-draggable.
     def _start(self, _event):
-        if not self.suspended:
-            self.dragging = True
+        self.dragging = False
 
-    def _move(self, event):
-        if not self.dragging or self.suspended:
-            return
-        y = event.y_root - self.parent.winfo_rooty()
-        total = self.parent.winfo_height()
-        maximum = max(self.min_table, total - self._effective_min_upper())
-        self.table_height = max(self.min_table, min(total - y, maximum))
-        self._apply()
+    def _move(self, _event):
+        return
 
     def _finish(self, _event):
         self.dragging = False
-        self._apply()
 
     def _on_configure(self, _event):
-        if self.table_height is not None and not self.suspended:
+        if not self.suspended:
             self.owner.after_idle(self._apply)
 
     def _apply(self):
         if self.suspended:
             return
         total = self.parent.winfo_height()
-        if total <= 1 or self.table_height is None:
+        if total <= 1:
             return
-        maximum = max(self.min_table, total - self._effective_min_upper())
-        self.table_height = max(self.min_table, min(self.table_height, maximum))
-        self.parent.rowconfigure(self.absorb_row, weight=1)
-        self.parent.rowconfigure(self.table_row, weight=0, minsize=self.table_height)
-        if self.compact:
-            self.compact(total - self.table_height)
+
+        # Release the old fixed-pixel table constraint. Controls keep their
+        # natural/requested height; the table receives only the remaining space.
+        self.table_height = None
+        self.parent.rowconfigure(self.absorb_row, weight=0)
+        self.parent.rowconfigure(
+            self.table_row,
+            weight=1,
+            minsize=min(max(int(self.min_table), 0), 90),
+        )
 
 
 def _hide_label_with_text(root, needle: str, hide: bool) -> None:
@@ -141,13 +142,13 @@ def _move_tree_container(tree: ttk.Treeview, *, row: int) -> None:
 
 
 class ResizableOZPriceAnalyzerApp(OZPriceAnalyzerApp):
-    """v0.5.3+ layout: draggable table height on Overview, Scenario and Settings."""
+    """Static table layout with protected controls and non-draggable separators."""
 
     def _build_overview_tab(self) -> None:
         super()._build_overview_tab()
         _move_tree_container(self.overview_tree, row=4)
         self.overview_tab.rowconfigure(3, weight=0)
-        self.overview_tab.rowconfigure(4, weight=0)
+        self.overview_tab.rowconfigure(4, weight=1)
 
         def compact(upper: int):
             _hide_label_with_text(
@@ -172,7 +173,7 @@ class ResizableOZPriceAnalyzerApp(OZPriceAnalyzerApp):
         _move_tree_container(self.scenario_tree, row=5)
         self.scenario_kpi_frame.grid_configure(row=6)
         self.scenario_tab.rowconfigure(4, weight=0)
-        self.scenario_tab.rowconfigure(5, weight=0)
+        self.scenario_tab.rowconfigure(5, weight=1)
 
         def compact(upper: int):
             _hide_label_with_text(
@@ -189,10 +190,10 @@ class ResizableOZPriceAnalyzerApp(OZPriceAnalyzerApp):
     def _build_settings_tab(self) -> None:
         super()._build_settings_tab()
         _move_tree_container(self.products_tree, row=4)
-        self.settings_tab.rowconfigure(1, weight=1)
+        self.settings_tab.rowconfigure(1, weight=0)
         self.settings_tab.rowconfigure(2, weight=0)
         self.settings_tab.rowconfigure(3, weight=0)
-        self.settings_tab.rowconfigure(4, weight=0)
+        self.settings_tab.rowconfigure(4, weight=1)
 
         def compact(upper: int):
             _hide_label_with_text(
