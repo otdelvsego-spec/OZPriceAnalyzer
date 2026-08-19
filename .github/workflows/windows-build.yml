@@ -6,6 +6,7 @@ on:
     branches:
       - main
       - agent/initial-python-app
+      - agent/report-total-labels-v0.5.16
     tags:
       - "v*"
 
