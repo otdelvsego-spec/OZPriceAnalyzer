@@ -9,6 +9,7 @@ from openpyxl import load_workbook
 from ozon_app.database import Database
 from ozon_app.exporter import export_calculation, export_run
 from ozon_app.models import ParsedSource, Product, ProductResult, RunCalculation
+from ozon_app.report_totals import report_total_value
 
 
 class DatabaseExporterTests(unittest.TestCase):
@@ -54,6 +55,7 @@ class DatabaseExporterTests(unittest.TestCase):
             self.assertEqual(loaded.products[0].labor_cost, 30)
             self.assertEqual(loaded.products[0].category, "Старая категория")
             self.assertEqual(loaded.unallocated_total, -50)
+            self.assertAlmostEqual(report_total_value(loaded), 130.0)
 
             database.save_product(
                 Product("A-1", "Товар", material_cost=999, labor_cost=1, category="Новая категория")
@@ -67,10 +69,17 @@ class DatabaseExporterTests(unittest.TestCase):
             workbook = load_workbook(destination, data_only=False)
             try:
                 self.assertEqual(workbook.sheetnames, ["КонсОтчет", "Разбивка"])
-                self.assertEqual(workbook["КонсОтчет"]["H4"].value, -50)
+                sheet = workbook["КонсОтчет"]
+                self.assertEqual(sheet["H4"].value, -50)
+                self.assertEqual(sheet["L3"].value, "Чистая прибыль товаров")
+                self.assertEqual(sheet["M3"].value, "Итог отчета с учетом нераспределенных")
+                self.assertEqual(sheet["M4"].value, "=L7+H4")
+                self.assertEqual(sheet["K6"].value, "Финрезультат Ozon на ед.")
+                self.assertEqual(sheet["M6"].value, "Финрезультат Ozon до с/с и налога")
+                self.assertEqual(sheet["AW6"].value, "Прибыль до себестоимости")
                 self.assertEqual(workbook["Разбивка"]["A5"].value, "Подписка Premium")
                 self.assertEqual(workbook["Разбивка"]["C5"].value, -50)
-                self.assertTrue(str(workbook["КонсОтчет"]["AO8"].value).startswith("=IF"))
+                self.assertTrue(str(sheet["AO8"].value).startswith("=IF"))
             finally:
                 workbook.close()
 
