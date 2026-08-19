@@ -1,4 +1,4 @@
-from ozon_app.overview_export import run_app
+from ozon_app.report_totals import run_app
 
 
 if __name__ == "__main__":
