@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ozpriceanalyzer"
+dynamic = ["version"]
+description = "Локальный анализатор отчетов Ozon с историей и сценариями цены"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["openpyxl>=3.1,<4"]
+
+[project.scripts]
+ozpriceanalyzer = "ozon_app.report_totals:run_app"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["ozon_app*"]
+
+[tool.setuptools.package-data]
+ozon_app = ["resources/*.json", "resources/*.xlsx"]
+
+[tool.setuptools.dynamic]
+version = {attr = "ozon_app.__version__"}

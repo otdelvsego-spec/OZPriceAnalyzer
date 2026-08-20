@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.db
+.venv/
+venv/
+build/
+dist/
+*.spec
+!OZPriceAnalyzer.spec
+artifacts/
+.idea/
+.vscode/
+.pytest_cache/
+.coverage
+data/
+exports/
