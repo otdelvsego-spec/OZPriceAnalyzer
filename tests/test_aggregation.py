@@ -100,6 +100,34 @@ class AggregationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "не выбраны"):
             aggregate_calculations([])
 
+    def test_combined_overview_preserves_each_period_compensation_tax(self) -> None:
+        april = RunCalculation(
+            run_id=1,
+            period_start=date(2026, 4, 1),
+            period_end=date(2026, 4, 30),
+            tax_rate=0.04,
+            products=[ProductResult("A", "Товар", 0, 0, revenue_no_points=100)],
+            unallocated_total=100,
+            unallocated={"Брак по вине Ozon на складе": (1, 100)},
+            accrual_stats={},
+        )
+        may = RunCalculation(
+            run_id=2,
+            period_start=date(2026, 5, 1),
+            period_end=date(2026, 5, 31),
+            tax_rate=0.06,
+            products=[ProductResult("A", "Товар", 0, 0, revenue_no_points=100)],
+            unallocated_total=100,
+            unallocated={"Потеря по вине Ozon в логистике": (1, 100)},
+            accrual_stats={},
+        )
+
+        combined = aggregate_calculations([april, may])
+
+        self.assertEqual(combined.unallocated_compensation_income, 200)
+        self.assertEqual(combined.compensation_tax, 10)
+        self.assertEqual(combined.totals()["tax"], 20)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -78,8 +78,11 @@ class DatabaseExporterTests(unittest.TestCase):
                 sheet = workbook["КонсОтчет"]
                 self.assertEqual(sheet["H4"].value, -50)
                 self.assertEqual(sheet["L3"].value, "Чистая прибыль товаров")
-                self.assertEqual(sheet["M3"].value, "Итог отчета с учетом нераспределенных")
-                self.assertEqual(sheet["M4"].value, "=L7+H4")
+                self.assertEqual(
+                    sheet["M3"].value,
+                    "Итог отчета с учетом нераспределенных после налога",
+                )
+                self.assertEqual(sheet["M4"].value, "=L7+H4-J4")
                 self.assertEqual(sheet["K6"].value, "Финрезультат Ozon на ед.")
                 self.assertEqual(sheet["M6"].value, "Финрезультат Ozon до с/с и налога")
                 self.assertEqual(sheet["AH6"].value, "Средняя комиссия, % от выручки")
@@ -89,7 +92,7 @@ class DatabaseExporterTests(unittest.TestCase):
                 self.assertEqual(sheet["AH7"].value, "=IFERROR(-V7/R7,0)")
                 self.assertEqual(sheet["AI7"].value, "=IFERROR(-(Y7+Z7)/R7,0)")
                 self.assertEqual(sheet["AJ7"].value, "=IFERROR(U7/R7,0)")
-                self.assertEqual(sheet["AK7"].value, "=IFERROR((L7+$H$4)/R7,0)")
+                self.assertEqual(sheet["AK7"].value, "=IFERROR((L7+$H$4-$J$4)/R7,0)")
                 self.assertEqual(sheet["AH8"].value, "=IFERROR(-V8/R8,0)")
                 self.assertEqual(sheet["AI8"].value, "=IFERROR(-(Y8+Z8)/R8,0)")
                 self.assertEqual(sheet["AJ8"].value, "=IFERROR(U8/R8,0)")
@@ -99,6 +102,64 @@ class DatabaseExporterTests(unittest.TestCase):
                 self.assertEqual(workbook["Разбивка"]["A5"].value, "Подписка Premium")
                 self.assertEqual(workbook["Разбивка"]["C5"].value, -50)
                 self.assertTrue(str(sheet["AO8"].value).startswith("=IF"))
+            finally:
+                workbook.close()
+
+    def test_compensation_tax_is_visible_in_history_and_excel_totals(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = Database(root / "app.sqlite3")
+            source_path = root / "source.xlsx"
+            source = ParsedSource(
+                path=source_path,
+                file_hash="hash-compensation",
+                report_type="ACCRUAL",
+                sheet_name="Начисления",
+                header_row=1,
+            )
+            calculation = RunCalculation(
+                run_id=None,
+                period_start=None,
+                period_end=None,
+                tax_rate=0.04,
+                products=[
+                    ProductResult(
+                        article="A-1",
+                        name="Товар",
+                        material_cost=100,
+                        labor_cost=0,
+                        units=1,
+                        revenue_no_points=500,
+                        financial_result=300,
+                    )
+                ],
+                unallocated_total=120.78,
+                unallocated={"Брак по вине Ozon на складе": (1, 120.78)},
+                accrual_stats={"Брак по вине Ozon на складе": (0, 1)},
+                source_files=[source],
+            )
+            run_id = database.save_run(calculation, {str(source_path): source_path})
+
+            loaded = database.load_calculation(run_id)
+            self.assertAlmostEqual(loaded.unallocated_compensation_income, 120.78)
+            self.assertAlmostEqual(loaded.compensation_tax, 4.8312)
+            self.assertAlmostEqual(report_total_value(loaded), 295.9488)
+            self.assertAlmostEqual(database.list_runs()[0].net_margin, 295.9488 / 500)
+
+            destination = root / "compensation.xlsx"
+            export_run(database, run_id, destination)
+            workbook = load_workbook(destination, data_only=False)
+            try:
+                sheet = workbook["КонсОтчет"]
+                self.assertEqual(sheet["H4"].value, 120.78)
+                self.assertEqual(sheet["I4"].value, 120.78)
+                self.assertAlmostEqual(sheet["J4"].value, 4.8312)
+                self.assertEqual(sheet["O7"].value, "=SUM(O8:O8)+$J$4")
+                self.assertEqual(sheet["P7"].value, "=SUM(P8:P8)+$I$4")
+                breakdown = workbook["Разбивка"]
+                labels = [breakdown.cell(row, 1).value for row in range(1, breakdown.max_row + 1)]
+                tax_row = labels.index("Налог с компенсаций") + 1
+                self.assertAlmostEqual(breakdown.cell(tax_row, 3).value, 4.8312)
             finally:
                 workbook.close()
 

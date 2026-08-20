@@ -1278,6 +1278,29 @@ class OZPriceAnalyzerApp(tk.Tk):
             tag = "negative" if amount < 0 else "positive"
             self.breakdown_tree.insert("", "end", values=(accrual_type, count, _money(amount), _percent(share)), tags=(tag,))
         self.breakdown_tree.insert("", "end", values=("Итого", sum(x[0] for x in calculation.unallocated.values()), _money(total), _percent(1 if total else 0)), tags=("total",))
+        if calculation.unallocated_compensation_income:
+            self.breakdown_tree.insert(
+                "",
+                "end",
+                values=(
+                    "Налог с компенсаций",
+                    "—",
+                    _money(-calculation.compensation_tax),
+                    "—",
+                ),
+                tags=("negative",),
+            )
+            self.breakdown_tree.insert(
+                "",
+                "end",
+                values=(
+                    "Итого после налога с компенсаций",
+                    "—",
+                    _money(total - calculation.compensation_tax),
+                    "—",
+                ),
+                tags=("total",),
+            )
         self._configure_value_tags(self.breakdown_tree)
 
     def _populate_guide(self) -> None:

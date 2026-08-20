@@ -10,7 +10,14 @@ from typing import Iterator
 from .calculator import distribution_status, guide_target
 from .config import DEFAULT_TAX_RATE
 from .excel_reader import normalize_text
-from .models import ParsedSource, Product, ProductResult, RunCalculation, RunSummary
+from .models import (
+    ParsedSource,
+    Product,
+    ProductResult,
+    RunCalculation,
+    RunSummary,
+    is_compensation_accrual_type,
+)
 from .ordering import default_article_order, insert_at_group_end
 
 
@@ -653,7 +660,7 @@ class Database:
                 """
                 SELECT r.id, r.created_at, r.period_start, r.period_end, r.source_count,
                        r.units, r.revenue, r.net_profit, r.unallocated_total, r.status,
-                       r.report_name,
+                       r.report_name, r.tax_rate,
                        CASE WHEN r.cost_sold = 0 THEN 0
                             ELSE r.net_profit / r.cost_sold
                        END AS profitability,
@@ -665,10 +672,7 @@ class Database:
                        END AS logistics_share,
                        CASE WHEN r.revenue = 0 THEN 0
                             ELSE COALESCE(p.points, 0) / r.revenue
-                       END AS points_share,
-                       CASE WHEN r.revenue = 0 THEN 0
-                            ELSE (r.net_profit + r.unallocated_total) / r.revenue
-                       END AS net_margin
+                       END AS points_share
                 FROM runs AS r
                 LEFT JOIN (
                     SELECT run_id,
@@ -684,7 +688,34 @@ class Database:
                     r.id ASC
                 """
             ).fetchall()
-        return [RunSummary(**dict(row)) for row in rows]
+            unallocated_rows = db.execute(
+                "SELECT run_id, accrual_type, amount FROM unallocated"
+            ).fetchall()
+        compensation_by_run: dict[int, float] = {}
+        for row in unallocated_rows:
+            if is_compensation_accrual_type(str(row["accrual_type"])):
+                run_id = int(row["run_id"])
+                compensation_by_run[run_id] = (
+                    compensation_by_run.get(run_id, 0.0) + float(row["amount"])
+                )
+        summaries: list[RunSummary] = []
+        for row in rows:
+            values = dict(row)
+            tax_rate = float(values.pop("tax_rate"))
+            revenue = float(values["revenue"])
+            compensation_tax = compensation_by_run.get(int(values["id"]), 0.0) * tax_rate
+            values["net_margin"] = (
+                (
+                    float(values["net_profit"])
+                    + float(values["unallocated_total"])
+                    - compensation_tax
+                )
+                / revenue
+                if revenue
+                else 0.0
+            )
+            summaries.append(RunSummary(**values))
+        return summaries
 
     def rename_run(self, run_id: int, report_name: str) -> None:
         cleaned = " ".join(str(report_name).split())

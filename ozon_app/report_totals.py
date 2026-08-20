@@ -8,9 +8,8 @@ from .ui import _money, _percent
 
 
 def report_total_value(calculation) -> float:
-    """Return business result including unallocated income/expenses."""
-    totals = calculation.totals()
-    return float(totals["net_profit"]) + float(totals["unallocated"])
+    """Return report profit after tax on unallocated compensation income."""
+    return float(calculation.report_net_profit)
 
 
 def overview_revenue_kpi_values(calculation) -> dict[str, str]:
@@ -54,7 +53,7 @@ class ReportTotalsOZPriceAnalyzerApp(OverviewColumnSettingsOZPriceAnalyzerApp):
         card.grid(row=1, column=6, sticky="nsew", padx=(5, 0))
         ttk.Label(
             card,
-            text="Итог отчёта с нераспределёнными",
+            text="Итог с нераспределёнными после налога",
             style="CardMuted.TLabel",
         ).grid(row=0, column=0, sticky="w")
         ttk.Label(

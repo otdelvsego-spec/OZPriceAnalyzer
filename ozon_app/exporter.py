@@ -83,20 +83,25 @@ def _fill_report_sheet(ws, calculation: RunCalculation, planned_prices: dict[str
 
     last_row = max(output_last_row, 8)
     ws["H4"] = calculation.unallocated_total
+    ws["I4"] = calculation.unallocated_compensation_income
+    ws["J4"] = calculation.compensation_tax
     ws["P4"] = calculation.tax_rate
+    ws["M4"] = "=L7+H4-J4"
     if calculation.period_start and calculation.period_end:
         ws["B5"] = f"Период: {calculation.period_start:%d.%m.%Y}-{calculation.period_end:%d.%m.%Y}"
     else:
         ws["B5"] = "Период не определен"
     for column in ("F", "G", "H", "L", "M", "O", "P"):
         ws[f"{column}7"] = f"=SUM({column}8:{column}{last_row})"
+    ws["O7"] = f"=SUM(O8:O{last_row})+$J$4"
+    ws["P7"] = f"=SUM(P8:P{last_row})+$I$4"
     for column_number in range(17, 34):
         letter = ws.cell(1, column_number).column_letter
         ws[f"{letter}7"] = f"=SUM({letter}8:{letter}{last_row})"
     ws["AH7"] = "=IFERROR(-V7/R7,0)"
     ws["AI7"] = "=IFERROR(-(Y7+Z7)/R7,0)"
     ws["AJ7"] = "=IFERROR(U7/R7,0)"
-    ws["AK7"] = "=IFERROR((L7+$H$4)/R7,0)"
+    ws["AK7"] = "=IFERROR((L7+$H$4-$J$4)/R7,0)"
     ws["AL7"] = "=IFERROR(R7/Q7,\"\")"
     ws["AM7"] = "=IF(OR(AL7=\"\",AN7=\"\"),\"\",IFERROR(AN7/AL7-1,0))"
     ws["AN7"] = "=IFERROR(AQ7/Q7,\"\")"
@@ -208,6 +213,12 @@ def _create_breakdown_sheet(workbook, calculation: RunCalculation) -> None:
     ws.cell(total_row + 2, 3, "='КонсОтчет'!H4")
     ws.cell(total_row + 3, 1, "Отклонение")
     ws.cell(total_row + 3, 3, f"=C{total_row}-C{total_row + 2}")
+    ws.cell(total_row + 5, 1, "Компенсации в налогооблагаемой базе")
+    ws.cell(total_row + 5, 3, calculation.unallocated_compensation_income)
+    ws.cell(total_row + 6, 1, "Налог с компенсаций")
+    ws.cell(total_row + 6, 3, calculation.compensation_tax)
+    ws.cell(total_row + 7, 1, "Нераспределенные после налога с компенсаций")
+    ws.cell(total_row + 7, 3, calculation.unallocated_total - calculation.compensation_tax)
 
     blue = PatternFill("solid", fgColor="D9E1F2")
     green = PatternFill("solid", fgColor="E2EFDA")
@@ -230,7 +241,7 @@ def _create_breakdown_sheet(workbook, calculation: RunCalculation) -> None:
     ws.column_dimensions["A"].width = 60
     ws.column_dimensions["B"].width = 18
     ws.column_dimensions["C"].width = 18
-    for row in range(5, total_row + 4):
+    for row in range(5, total_row + 8):
         ws.cell(row, 3).number_format = "#,##0.00"
     ws.auto_filter.ref = f"A4:C{total_row}"
     ws.freeze_panes = "A5"

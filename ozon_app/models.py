@@ -6,6 +6,21 @@ from pathlib import Path
 from typing import Any
 
 
+_COMPENSATION_ACCRUAL_TYPES = frozenset(
+    {
+        "брак по вине ozon на складе",
+        "потеря по вине ozon в логистике",
+    }
+)
+
+
+def is_compensation_accrual_type(value: str) -> bool:
+    """Return whether an unallocated Ozon accrual is taxable compensation."""
+    key = " ".join(str(value).replace("\r", " ").replace("\n", " ").split())
+    key = key.casefold().replace("ё", "е")
+    return key in _COMPENSATION_ACCRUAL_TYPES or key.startswith("компенсац")
+
+
 @dataclass(slots=True)
 class Product:
     article: str
@@ -194,16 +209,43 @@ class RunCalculation:
     realization_revenue: float = 0.0
     realization_units: float = 0.0
     source_period_warnings: list[str] = field(default_factory=list)
+    compensation_tax_override: float | None = None
+
+    @property
+    def unallocated_compensation_income(self) -> float:
+        """Compensation income kept outside product revenue and product profit."""
+        return sum(
+            amount
+            for accrual_type, (_, amount) in self.unallocated.items()
+            if is_compensation_accrual_type(accrual_type)
+        )
+
+    @property
+    def compensation_tax(self) -> float:
+        if self.compensation_tax_override is not None:
+            return self.compensation_tax_override
+        return self.unallocated_compensation_income * self.tax_rate
+
+    @property
+    def report_net_profit(self) -> float:
+        product_net_profit = sum(item.net_profit(self.tax_rate) for item in self.products)
+        return product_net_profit + self.unallocated_total - self.compensation_tax
 
     def totals(self) -> dict[str, float]:
+        product_taxable_income = sum(item.taxable_income for item in self.products)
+        product_tax = sum(item.tax(self.tax_rate) for item in self.products)
         return {
             "units": sum(item.units for item in self.products),
             "revenue": sum(item.revenue_including_points for item in self.products),
             "financial_result": sum(item.financial_result for item in self.products),
             "cost_sold": sum(item.cost_sold for item in self.products),
-            "tax": sum(item.tax(self.tax_rate) for item in self.products),
+            "taxable_income": product_taxable_income + self.unallocated_compensation_income,
+            "product_tax": product_tax,
+            "compensation_tax": self.compensation_tax,
+            "tax": product_tax + self.compensation_tax,
             "net_profit": sum(item.net_profit(self.tax_rate) for item in self.products),
             "unallocated": self.unallocated_total,
+            "report_net_profit": self.report_net_profit,
         }
 
     def revenue_shares(self) -> dict[str, float]:
@@ -221,10 +263,7 @@ class RunCalculation:
                 item.logistics + item.reverse_logistics for item in self.products
             ) / revenue,
             "points_share": sum(item.points for item in self.products) / revenue,
-            "net_margin": (
-                sum(item.net_profit(self.tax_rate) for item in self.products)
-                + self.unallocated_total
-            ) / revenue,
+            "net_margin": self.report_net_profit / revenue,
         }
 
     def revenue_amounts(self) -> dict[str, float]:
