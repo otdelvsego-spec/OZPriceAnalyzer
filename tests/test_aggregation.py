@@ -92,7 +92,7 @@ class AggregationTests(unittest.TestCase):
                 "commission_share": 0.0,
                 "logistics_share": 0.0,
                 "points_share": 0.0,
-                "net_margin": 326 / 1400,
+                "net_margin": 301 / 1400,
             },
         )
 

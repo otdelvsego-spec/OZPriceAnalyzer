@@ -10,7 +10,7 @@ from ozon_app.overview_column_settings import (
     serialize_column_preferences,
     visible_column_ids,
 )
-from ozon_app.ui import OVERVIEW_COLUMN_SPECS
+from ozon_app.ui import OVERVIEW_COLUMN_SPECS, SCENARIO_COLUMN_SPECS
 
 
 class OverviewColumnSettingsTests(unittest.TestCase):
@@ -61,6 +61,25 @@ class OverviewColumnSettingsTests(unittest.TestCase):
         ]
 
         self.assertEqual(normalize_column_preferences(raw), default_column_preferences())
+
+    def test_scenario_preferences_have_independent_order_and_visibility(self) -> None:
+        preferences = default_column_preferences(SCENARIO_COLUMN_SPECS)
+        moved = preferences.pop(-1)
+        preferences.insert(0, moved)
+        preferences[1] = ColumnPreference(preferences[1].column_id, False)
+
+        restored = normalize_column_preferences(
+            serialize_column_preferences(preferences, SCENARIO_COLUMN_SPECS),
+            SCENARIO_COLUMN_SPECS,
+        )
+
+        self.assertEqual(restored, preferences)
+        self.assertEqual(restored[0].column_id, "net_total")
+        self.assertEqual(len(restored), len(SCENARIO_COLUMN_SPECS))
+        self.assertNotEqual(
+            [item.column_id for item in restored],
+            [item.column_id for item in default_column_preferences()],
+        )
 
 
 if __name__ == "__main__":

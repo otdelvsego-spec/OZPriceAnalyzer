@@ -28,8 +28,8 @@ class RevenueShareMetricTests(unittest.TestCase):
             period_end=None,
             tax_rate=0.04,
             products=[product],
-            unallocated_total=0,
-            unallocated={},
+            unallocated_total=-50,
+            unallocated={"Общие расходы": (1, -50)},
             accrual_stats={},
         )
 
@@ -43,7 +43,7 @@ class RevenueShareMetricTests(unittest.TestCase):
                 "commission_share": 0.2,
                 "logistics_share": 0.1,
                 "points_share": 0.1,
-                "net_margin": 0.364,
+                "net_margin": 0.314,
             },
         )
         self.assertEqual(
@@ -58,6 +58,30 @@ class RevenueShareMetricTests(unittest.TestCase):
         self.assertEqual(product.logistics_share(), 0.0)
         self.assertEqual(product.points_share(), 0.0)
         self.assertEqual(product.net_margin(0.04), 0.0)
+
+    def test_report_net_margin_includes_unallocated_income_and_expenses(self) -> None:
+        product = ProductResult(
+            "A",
+            "Товар",
+            100,
+            0,
+            units=1,
+            revenue_no_points=500,
+            financial_result=300,
+        )
+        calculation = RunCalculation(
+            run_id=1,
+            period_start=None,
+            period_end=None,
+            tax_rate=0.04,
+            products=[product],
+            unallocated_total=-80,
+            unallocated={"Общие расходы": (1, -80)},
+            accrual_stats={},
+        )
+
+        self.assertAlmostEqual(product.net_margin(0.04), 0.36)
+        self.assertAlmostEqual(calculation.revenue_shares()["net_margin"], 0.20)
 
 
 if __name__ == "__main__":

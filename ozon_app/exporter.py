@@ -96,7 +96,7 @@ def _fill_report_sheet(ws, calculation: RunCalculation, planned_prices: dict[str
     ws["AH7"] = "=IFERROR(-V7/R7,0)"
     ws["AI7"] = "=IFERROR(-(Y7+Z7)/R7,0)"
     ws["AJ7"] = "=IFERROR(U7/R7,0)"
-    ws["AK7"] = "=IFERROR(L7/R7,0)"
+    ws["AK7"] = "=IFERROR((L7+$H$4)/R7,0)"
     ws["AL7"] = "=IFERROR(R7/Q7,\"\")"
     ws["AM7"] = "=IF(OR(AL7=\"\",AN7=\"\"),\"\",IFERROR(AN7/AL7-1,0))"
     ws["AN7"] = "=IFERROR(AQ7/Q7,\"\")"

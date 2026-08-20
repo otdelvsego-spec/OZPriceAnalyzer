@@ -14,7 +14,7 @@ def report_total_value(calculation) -> float:
 
 
 class ReportTotalsOZPriceAnalyzerApp(OverviewColumnSettingsOZPriceAnalyzerApp):
-    """v0.5.17: report totals, revenue shares and configurable Overview columns."""
+    """Report totals, revenue shares and configurable report-table columns."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)

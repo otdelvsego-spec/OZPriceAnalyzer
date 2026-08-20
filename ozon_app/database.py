@@ -664,7 +664,7 @@ class Database:
                             ELSE COALESCE(p.points, 0) / r.revenue
                        END AS points_share,
                        CASE WHEN r.revenue = 0 THEN 0
-                            ELSE r.net_profit / r.revenue
+                            ELSE (r.net_profit + r.unallocated_total) / r.revenue
                        END AS net_margin
                 FROM runs AS r
                 LEFT JOIN (

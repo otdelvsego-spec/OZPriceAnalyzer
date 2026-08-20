@@ -108,6 +108,29 @@ OVERVIEW_COLUMN_SPECS = (
     ("net_margin", "Чистая прибыль, % от выручки", 215),
 )
 
+SCENARIO_COLUMN_SPECS = (
+    ("article", "Артикул", 120),
+    ("name", "Наименование", 230),
+    ("category", "Категория", 190),
+    ("cost", "Себестоимость", 135),
+    ("units", "Продажи", 135),
+    ("current_price", "Текущая цена", 135),
+    ("planned_price", "Плановая цена", 135),
+    ("change", "Изменение", 135),
+    ("profitability", "Доходность", 135),
+    ("other_costs", "Затраты Ozon без комиссии", 135),
+    ("planned_revenue", "Плановая выручка", 135),
+    ("commission_rate", "Средняя комиссия", 135),
+    ("commission", "Плановая комиссия", 135),
+    ("points", "Плановые баллы", 135),
+    ("taxable", "Налоговая база", 135),
+    ("tax", "Налог", 135),
+    ("profit", "Прибыль от продаж", 135),
+    ("profit_unit", "Прибыль/ед. до с/с", 135),
+    ("net_unit", "Чистая прибыль/ед.", 135),
+    ("net_total", "Чистая прибыль всего", 135),
+)
+
 
 class OZPriceAnalyzerApp(tk.Tk):
     def __init__(self, service: AppService | None = None):
@@ -517,10 +540,10 @@ class OZPriceAnalyzerApp(tk.Tk):
 
         self.scenario_tree = self._create_tree(
             self.scenario_tab,
-            ["article", "name", "category", "cost", "units", "current_price", "planned_price", "change", "profitability", "other_costs", "planned_revenue", "commission_rate", "commission", "points", "taxable", "tax", "profit", "profit_unit", "net_unit", "net_total"],
-            ["Артикул", "Наименование", "Категория", "Себестоимость", "Продажи", "Текущая цена", "Плановая цена", "Изменение", "Доходность", "Затраты Ozon без комиссии", "Плановая выручка", "Средняя комиссия", "Плановая комиссия", "Плановые баллы", "Налоговая база", "Налог", "Прибыль от продаж", "Прибыль/ед. до с/с", "Чистая прибыль/ед.", "Чистая прибыль всего"],
+            [column_id for column_id, _heading, _width in SCENARIO_COLUMN_SPECS],
+            [heading for _column_id, heading, _width in SCENARIO_COLUMN_SPECS],
             row=4,
-            widths=[120, 230, 190] + [135] * 17,
+            widths=[width for _column_id, _heading, width in SCENARIO_COLUMN_SPECS],
         )
         self.scenario_tree.bind("<<TreeviewSelect>>", self._on_scenario_selected)
 

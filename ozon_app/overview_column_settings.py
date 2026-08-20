@@ -6,10 +6,13 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from .overview_export import OverviewExportOZPriceAnalyzerApp
-from .ui import OVERVIEW_COLUMN_SPECS
+from .ui import OVERVIEW_COLUMN_SPECS, SCENARIO_COLUMN_SPECS
 
 
 OVERVIEW_COLUMNS_SETTING = "overview_columns_v1"
+SCENARIO_COLUMNS_SETTING = "scenario_columns_v1"
+
+ColumnSpecs = tuple[tuple[str, str, int], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,11 +21,16 @@ class ColumnPreference:
     visible: bool = True
 
 
-def default_column_preferences() -> list[ColumnPreference]:
-    return [ColumnPreference(column_id) for column_id, _heading, _width in OVERVIEW_COLUMN_SPECS]
+def default_column_preferences(
+    column_specs: ColumnSpecs = OVERVIEW_COLUMN_SPECS,
+) -> list[ColumnPreference]:
+    return [ColumnPreference(column_id) for column_id, _heading, _width in column_specs]
 
 
-def normalize_column_preferences(value: object) -> list[ColumnPreference]:
+def normalize_column_preferences(
+    value: object,
+    column_specs: ColumnSpecs = OVERVIEW_COLUMN_SPECS,
+) -> list[ColumnPreference]:
     """Return a complete, valid order while preserving saved visibility choices."""
     if isinstance(value, str):
         try:
@@ -32,7 +40,7 @@ def normalize_column_preferences(value: object) -> list[ColumnPreference]:
     if isinstance(value, dict):
         value = value.get("columns")
 
-    available = [column_id for column_id, _heading, _width in OVERVIEW_COLUMN_SPECS]
+    available = [column_id for column_id, _heading, _width in column_specs]
     available_set = set(available)
     result: list[ColumnPreference] = []
     seen: set[str] = set()
@@ -56,13 +64,17 @@ def normalize_column_preferences(value: object) -> list[ColumnPreference]:
             result.append(ColumnPreference(column_id, True))
 
     if not any(item.visible for item in result):
-        return default_column_preferences()
+        return default_column_preferences(column_specs)
     return result
 
 
-def serialize_column_preferences(preferences: list[ColumnPreference]) -> str:
+def serialize_column_preferences(
+    preferences: list[ColumnPreference],
+    column_specs: ColumnSpecs = OVERVIEW_COLUMN_SPECS,
+) -> str:
     normalized = normalize_column_preferences(
-        [{"id": item.column_id, "visible": item.visible} for item in preferences]
+        [{"id": item.column_id, "visible": item.visible} for item in preferences],
+        column_specs,
     )
     return json.dumps(
         {
@@ -87,21 +99,25 @@ class OverviewColumnDialog(tk.Toplevel):
         owner: tk.Misc,
         preferences: list[ColumnPreference],
         headings: dict[str, str],
+        *,
+        column_specs: ColumnSpecs = OVERVIEW_COLUMN_SPECS,
+        section_title: str = "Обзор",
     ) -> None:
         super().__init__(owner)
-        self.title("Настройка столбцов — Обзор")
+        self.title(f"Настройка столбцов — {section_title}")
         self.geometry("720x720")
         self.minsize(600, 520)
         self.transient(owner)
         self.confirmed = False
         self.preferences = list(normalize_column_preferences(
-            [{"id": item.column_id, "visible": item.visible} for item in preferences]
+            [{"id": item.column_id, "visible": item.visible} for item in preferences],
+            column_specs,
         ))
         self.headings = headings
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(2, weight=1)
-        ttk.Label(self, text="Столбцы таблицы «Обзор»", style="Section.TLabel").grid(
+        ttk.Label(self, text=f"Столбцы таблицы «{section_title}»", style="Section.TLabel").grid(
             row=0, column=0, sticky="w", padx=20, pady=(18, 3)
         )
         ttk.Label(
@@ -258,15 +274,21 @@ class OverviewColumnDialog(tk.Toplevel):
 
 
 class OverviewColumnSettingsOZPriceAnalyzerApp(OverviewExportOZPriceAnalyzerApp):
-    """Configurable visibility and order for the Overview report table."""
+    """Configurable visibility and order for Overview and price-scenario tables."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.overview_column_preferences = normalize_column_preferences(
             self.db.get_setting(OVERVIEW_COLUMNS_SETTING, "")
         )
+        self.scenario_column_preferences = normalize_column_preferences(
+            self.db.get_setting(SCENARIO_COLUMNS_SETTING, ""),
+            SCENARIO_COLUMN_SPECS,
+        )
         self._apply_overview_column_preferences()
+        self._apply_scenario_column_preferences()
         self._install_overview_column_settings_button()
+        self._install_scenario_column_settings_button()
 
     def _overview_header(self):
         for child in self.overview_tab.winfo_children():
@@ -289,6 +311,34 @@ class OverviewColumnSettingsOZPriceAnalyzerApp(OverviewExportOZPriceAnalyzerApp)
             command=self.open_overview_column_settings,
         )
         self.overview_columns_button.grid(row=0, column=5, padx=(8, 0))
+
+    def _scenario_filters(self):
+        for child in self.scenario_tab.winfo_children():
+            if child.winfo_manager() != "grid":
+                continue
+            try:
+                if int(child.grid_info().get("row", -1)) == 3:
+                    return child
+            except (TypeError, ValueError, tk.TclError):
+                continue
+        return None
+
+    def _install_scenario_column_settings_button(self) -> None:
+        filters = self._scenario_filters()
+        if filters is None:
+            return
+        self.scenario_columns_button = ttk.Button(
+            filters,
+            text="Настроить столбцы…",
+            command=self.open_scenario_column_settings,
+        )
+        self.scenario_columns_button.grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(8, 0),
+        )
 
     def open_overview_column_settings(self) -> None:
         headings = {
@@ -313,13 +363,63 @@ class OverviewColumnSettingsOZPriceAnalyzerApp(OverviewExportOZPriceAnalyzerApp)
         self._apply_overview_column_preferences()
         self.status_var.set("Настройка столбцов обзора сохранена")
 
+    def open_scenario_column_settings(self) -> None:
+        headings = {
+            column_id: str(self.scenario_tree.heading(column_id).get("text", "") or column_id)
+            for column_id, _heading, _width in SCENARIO_COLUMN_SPECS
+        }
+        dialog = OverviewColumnDialog(
+            self,
+            self.scenario_column_preferences,
+            headings,
+            column_specs=SCENARIO_COLUMN_SPECS,
+            section_title="Сценарий цены",
+        )
+        self.wait_window(dialog)
+        if not dialog.confirmed:
+            return
+        try:
+            payload = serialize_column_preferences(
+                dialog.preferences,
+                SCENARIO_COLUMN_SPECS,
+            )
+            self.db.set_setting(SCENARIO_COLUMNS_SETTING, payload)
+        except Exception as exc:
+            messagebox.showerror("Настройка столбцов", str(exc), parent=self)
+            return
+        self.scenario_column_preferences = normalize_column_preferences(
+            payload,
+            SCENARIO_COLUMN_SPECS,
+        )
+        self._apply_scenario_column_preferences()
+        self.status_var.set("Настройка столбцов сценария цены сохранена")
+
     def _apply_overview_column_preferences(self) -> None:
-        visible = visible_column_ids(self.overview_column_preferences)
-        self.overview_tree.configure(displaycolumns=visible)
+        self._apply_column_preferences(
+            self.overview_tree,
+            self.overview_column_preferences,
+            "overview",
+        )
+
+    def _apply_scenario_column_preferences(self) -> None:
+        self._apply_column_preferences(
+            self.scenario_tree,
+            self.scenario_column_preferences,
+            "scenario",
+        )
+
+    def _apply_column_preferences(
+        self,
+        tree: ttk.Treeview,
+        preferences: list[ColumnPreference],
+        table_key: str,
+    ) -> None:
+        visible = visible_column_ids(preferences)
+        tree.configure(displaycolumns=visible)
         tooltips = getattr(self, "_heading_tooltips", None)
         if tooltips is not None:
-            self.after_idle(lambda: tooltips.fit_tree(self.overview_tree))
-        controller = getattr(self, "_table_modes", {}).get("overview")
+            self.after_idle(lambda: tooltips.fit_tree(tree))
+        controller = getattr(self, "_table_modes", {}).get(table_key)
         detached = getattr(controller, "_detached", None)
         if detached is not None:
             try:

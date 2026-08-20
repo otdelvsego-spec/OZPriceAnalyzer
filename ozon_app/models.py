@@ -221,7 +221,10 @@ class RunCalculation:
                 item.logistics + item.reverse_logistics for item in self.products
             ) / revenue,
             "points_share": sum(item.points for item in self.products) / revenue,
-            "net_margin": sum(item.net_profit(self.tax_rate) for item in self.products) / revenue,
+            "net_margin": (
+                sum(item.net_profit(self.tax_rate) for item in self.products)
+                + self.unallocated_total
+            ) / revenue,
         }
 
 
