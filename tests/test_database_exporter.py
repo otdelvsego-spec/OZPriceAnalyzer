@@ -13,6 +13,37 @@ from ozon_app.report_totals import report_total_value
 
 
 class DatabaseExporterTests(unittest.TestCase):
+    def test_existing_history_backfills_positive_unallocated_income_tax_base(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy.sqlite3"
+            database = Database(path)
+            run_id = database.save_run(
+                RunCalculation(
+                    run_id=None,
+                    period_start=None,
+                    period_end=None,
+                    tax_rate=0.04,
+                    products=[],
+                    unallocated_total=80,
+                    unallocated={
+                        "Премия Ozon": (1, 100),
+                        "Подписка": (1, -20),
+                    },
+                    accrual_stats={},
+                ),
+                {},
+            )
+            with database.transaction() as connection:
+                connection.execute(
+                    "ALTER TABLE runs DROP COLUMN taxable_unallocated_income"
+                )
+
+            migrated = Database(path).load_calculation(run_id)
+
+            self.assertEqual(migrated.taxable_unallocated_income, 100)
+            self.assertEqual(migrated.unallocated_income_tax, 4)
+            self.assertEqual(migrated.report_net_profit, 76)
+
     def test_history_snapshot_and_excel_breakdown(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -105,7 +136,7 @@ class DatabaseExporterTests(unittest.TestCase):
             finally:
                 workbook.close()
 
-    def test_compensation_tax_is_visible_in_history_and_excel_totals(self) -> None:
+    def test_unallocated_income_tax_is_visible_in_history_and_excel_totals(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             database = Database(root / "app.sqlite3")
@@ -141,8 +172,8 @@ class DatabaseExporterTests(unittest.TestCase):
             run_id = database.save_run(calculation, {str(source_path): source_path})
 
             loaded = database.load_calculation(run_id)
-            self.assertAlmostEqual(loaded.unallocated_compensation_income, 120.78)
-            self.assertAlmostEqual(loaded.compensation_tax, 4.8312)
+            self.assertAlmostEqual(loaded.taxable_unallocated_income, 120.78)
+            self.assertAlmostEqual(loaded.unallocated_income_tax, 4.8312)
             self.assertAlmostEqual(report_total_value(loaded), 295.9488)
             self.assertAlmostEqual(database.list_runs()[0].net_margin, 295.9488 / 500)
 
@@ -158,7 +189,7 @@ class DatabaseExporterTests(unittest.TestCase):
                 self.assertEqual(sheet["P7"].value, "=SUM(P8:P8)+$I$4")
                 breakdown = workbook["Разбивка"]
                 labels = [breakdown.cell(row, 1).value for row in range(1, breakdown.max_row + 1)]
-                tax_row = labels.index("Налог с компенсаций") + 1
+                tax_row = labels.index("Налог с нераспределенных доходов") + 1
                 self.assertAlmostEqual(breakdown.cell(tax_row, 3).value, 4.8312)
             finally:
                 workbook.close()

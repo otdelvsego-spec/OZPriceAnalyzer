@@ -83,8 +83,8 @@ def _fill_report_sheet(ws, calculation: RunCalculation, planned_prices: dict[str
 
     last_row = max(output_last_row, 8)
     ws["H4"] = calculation.unallocated_total
-    ws["I4"] = calculation.unallocated_compensation_income
-    ws["J4"] = calculation.compensation_tax
+    ws["I4"] = calculation.taxable_unallocated_income
+    ws["J4"] = calculation.unallocated_income_tax
     ws["P4"] = calculation.tax_rate
     ws["M4"] = "=L7+H4-J4"
     if calculation.period_start and calculation.period_end:
@@ -213,12 +213,12 @@ def _create_breakdown_sheet(workbook, calculation: RunCalculation) -> None:
     ws.cell(total_row + 2, 3, "='КонсОтчет'!H4")
     ws.cell(total_row + 3, 1, "Отклонение")
     ws.cell(total_row + 3, 3, f"=C{total_row}-C{total_row + 2}")
-    ws.cell(total_row + 5, 1, "Компенсации в налогооблагаемой базе")
-    ws.cell(total_row + 5, 3, calculation.unallocated_compensation_income)
-    ws.cell(total_row + 6, 1, "Налог с компенсаций")
-    ws.cell(total_row + 6, 3, calculation.compensation_tax)
-    ws.cell(total_row + 7, 1, "Нераспределенные после налога с компенсаций")
-    ws.cell(total_row + 7, 3, calculation.unallocated_total - calculation.compensation_tax)
+    ws.cell(total_row + 5, 1, "Нераспределенные доходы в налогооблагаемой базе")
+    ws.cell(total_row + 5, 3, calculation.taxable_unallocated_income)
+    ws.cell(total_row + 6, 1, "Налог с нераспределенных доходов")
+    ws.cell(total_row + 6, 3, calculation.unallocated_income_tax)
+    ws.cell(total_row + 7, 1, "Нераспределенные после налога с доходов")
+    ws.cell(total_row + 7, 3, calculation.unallocated_total - calculation.unallocated_income_tax)
 
     blue = PatternFill("solid", fgColor="D9E1F2")
     green = PatternFill("solid", fgColor="E2EFDA")

@@ -6,21 +6,6 @@ from pathlib import Path
 from typing import Any
 
 
-_COMPENSATION_ACCRUAL_TYPES = frozenset(
-    {
-        "брак по вине ozon на складе",
-        "потеря по вине ozon в логистике",
-    }
-)
-
-
-def is_compensation_accrual_type(value: str) -> bool:
-    """Return whether an unallocated Ozon accrual is taxable compensation."""
-    key = " ".join(str(value).replace("\r", " ").replace("\n", " ").split())
-    key = key.casefold().replace("ё", "е")
-    return key in _COMPENSATION_ACCRUAL_TYPES or key.startswith("компенсац")
-
-
 @dataclass(slots=True)
 class Product:
     article: str
@@ -68,6 +53,16 @@ class RealizationRow:
 
 
 @dataclass(slots=True)
+class AdditionalIncomeRow:
+    source_name: str
+    page_number: int
+    document_number: str
+    income_date: date
+    income_type: str
+    amount: float
+
+
+@dataclass(slots=True)
 class ParsedSource:
     path: Path
     file_hash: str
@@ -76,19 +71,26 @@ class ParsedSource:
     header_row: int
     accrual_rows: list[AccrualRow] = field(default_factory=list)
     realization_rows: list[RealizationRow] = field(default_factory=list)
+    additional_income_rows: list[AdditionalIncomeRow] = field(default_factory=list)
     period_start: date | None = None
     period_end: date | None = None
     duplicate_run_ids: list[int] = field(default_factory=list)
 
     @property
     def row_count(self) -> int:
-        return len(self.accrual_rows) + len(self.realization_rows)
+        return (
+            len(self.accrual_rows)
+            + len(self.realization_rows)
+            + len(self.additional_income_rows)
+        )
 
     @property
     def total_amount(self) -> float:
         if self.accrual_rows:
             return sum(row.amount for row in self.accrual_rows)
-        return sum(row.amount for row in self.realization_rows)
+        if self.realization_rows:
+            return sum(row.amount for row in self.realization_rows)
+        return sum(row.amount for row in self.additional_income_rows)
 
 
 @dataclass(slots=True)
@@ -209,27 +211,23 @@ class RunCalculation:
     realization_revenue: float = 0.0
     realization_units: float = 0.0
     source_period_warnings: list[str] = field(default_factory=list)
-    compensation_tax_override: float | None = None
+    taxable_unallocated_income_override: float | None = None
 
     @property
-    def unallocated_compensation_income(self) -> float:
-        """Compensation income kept outside product revenue and product profit."""
-        return sum(
-            amount
-            for accrual_type, (_, amount) in self.unallocated.items()
-            if is_compensation_accrual_type(accrual_type)
-        )
+    def taxable_unallocated_income(self) -> float:
+        """Positive report-level Ozon income included in the simplified-tax base."""
+        if self.taxable_unallocated_income_override is not None:
+            return self.taxable_unallocated_income_override
+        return sum(max(amount, 0.0) for _, amount in self.unallocated.values())
 
     @property
-    def compensation_tax(self) -> float:
-        if self.compensation_tax_override is not None:
-            return self.compensation_tax_override
-        return self.unallocated_compensation_income * self.tax_rate
+    def unallocated_income_tax(self) -> float:
+        return self.taxable_unallocated_income * self.tax_rate
 
     @property
     def report_net_profit(self) -> float:
         product_net_profit = sum(item.net_profit(self.tax_rate) for item in self.products)
-        return product_net_profit + self.unallocated_total - self.compensation_tax
+        return product_net_profit + self.unallocated_total - self.unallocated_income_tax
 
     def totals(self) -> dict[str, float]:
         product_taxable_income = sum(item.taxable_income for item in self.products)
@@ -239,10 +237,11 @@ class RunCalculation:
             "revenue": sum(item.revenue_including_points for item in self.products),
             "financial_result": sum(item.financial_result for item in self.products),
             "cost_sold": sum(item.cost_sold for item in self.products),
-            "taxable_income": product_taxable_income + self.unallocated_compensation_income,
+            "taxable_income": product_taxable_income + self.taxable_unallocated_income,
+            "taxable_unallocated_income": self.taxable_unallocated_income,
             "product_tax": product_tax,
-            "compensation_tax": self.compensation_tax,
-            "tax": product_tax + self.compensation_tax,
+            "unallocated_income_tax": self.unallocated_income_tax,
+            "tax": product_tax + self.unallocated_income_tax,
             "net_profit": sum(item.net_profit(self.tax_rate) for item in self.products),
             "unallocated": self.unallocated_total,
             "report_net_profit": self.report_net_profit,

@@ -10,7 +10,12 @@ from pathlib import Path
 from .calculator import calculate_run, discover_unknown_products
 from .config import ensure_app_dirs
 from .database import Database
-from .excel_reader import REPORT_ACCRUAL, REPORT_REALIZATION, parse_report
+from .excel_reader import (
+    REPORT_ACCRUAL,
+    REPORT_ADDITIONAL_INCOME,
+    REPORT_REALIZATION,
+    parse_report,
+)
 from .models import ParsedSource, Product, RunCalculation, UnknownProduct
 
 
@@ -27,6 +32,12 @@ class ImportSession:
     @property
     def has_realization(self) -> bool:
         return any(source.report_type == REPORT_REALIZATION for source in self.sources)
+
+    @property
+    def has_additional_income(self) -> bool:
+        return any(
+            source.report_type == REPORT_ADDITIONAL_INCOME for source in self.sources
+        )
 
     @property
     def period_start(self) -> date | None:
@@ -260,7 +271,7 @@ class AppService:
         return runs[-1].id if runs else None
 
     def recalculate_history(self) -> HistoryRecalculationResult:
-        """Rebuild saved runs from stored XLSX while preserving historical inputs."""
+        """Rebuild saved runs from stored source files while preserving historical inputs."""
         runs = self.db.list_runs()
         if not runs:
             return HistoryRecalculationResult(0, 0, 0.0, 0)
@@ -408,10 +419,13 @@ def _month_list(months: set[tuple[int, int]]) -> str:
 
 
 def split_import_sources(sources: list[ParsedSource]) -> list[ImportSession]:
-    """Create one calculation session per accrual file and match realization by month."""
+    """Create one session per accrual file and match supplementary files by month."""
     accrual_sources = [source for source in sources if source.report_type == REPORT_ACCRUAL]
     realization_sources = [
         source for source in sources if source.report_type == REPORT_REALIZATION
+    ]
+    additional_income_sources = [
+        source for source in sources if source.report_type == REPORT_ADDITIONAL_INCOME
     ]
     if not accrual_sources:
         raise ValueError("Для расчета нужен хотя бы один отчет по начислениям")
@@ -457,6 +471,29 @@ def split_import_sources(sources: list[ParsedSource]) -> list[ImportSession]:
             f"Отчет по выкупам «{source.path.name}» ({period}) нельзя распределить "
             f"однозначно: за {month[1]:02d}.{month[0]} выбрано несколько отчетов "
             f"по начислениям: {names}. Импортируйте их раздельно."
+        )
+
+    for source in sorted(additional_income_sources, key=_source_sort_key):
+        month = _source_month(source)
+        matches = accruals_by_month.get(month, []) if month is not None else []
+        if len(matches) == 1:
+            matches[0].sources.append(source)
+            continue
+        period = _source_period(source)
+        if month is None:
+            raise ValueError(
+                f"В акте дополнительного дохода «{source.path.name}» не удалось "
+                f"определить календарный месяц ({period})."
+            )
+        if not matches:
+            raise ValueError(
+                f"Для акта дополнительного дохода «{source.path.name}» ({period}) "
+                f"не найден отчет по начислениям за {month[1]:02d}.{month[0]}."
+            )
+        names = ", ".join(f"«{session.sources[0].path.name}»" for session in matches)
+        raise ValueError(
+            f"Акт дополнительного дохода «{source.path.name}» ({period}) нельзя "
+            f"распределить однозначно: выбрано несколько отчетов за месяц: {names}."
         )
 
     return sessions

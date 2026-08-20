@@ -10,14 +10,7 @@ from typing import Iterator
 from .calculator import distribution_status, guide_target
 from .config import DEFAULT_TAX_RATE
 from .excel_reader import normalize_text
-from .models import (
-    ParsedSource,
-    Product,
-    ProductResult,
-    RunCalculation,
-    RunSummary,
-    is_compensation_accrual_type,
-)
+from .models import ParsedSource, Product, ProductResult, RunCalculation, RunSummary
 from .ordering import default_article_order, insert_at_group_end
 
 
@@ -117,6 +110,7 @@ class Database:
                     tax REAL NOT NULL,
                     net_profit REAL NOT NULL,
                     unallocated_total REAL NOT NULL,
+                    taxable_unallocated_income REAL NOT NULL DEFAULT 0,
                     realization_revenue REAL NOT NULL DEFAULT 0,
                     realization_units REAL NOT NULL DEFAULT 0,
                     duplicate_realization_rows INTEGER NOT NULL DEFAULT 0,
@@ -222,6 +216,21 @@ class Database:
             run_columns = {row[1] for row in db.execute("PRAGMA table_info(runs)")}
             if "report_name" not in run_columns:
                 db.execute("ALTER TABLE runs ADD COLUMN report_name TEXT")
+            if "taxable_unallocated_income" not in run_columns:
+                db.execute(
+                    "ALTER TABLE runs ADD COLUMN "
+                    "taxable_unallocated_income REAL NOT NULL DEFAULT 0"
+                )
+                db.execute(
+                    """
+                    UPDATE runs
+                    SET taxable_unallocated_income = COALESCE((
+                        SELECT SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END)
+                        FROM unallocated
+                        WHERE unallocated.run_id = runs.id
+                    ), 0)
+                    """
+                )
 
     def _seed_defaults(self) -> None:
         defaults = {
@@ -511,9 +520,9 @@ class Database:
                 INSERT INTO runs(
                     period_start, period_end, tax_rate, source_count, units, revenue,
                     financial_result, cost_sold, tax, net_profit, unallocated_total,
-                    realization_revenue, realization_units, duplicate_realization_rows,
-                    already_accrued_realization_rows, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Готов')
+                    taxable_unallocated_income, realization_revenue, realization_units,
+                    duplicate_realization_rows, already_accrued_realization_rows, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Готов')
                 """,
                 (
                     _date_text(calculation.period_start),
@@ -527,6 +536,7 @@ class Database:
                     totals["tax"],
                     totals["net_profit"],
                     calculation.unallocated_total,
+                    calculation.taxable_unallocated_income,
                     calculation.realization_revenue,
                     calculation.realization_units,
                     calculation.duplicate_realization_rows,
@@ -660,7 +670,7 @@ class Database:
                 """
                 SELECT r.id, r.created_at, r.period_start, r.period_end, r.source_count,
                        r.units, r.revenue, r.net_profit, r.unallocated_total, r.status,
-                       r.report_name, r.tax_rate,
+                       r.report_name, r.tax_rate, r.taxable_unallocated_income,
                        CASE WHEN r.cost_sold = 0 THEN 0
                             ELSE r.net_profit / r.cost_sold
                        END AS profitability,
@@ -688,27 +698,20 @@ class Database:
                     r.id ASC
                 """
             ).fetchall()
-            unallocated_rows = db.execute(
-                "SELECT run_id, accrual_type, amount FROM unallocated"
-            ).fetchall()
-        compensation_by_run: dict[int, float] = {}
-        for row in unallocated_rows:
-            if is_compensation_accrual_type(str(row["accrual_type"])):
-                run_id = int(row["run_id"])
-                compensation_by_run[run_id] = (
-                    compensation_by_run.get(run_id, 0.0) + float(row["amount"])
-                )
         summaries: list[RunSummary] = []
         for row in rows:
             values = dict(row)
             tax_rate = float(values.pop("tax_rate"))
+            taxable_unallocated_income = float(
+                values.pop("taxable_unallocated_income")
+            )
             revenue = float(values["revenue"])
-            compensation_tax = compensation_by_run.get(int(values["id"]), 0.0) * tax_rate
+            unallocated_income_tax = taxable_unallocated_income * tax_rate
             values["net_margin"] = (
                 (
                     float(values["net_profit"])
                     + float(values["unallocated_total"])
-                    - compensation_tax
+                    - unallocated_income_tax
                 )
                 / revenue
                 if revenue
@@ -828,6 +831,9 @@ class Database:
             realization_revenue=float(run["realization_revenue"]),
             realization_units=float(run["realization_units"]),
             source_period_warnings=source_period_warnings,
+            taxable_unallocated_income_override=float(
+                run["taxable_unallocated_income"]
+            ),
         )
 
     def list_source_files(self, run_id: int) -> list[dict[str, object]]:

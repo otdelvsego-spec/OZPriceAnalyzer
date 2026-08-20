@@ -25,7 +25,13 @@ from .costs import (
 )
 from .config import APP_TITLE, APP_VERSION, save_storage_location
 from .database import Database
-from .excel_reader import REPORT_REALIZATION, preview_sheet, workbook_sheet_names
+from .excel_reader import (
+    REPORT_ADDITIONAL_INCOME,
+    REPORT_REALIZATION,
+    preview_pdf,
+    preview_sheet,
+    workbook_sheet_names,
+)
 from .exporter import export_calculation, export_run, suggested_export_name
 from .models import Product, ProductResult, RunCalculation, RunSummary, ScenarioRow, UnknownProduct
 from .ordering import insert_at_group_end
@@ -1153,7 +1159,11 @@ class OZPriceAnalyzerApp(tk.Tk):
         for row in sources:
             iid = str(row["id"])
             self.source_by_iid[iid] = row
-            report_type = "Начисления" if row["report_type"] == "ACCRUAL" else "Выкупленные товары"
+            report_type = {
+                "ACCRUAL": "Начисления",
+                "REALIZATION": "Выкупленные товары",
+                REPORT_ADDITIONAL_INCOME: "Дополнительный доход",
+            }.get(str(row["report_type"]), str(row["report_type"]))
             period = _period_text(row.get("period_start"), row.get("period_end"))
             self.source_tree.insert(
                 "",
@@ -1177,6 +1187,17 @@ class OZPriceAnalyzerApp(tk.Tk):
         try:
             self.preview_path = str(source["stored_path"])
             self.preview_file_var.set(f"Файл: {source['original_name']}")
+            if str(source["report_type"]) == REPORT_ADDITIONAL_INCOME:
+                self.sheet_combo["values"] = ("PDF",)
+                self.sheet_var.set("PDF")
+                max_rows = int(self.db.get_setting("preview_rows", "500"))
+                self.preview_headers, self.preview_rows = preview_pdf(
+                    self.preview_path,
+                    max_rows=max_rows,
+                )
+                self._filter_preview()
+                self.clear_preview_button.configure(state="normal")
+                return
             sheets = workbook_sheet_names(self.preview_path)
             self.sheet_combo["values"] = sheets
             preferred = str(source["sheet_name"])
@@ -1278,14 +1299,14 @@ class OZPriceAnalyzerApp(tk.Tk):
             tag = "negative" if amount < 0 else "positive"
             self.breakdown_tree.insert("", "end", values=(accrual_type, count, _money(amount), _percent(share)), tags=(tag,))
         self.breakdown_tree.insert("", "end", values=("Итого", sum(x[0] for x in calculation.unallocated.values()), _money(total), _percent(1 if total else 0)), tags=("total",))
-        if calculation.unallocated_compensation_income:
+        if calculation.taxable_unallocated_income:
             self.breakdown_tree.insert(
                 "",
                 "end",
                 values=(
-                    "Налог с компенсаций",
+                    "Налог с нераспределенных доходов",
                     "—",
-                    _money(-calculation.compensation_tax),
+                    _money(-calculation.unallocated_income_tax),
                     "—",
                 ),
                 tags=("negative",),
@@ -1294,9 +1315,9 @@ class OZPriceAnalyzerApp(tk.Tk):
                 "",
                 "end",
                 values=(
-                    "Итого после налога с компенсаций",
+                    "Итого после налога с доходов",
                     "—",
-                    _money(total - calculation.compensation_tax),
+                    _money(total - calculation.unallocated_income_tax),
                     "—",
                 ),
                 tags=("total",),
@@ -1947,7 +1968,7 @@ class OZPriceAnalyzerApp(tk.Tk):
         confirmed = messagebox.askyesno(
             "Пересчитать историю",
             f"Будут заново рассчитаны все сохраненные отчеты: {len(runs)}.\n\n"
-            "Используются сохраненные копии исходных XLSX. Начисления известных "
+            "Используются сохраненные копии исходных XLSX и PDF. Начисления известных "
             "артикулов будут учтены даже для архивных товаров и товаров без продаж. "
             "Количество продаж будет заново определено по группам «Продажи» и «Возвраты».\n\n"
             "Наименования отчетов, историческая себестоимость и плановые цены сохранятся. "
@@ -2273,7 +2294,11 @@ class OZPriceAnalyzerApp(tk.Tk):
             return
         paths = filedialog.askopenfilenames(
             title="Выберите отчеты Ozon",
-            filetypes=[("Отчеты Excel", "*.xlsx")],
+            filetypes=[
+                ("Отчеты Ozon", "*.xlsx *.pdf"),
+                ("Отчеты Excel", "*.xlsx"),
+                ("Акты Ozon PDF", "*.pdf"),
+            ],
             parent=self,
         )
         if not paths:

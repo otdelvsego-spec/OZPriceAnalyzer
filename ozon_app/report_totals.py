@@ -8,7 +8,7 @@ from .ui import _money, _percent
 
 
 def report_total_value(calculation) -> float:
-    """Return report profit after tax on unallocated compensation income."""
+    """Return report profit after tax on positive unallocated Ozon income."""
     return float(calculation.report_net_profit)
 
 

@@ -5,7 +5,7 @@ from dataclasses import replace
 from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 
-from .excel_reader import all_rows, normalize_text
+from .excel_reader import all_additional_income_rows, all_rows, normalize_text
 from .models import AccrualRow, ParsedSource, Product, ProductResult, RunCalculation, ScenarioRow, UnknownProduct
 
 
@@ -156,6 +156,7 @@ def calculate_run(
 ) -> RunCalculation:
     skipped_articles = skipped_articles or set()
     accrual_rows, realization_rows = all_rows(sources)
+    additional_income_rows = all_additional_income_rows(sources)
     referenced_articles = {
         row.article for row in accrual_rows if row.article
     } | {
@@ -189,6 +190,7 @@ def calculate_run(
     returns_by_article: dict[str, float] = defaultdict(float)
     accrual_revenue_keys: set[tuple[str, str]] = set()
     unallocated_total = 0.0
+    taxable_unallocated_income = 0.0
     allocated_accrual_total = 0.0
     skipped_accrual_total = 0.0
 
@@ -239,9 +241,22 @@ def calculate_run(
                 returns_by_article[row.article] += abs(row.quantity)
         else:
             unallocated_total += row.amount
+            if row.amount > 0:
+                taxable_unallocated_income += row.amount
             item = breakdown.setdefault(type_key or "без типа начисления", [row.accrual_type or "Без типа начисления", 0, 0.0])
             item[1] = int(item[1]) + 1
             item[2] = float(item[2]) + row.amount
+
+    for row in additional_income_rows:
+        type_key = _type_key(row.income_type)
+        stat = current_stats.setdefault(type_key, [row.income_type, 0, 0])
+        stat[2] = int(stat[2]) + 1
+        unallocated_total += row.amount
+        if row.amount > 0:
+            taxable_unallocated_income += row.amount
+        item = breakdown.setdefault(type_key, [row.income_type, 0, 0.0])
+        item[1] = int(item[1]) + 1
+        item[2] = float(item[2]) + row.amount
 
     for (_, article, seller_price), (amount, source_quantity) in sales_orders.items():
         if article not in results:
@@ -303,7 +318,9 @@ def calculate_run(
         realization_revenue += row.amount
         realization_units += row.quantity
 
-    source_accrual_total = sum(row.amount for row in accrual_rows)
+    source_accrual_total = sum(row.amount for row in accrual_rows) + sum(
+        row.amount for row in additional_income_rows
+    )
     allocation_difference = (
         source_accrual_total
         - allocated_accrual_total
@@ -351,6 +368,7 @@ def calculate_run(
         already_accrued_realization_rows=already_accrued_rows,
         realization_revenue=realization_revenue,
         realization_units=realization_units,
+        taxable_unallocated_income_override=taxable_unallocated_income,
     )
 
 

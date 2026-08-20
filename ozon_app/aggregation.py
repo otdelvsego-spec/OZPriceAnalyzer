@@ -130,5 +130,7 @@ def aggregate_calculations(calculations: list[RunCalculation]) -> RunCalculation
             for calculation in ordered
             for warning in calculation.source_period_warnings
         ],
-        compensation_tax_override=sum(item.compensation_tax for item in ordered),
+        taxable_unallocated_income_override=sum(
+            item.taxable_unallocated_income for item in ordered
+        ),
     )

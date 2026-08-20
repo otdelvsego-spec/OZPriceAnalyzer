@@ -10,11 +10,12 @@ from typing import Iterable
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
-from .models import AccrualRow, ParsedSource, RealizationRow
+from .models import AdditionalIncomeRow, AccrualRow, ParsedSource, RealizationRow
 
 
 REPORT_ACCRUAL = "ACCRUAL"
 REPORT_REALIZATION = "REALIZATION"
+REPORT_ADDITIONAL_INCOME = "ADDITIONAL_INCOME"
 
 
 class ReportFormatError(ValueError):
@@ -158,8 +159,12 @@ def _detect_sheet(workbook) -> tuple[str, object, int]:
 
 def parse_report(path: str | Path) -> ParsedSource:
     source_path = Path(path).expanduser().resolve()
+    if source_path.suffix.casefold() == ".pdf":
+        return _parse_additional_income_pdf(source_path)
     if source_path.suffix.casefold() != ".xlsx":
-        raise ReportFormatError(f"Поддерживаются только файлы XLSX: {source_path.name}")
+        raise ReportFormatError(
+            f"Поддерживаются отчеты XLSX и акты дополнительного дохода PDF: {source_path.name}"
+        )
     try:
         # Ozon exports often omit worksheet dimensions. Normal mode is both
         # reliable and much faster here than random cell access in read-only mode.
@@ -182,6 +187,72 @@ def parse_report(path: str | Path) -> ParsedSource:
         return parsed
     finally:
         workbook.close()
+
+
+def _parse_additional_income_pdf(source_path: Path) -> ParsedSource:
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(source_path)
+        page_texts = [page.extract_text() or "" for page in reader.pages]
+    except Exception as exc:
+        raise ReportFormatError(f"Не удалось прочитать {source_path.name}: {exc}") from exc
+
+    text = "\n".join(page_texts)
+    normalized = normalize_text(text).replace("ё", "е")
+    if "ozon" not in normalized or not re.search(r"акт о (?:премии|компенсации)", normalized):
+        raise ReportFormatError(
+            f"PDF не является актом Ozon о премии или компенсации: {source_path.name}"
+        )
+
+    document = re.search(
+        r"акт\s+о\s+(премии|компенсации)(.*?)#\s*([\w-]+)\s+от\s+(\d{2}\.\d{2}\.\d{4})",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    amount_match = re.search(
+        r"итого\s+к\s+начислению\s*,?\s*руб\.?\s*([\d\s]+[.,]\d{2})",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if document is None or amount_match is None:
+        raise ReportFormatError(
+            f"В акте {source_path.name} не найдены номер, дата или сумма к начислению"
+        )
+
+    income_date = as_date(document.group(4))
+    amount = as_float(amount_match.group(1))
+    if income_date is None or amount <= 0:
+        raise ReportFormatError(
+            f"В акте {source_path.name} указана некорректная дата или сумма"
+        )
+
+    kind = normalize_text(document.group(1)).replace("ё", "е")
+    details = " ".join(document.group(2).split()).strip(" -—")
+    if kind == "премии":
+        income_type = "Премия" + (f" {details}" if details else " Ozon")
+    else:
+        income_type = "Компенсация" + (f" {details}" if details else " Ozon")
+    parsed = ParsedSource(
+        path=source_path,
+        file_hash=sha256_file(source_path),
+        report_type=REPORT_ADDITIONAL_INCOME,
+        sheet_name="PDF",
+        header_row=0,
+        period_start=income_date,
+        period_end=income_date,
+    )
+    parsed.additional_income_rows.append(
+        AdditionalIncomeRow(
+            source_name=source_path.name,
+            page_number=1,
+            document_number=display_text(document.group(3)),
+            income_date=income_date,
+            income_type=income_type,
+            amount=amount,
+        )
+    )
+    return parsed
 
 
 def _parse_accrual(ws, header_row: int, parsed: ParsedSource) -> None:
@@ -363,6 +434,24 @@ def preview_sheet(
         workbook.close()
 
 
+def preview_pdf(path: str | Path, max_rows: int = 500) -> tuple[list[str], list[list[str]]]:
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(Path(path))
+        rows: list[list[str]] = []
+        for page_number, page in enumerate(reader.pages, start=1):
+            for line in (page.extract_text() or "").splitlines():
+                cleaned = " ".join(line.split())
+                if cleaned:
+                    rows.append([str(page_number), cleaned])
+                    if len(rows) >= max_rows:
+                        return ["Страница", "Текст"], rows
+        return ["Страница", "Текст"], rows
+    except Exception as exc:
+        raise ReportFormatError(f"Не удалось просмотреть PDF: {exc}") from exc
+
+
 def _format_preview_value(value: object) -> str:
     if value is None:
         return ""
@@ -384,3 +473,7 @@ def all_rows(sources: Iterable[ParsedSource]) -> tuple[list[AccrualRow], list[Re
         accrual.extend(source.accrual_rows)
         realization.extend(source.realization_rows)
     return accrual, realization
+
+
+def all_additional_income_rows(sources: Iterable[ParsedSource]) -> list[AdditionalIncomeRow]:
+    return [row for source in sources for row in source.additional_income_rows]

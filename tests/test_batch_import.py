@@ -6,8 +6,16 @@ from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
-from ozon_app.excel_reader import REPORT_ACCRUAL, REPORT_REALIZATION
-from ozon_app.models import AccrualRow, ParsedSource, Product, RealizationRow, RunCalculation
+from ozon_app.calculator import calculate_run
+from ozon_app.excel_reader import REPORT_ACCRUAL, REPORT_ADDITIONAL_INCOME, REPORT_REALIZATION
+from ozon_app.models import (
+    AdditionalIncomeRow,
+    AccrualRow,
+    ParsedSource,
+    Product,
+    RealizationRow,
+    RunCalculation,
+)
 from ozon_app.service import AppService, split_import_sources
 
 
@@ -73,7 +81,51 @@ def _realization_source(
     )
 
 
+def _additional_income_source(path: Path, value_date: date) -> ParsedSource:
+    return ParsedSource(
+        path=path,
+        file_hash=f"income-{value_date:%Y%m%d}",
+        report_type=REPORT_ADDITIONAL_INCOME,
+        sheet_name="PDF",
+        header_row=0,
+        additional_income_rows=[
+            AdditionalIncomeRow(
+                source_name=path.name,
+                page_number=1,
+                document_number="848264",
+                income_date=value_date,
+                income_type="Премия за расчеты баллами",
+                amount=61.40,
+            )
+        ],
+        period_start=value_date,
+        period_end=value_date,
+    )
+
+
 class BatchImportTests(unittest.TestCase):
+    def test_additional_income_pdf_is_matched_to_accrual_month(self) -> None:
+        january = _accrual_source(Path("january.xlsx"), date(2026, 1, 29))
+        premium = _additional_income_source(Path("premium.pdf"), date(2026, 1, 31))
+
+        sessions = split_import_sources([premium, january])
+
+        self.assertEqual(len(sessions), 1)
+        self.assertTrue(sessions[0].has_additional_income)
+        self.assertEqual(
+            [source.path.name for source in sessions[0].sources],
+            ["january.xlsx", "premium.pdf"],
+        )
+        calculation = calculate_run(
+            sessions[0].sources,
+            {"A": Product("A", "Товар")},
+            0.04,
+        )
+        self.assertAlmostEqual(calculation.unallocated_total, 61.40)
+        self.assertAlmostEqual(calculation.taxable_unallocated_income, 61.40)
+        self.assertAlmostEqual(calculation.unallocated_income_tax, 2.456)
+        self.assertAlmostEqual(calculation.report_net_profit, 48.944)
+
     def test_each_accrual_file_becomes_a_separate_chronological_session(self) -> None:
         april = _accrual_source(Path("april.xlsx"), date(2026, 4, 30))
         may = _accrual_source(Path("may.xlsx"), date(2026, 5, 31))

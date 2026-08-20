@@ -100,7 +100,7 @@ class AggregationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "не выбраны"):
             aggregate_calculations([])
 
-    def test_combined_overview_preserves_each_period_compensation_tax(self) -> None:
+    def test_combined_overview_preserves_each_period_unallocated_income_tax(self) -> None:
         april = RunCalculation(
             run_id=1,
             period_start=date(2026, 4, 1),
@@ -124,8 +124,8 @@ class AggregationTests(unittest.TestCase):
 
         combined = aggregate_calculations([april, may])
 
-        self.assertEqual(combined.unallocated_compensation_income, 200)
-        self.assertEqual(combined.compensation_tax, 10)
+        self.assertEqual(combined.taxable_unallocated_income, 200)
+        self.assertEqual(combined.unallocated_income_tax, 10)
         self.assertEqual(combined.totals()["tax"], 20)
 
 

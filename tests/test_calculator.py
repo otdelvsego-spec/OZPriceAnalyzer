@@ -163,6 +163,28 @@ class CalculatorTests(unittest.TestCase):
         self.assertEqual(result.unallocated_total, 12)
         self.assertEqual(result.unallocated["Новый тип Ozon"], (1, 12))
 
+    def test_only_positive_unallocated_rows_enter_tax_base(self) -> None:
+        source = ParsedSource(
+            path=Path("test.xlsx"),
+            file_hash="abc",
+            report_type="ACCRUAL",
+            sheet_name="Начисления",
+            header_row=1,
+            accrual_rows=[
+                accrual(2, "Корректировка Ozon", "", 100),
+                accrual(3, "Корректировка Ozon", "", -30),
+                accrual(4, "Программа Premium", "", -20),
+            ],
+        )
+
+        result = calculate_run([source], {}, 0.04)
+
+        self.assertEqual(result.unallocated_total, 50)
+        self.assertEqual(result.unallocated["Корректировка Ozon"], (2, 70))
+        self.assertEqual(result.taxable_unallocated_income, 100)
+        self.assertEqual(result.unallocated_income_tax, 4)
+        self.assertEqual(result.report_net_profit, 46)
+
     def test_skipped_unknown_article_is_not_moved_to_unallocated(self) -> None:
         source = ParsedSource(
             path=Path("test.xlsx"),
