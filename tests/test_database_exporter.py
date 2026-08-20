@@ -61,6 +61,7 @@ class DatabaseExporterTests(unittest.TestCase):
             self.assertEqual(summary.logistics_share, 0.0)
             self.assertEqual(summary.points_share, 0.0)
             self.assertAlmostEqual(summary.net_margin, 0.26)
+            self.assertAlmostEqual(summary.profitability, 0.9)
 
             database.save_product(
                 Product("A-1", "Товар", material_cost=999, labor_cost=1, category="Новая категория")

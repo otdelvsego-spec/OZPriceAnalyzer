@@ -270,6 +270,7 @@ class RunSummary:
     unallocated_total: float
     status: str
     report_name: str = ""
+    profitability: float = 0.0
     commission_share: float = 0.0
     logistics_share: float = 0.0
     points_share: float = 0.0

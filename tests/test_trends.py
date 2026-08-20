@@ -4,6 +4,7 @@ import unittest
 
 from ozon_app.models import RunSummary
 from ozon_app.trends import build_trend_points, chart_bounds
+from ozon_app.ui import TREND_METRICS, TREND_PERCENT_METRICS, _filter_runs_by_years
 
 
 def summary(
@@ -16,6 +17,7 @@ def summary(
     logistics_share: float = 0,
     points_share: float = 0,
     net_margin: float = 0,
+    profitability: float = 0,
 ) -> RunSummary:
     return RunSummary(
         id=run_id,
@@ -32,6 +34,7 @@ def summary(
         logistics_share=logistics_share,
         points_share=points_share,
         net_margin=net_margin,
+        profitability=profitability,
     )
 
 
@@ -64,6 +67,7 @@ class TrendTests(unittest.TestCase):
                 logistics_share=0.12,
                 points_share=0.08,
                 net_margin=0.19,
+                profitability=0.42,
             )
         ])[0]
 
@@ -71,6 +75,22 @@ class TrendTests(unittest.TestCase):
         self.assertAlmostEqual(point.value("logistics_share"), 0.12)
         self.assertAlmostEqual(point.value("points_share"), 0.08)
         self.assertAlmostEqual(point.value("net_margin"), 0.19)
+        self.assertAlmostEqual(point.value("profitability"), 0.42)
+
+    def test_profitability_uses_existing_metric_selector_and_percentage_scale(self) -> None:
+        self.assertEqual(TREND_METRICS["Доходность"], "profitability")
+        self.assertIn("profitability", TREND_PERCENT_METRICS)
+
+    def test_year_filter_accepts_multiple_history_years(self) -> None:
+        runs = [
+            summary(1, "2024-03-01", 100),
+            summary(2, "2025-03-01", 200),
+            summary(3, "2026-03-01", 300),
+        ]
+
+        filtered = _filter_runs_by_years(runs, {2024, 2026})
+
+        self.assertEqual([run.id for run in filtered], [1, 3])
 
 
 if __name__ == "__main__":

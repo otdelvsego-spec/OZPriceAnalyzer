@@ -40,6 +40,7 @@ THEME_VALUES = {value: key for key, value in THEME_LABELS.items()}
 TREND_METRICS = {
     "Выручка": "revenue",
     "Чистая прибыль": "net_profit",
+    "Доходность": "profitability",
     "Продажи, шт.": "units",
     "Нераспределенные доходы / расходы": "unallocated",
     "Средняя комиссия, % от выручки": "commission_share",
@@ -48,11 +49,14 @@ TREND_METRICS = {
     "Чистая прибыль, % от выручки": "net_margin",
 }
 TREND_PERCENT_METRICS = {
+    "profitability",
     "commission_share",
     "logistics_share",
     "points_share",
     "net_margin",
 }
+TREND_PERIOD_ALL = "Все годы"
+TREND_PERIOD_SELECT = "Выбрать годы…"
 CATEGORY_ALL = "Все категории"
 CATEGORY_EMPTY = "Без категории"
 SORT_NONE = "Без сортировки"
@@ -149,6 +153,10 @@ class OZPriceAnalyzerApp(tk.Tk):
         self.history_number_by_id: dict[int, int] = {}
         self.history_year_filter: set[int] | None = None
         self.history_year_filter_var = tk.StringVar(value="Все годы")
+        self.trend_year_filter: set[int] | None = None
+        self.trend_period_mode = "all"
+        self.trend_period_var = tk.StringVar(value=TREND_PERIOD_ALL)
+        self.trend_has_history = False
         self.source_by_iid: dict[str, dict[str, object]] = {}
         self.preview_headers: list[str] = []
         self.preview_rows: list[list[str]] = []
@@ -623,6 +631,16 @@ class OZPriceAnalyzerApp(tk.Tk):
         )
         trend_combo.grid(row=0, column=1, sticky="w")
         trend_combo.bind("<<ComboboxSelected>>", lambda _event: self._draw_trend_chart())
+        ttk.Label(controls, text="Период:").grid(row=0, column=2, padx=(24, 6))
+        self.trend_period_combo = ttk.Combobox(
+            controls,
+            textvariable=self.trend_period_var,
+            state="readonly",
+            values=(TREND_PERIOD_ALL, _current_year_period_label(), TREND_PERIOD_SELECT),
+            width=24,
+        )
+        self.trend_period_combo.grid(row=0, column=3, sticky="w")
+        self.trend_period_combo.bind("<<ComboboxSelected>>", self._on_trend_period_selected)
 
         self.trend_canvas = tk.Canvas(
             self.trend_tab,
@@ -642,17 +660,17 @@ class OZPriceAnalyzerApp(tk.Tk):
             self.trend_tab,
             [
                 "run", "period", "units", "revenue", "revenue_change", "net",
-                "net_change", "unallocated", "commission_share", "logistics_share",
+                "net_change", "profitability", "unallocated", "commission_share", "logistics_share",
                 "points_share", "net_margin",
             ],
             [
                 "№ отчета", "Период", "Продажи", "Выручка", "Изменение выручки",
-                "Чистая прибыль", "Изменение прибыли", "Нераспределенные",
+                "Чистая прибыль", "Изменение прибыли", "Доходность", "Нераспределенные",
                 "Средняя комиссия, % от выручки", "Логистика, % от выручки",
                 "Баллы, % от выручки", "Чистая прибыль, % от выручки",
             ],
             row=5,
-            widths=[80, 230, 110, 150, 170, 150, 170, 170, 210, 190, 175, 215],
+            widths=[80, 230, 110, 150, 170, 150, 170, 140, 170, 210, 190, 175, 215],
             height=8,
         )
 
@@ -1515,7 +1533,15 @@ class OZPriceAnalyzerApp(tk.Tk):
         self.status_var.set(f"Отчет удален{suffix}")
 
     def refresh_trends(self, runs=None) -> None:
-        self.trend_points = build_trend_points(list(runs) if runs is not None else self.db.list_runs())
+        all_runs = list(runs) if runs is not None else self.db.list_runs()
+        self.trend_has_history = bool(all_runs)
+        selected_years = (
+            {date.today().year}
+            if self.trend_period_mode == "current"
+            else self.trend_year_filter
+        )
+        self.trend_period_var.set(_trend_period_label(self.trend_period_mode, selected_years))
+        self.trend_points = build_trend_points(_filter_runs_by_years(all_runs, selected_years))
         self.trend_tree.delete(*self.trend_tree.get_children())
         previous: TrendPoint | None = None
         for point in self.trend_points:
@@ -1534,6 +1560,7 @@ class OZPriceAnalyzerApp(tk.Tk):
                     _signed_money(revenue_change) if revenue_change is not None else "—",
                     _money(point.net_profit),
                     _signed_money(profit_change) if profit_change is not None else "—",
+                    _percent(point.profitability),
                     _money(point.unallocated),
                     _percent(point.commission_share),
                     _percent(point.logistics_share),
@@ -1545,6 +1572,48 @@ class OZPriceAnalyzerApp(tk.Tk):
             previous = point
         self._configure_value_tags(self.trend_tree)
         self._draw_trend_chart()
+
+    def _on_trend_period_selected(self, _event=None) -> None:
+        selection = self.trend_period_var.get()
+        if selection == TREND_PERIOD_ALL:
+            self.trend_period_mode = "all"
+            self.trend_year_filter = None
+            self.refresh_trends()
+            return
+        if selection == _current_year_period_label():
+            self.trend_period_mode = "current"
+            self.trend_year_filter = None
+            self.refresh_trends()
+            return
+        if selection == TREND_PERIOD_SELECT:
+            self.choose_trend_years()
+
+    def choose_trend_years(self) -> None:
+        runs = self.db.list_runs()
+        years = sorted({year for run in runs for year in _run_years(run)})
+        if not years:
+            self.trend_period_var.set(_trend_period_label(self.trend_period_mode, self.trend_year_filter))
+            messagebox.showinfo("Динамика", "В истории пока нет отчетов", parent=self)
+            return
+        selected_years = self.trend_year_filter if self.trend_period_mode == "custom" else None
+        dialog = HistoryYearFilterDialog(
+            self,
+            years,
+            selected_years,
+            title="Период динамики по годам",
+        )
+        self.wait_window(dialog)
+        if dialog.cancelled:
+            active_years = (
+                {date.today().year}
+                if self.trend_period_mode == "current"
+                else self.trend_year_filter
+            )
+            self.trend_period_var.set(_trend_period_label(self.trend_period_mode, active_years))
+            return
+        self.trend_year_filter = dialog.selected_years
+        self.trend_period_mode = "all" if dialog.selected_years is None else "custom"
+        self.refresh_trends(runs)
 
     def _draw_trend_chart(self) -> None:
         if not hasattr(self, "trend_canvas"):
@@ -1560,10 +1629,15 @@ class OZPriceAnalyzerApp(tk.Tk):
         plot_height = height - top - bottom
         metric = TREND_METRICS.get(self.trend_metric_var.get(), "revenue")
         if not self.trend_points:
+            empty_message = (
+                "За выбранный период нет сохраненных отчетов"
+                if self.trend_has_history
+                else "Импортируйте отчеты, чтобы увидеть динамику"
+            )
             canvas.create_text(
                 width / 2,
                 height / 2,
-                text="Импортируйте отчеты, чтобы увидеть динамику",
+                text=empty_message,
                 fill=self.colors["muted"],
                 font=("Segoe UI", 12),
             )
@@ -2669,9 +2743,11 @@ class HistoryYearFilterDialog(tk.Toplevel):
         parent: OZPriceAnalyzerApp,
         years: list[int],
         selected_years: set[int] | None,
+        *,
+        title: str = "Фильтр истории по годам",
     ):
         super().__init__(parent)
-        self.title("Фильтр истории по годам")
+        self.title(title)
         self.transient(parent)
         self.grab_set()
         self.resizable(False, False)
@@ -3915,6 +3991,16 @@ def _year_filter_label(selected_years: set[int] | None) -> str:
     if len(years) <= 3:
         return ", ".join(str(year) for year in years)
     return f"Выбрано лет: {len(years)}"
+
+
+def _current_year_period_label() -> str:
+    return f"Текущий год ({date.today().year})"
+
+
+def _trend_period_label(mode: str, selected_years: set[int] | None) -> str:
+    if mode == "current":
+        return _current_year_period_label()
+    return _year_filter_label(selected_years)
 
 
 def _text_year(value: str | None) -> int | None:

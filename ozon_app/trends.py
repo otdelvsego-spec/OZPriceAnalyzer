@@ -14,6 +14,7 @@ class TrendPoint:
     units: float
     revenue: float
     net_profit: float
+    profitability: float
     unallocated: float
     commission_share: float
     logistics_share: float
@@ -27,6 +28,8 @@ class TrendPoint:
             return self.revenue
         if metric == "net_profit":
             return self.net_profit
+        if metric == "profitability":
+            return self.profitability
         if metric == "unallocated":
             return self.unallocated
         if metric == "commission_share":
@@ -49,6 +52,7 @@ def build_trend_points(runs: list[RunSummary]) -> list[TrendPoint]:
             units=run.units,
             revenue=run.revenue,
             net_profit=run.net_profit,
+            profitability=run.profitability,
             unallocated=run.unallocated_total,
             commission_share=run.commission_share,
             logistics_share=run.logistics_share,
