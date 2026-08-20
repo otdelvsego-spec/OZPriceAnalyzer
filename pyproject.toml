@@ -11,7 +11,7 @@ requires-python = ">=3.11"
 dependencies = ["openpyxl>=3.1,<4"]
 
 [project.scripts]
-ozpriceanalyzer = "ozon_app.ui:run_app"
+ozpriceanalyzer = "ozon_app.report_totals:run_app"
 
 [tool.setuptools]
 include-package-data = true

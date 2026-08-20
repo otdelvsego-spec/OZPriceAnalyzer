@@ -48,6 +48,10 @@ class BuildMetadataTests(unittest.TestCase):
             metadata["tool"]["setuptools"]["dynamic"]["version"]["attr"],
             "ozon_app.__version__",
         )
+        self.assertEqual(
+            metadata["project"]["scripts"]["ozpriceanalyzer"],
+            "ozon_app.report_totals:run_app",
+        )
 
     def test_windows_build_files_reference_portable_application(self) -> None:
         spec_path = PROJECT_ROOT / "OZPriceAnalyzer.spec"
@@ -60,6 +64,11 @@ class BuildMetadataTests(unittest.TestCase):
         self.assertIn("actions/upload-artifact@v4", workflow)
         self.assertIn("OZPriceAnalyzer-Windows-x64", workflow)
         self.assertIn("smoke_test_windows.ps1", workflow)
+        smoke_test = (PROJECT_ROOT / "scripts/smoke_test_windows.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("SingleInstanceWindowProbe", smoke_test)
+        self.assertIn("Второй экземпляр не завершился", smoke_test)
 
 
 if __name__ == "__main__":

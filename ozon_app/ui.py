@@ -3936,8 +3936,9 @@ def _open_path(path: Path) -> None:
 
 
 def run_app() -> None:
-    app = OZPriceAnalyzerApp()
-    app.mainloop()
+    from .single_instance import launch_single_instance
+
+    launch_single_instance(OZPriceAnalyzerApp)
 
 
 if __name__ == "__main__":

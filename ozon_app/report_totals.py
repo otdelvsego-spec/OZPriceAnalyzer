@@ -131,5 +131,6 @@ class ReportTotalsOZPriceAnalyzerApp(OverviewColumnSettingsOZPriceAnalyzerApp):
 
 
 def run_app() -> None:
-    app = ReportTotalsOZPriceAnalyzerApp()
-    app.mainloop()
+    from .single_instance import launch_single_instance
+
+    launch_single_instance(ReportTotalsOZPriceAnalyzerApp)
