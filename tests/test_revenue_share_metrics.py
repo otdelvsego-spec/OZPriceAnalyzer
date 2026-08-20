@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from ozon_app.models import ProductResult, RunCalculation
+from ozon_app.report_totals import overview_revenue_kpi_values
 from ozon_app.ui import _result_values
 
 
@@ -44,6 +45,19 @@ class RevenueShareMetricTests(unittest.TestCase):
                 "logistics_share": 0.1,
                 "points_share": 0.1,
                 "net_margin": 0.314,
+            },
+        )
+        self.assertEqual(
+            calculation.revenue_amounts(),
+            {"commission": 200, "logistics": 100, "points": 100},
+        )
+        self.assertEqual(
+            overview_revenue_kpi_values(calculation),
+            {
+                "commission": "200.00 ₽ · 20.00%",
+                "logistics": "100.00 ₽ · 10.00%",
+                "points": "100.00 ₽ · 10.00%",
+                "net_margin": "31.40%",
             },
         )
         self.assertEqual(

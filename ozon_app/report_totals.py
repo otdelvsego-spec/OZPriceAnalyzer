@@ -13,6 +13,18 @@ def report_total_value(calculation) -> float:
     return float(totals["net_profit"]) + float(totals["unallocated"])
 
 
+def overview_revenue_kpi_values(calculation) -> dict[str, str]:
+    """Format paired monetary and relative KPIs for the Overview tab."""
+    amounts = calculation.revenue_amounts()
+    shares = calculation.revenue_shares()
+    return {
+        "commission": f"{_money(amounts['commission'])} · {_percent(shares['commission_share'])}",
+        "logistics": f"{_money(amounts['logistics'])} · {_percent(shares['logistics_share'])}",
+        "points": f"{_money(amounts['points'])} · {_percent(shares['points_share'])}",
+        "net_margin": _percent(shares["net_margin"]),
+    }
+
+
 class ReportTotalsOZPriceAnalyzerApp(OverviewColumnSettingsOZPriceAnalyzerApp):
     """Report totals, revenue shares and configurable report-table columns."""
 
@@ -69,9 +81,9 @@ class ReportTotalsOZPriceAnalyzerApp(OverviewColumnSettingsOZPriceAnalyzerApp):
 
         self.revenue_share_kpi_vars = {}
         cards = (
-            ("commission_share", "Средняя комиссия, % от выручки"),
-            ("logistics_share", "Логистика, % от выручки"),
-            ("points_share", "Баллы, % от выручки"),
+            ("commission", "Комиссия Ozon: сумма · % от выручки"),
+            ("logistics", "Логистика: сумма · % от выручки"),
+            ("points", "Баллы: сумма · % от выручки"),
             ("net_margin", "Чистая прибыль, % от выручки"),
         )
         for index, (key, title) in enumerate(cards):
@@ -125,9 +137,9 @@ class ReportTotalsOZPriceAnalyzerApp(OverviewColumnSettingsOZPriceAnalyzerApp):
             for variable in variables.values():
                 variable.set("—")
             return
-        shares = calculation.revenue_shares()
+        values = overview_revenue_kpi_values(calculation)
         for key, variable in variables.items():
-            variable.set(_percent(shares[key]))
+            variable.set(values[key])
 
 
 def run_app() -> None:
