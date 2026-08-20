@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import tkinter as tk
 from tkinter import ttk
 
-from .overview_export import OverviewExportOZPriceAnalyzerApp
-from .ui import _money
+from .overview_column_settings import OverviewColumnSettingsOZPriceAnalyzerApp
+from .ui import _money, _percent
 
 
 def report_total_value(calculation) -> float:
@@ -12,14 +13,16 @@ def report_total_value(calculation) -> float:
     return float(totals["net_profit"]) + float(totals["unallocated"])
 
 
-class ReportTotalsOZPriceAnalyzerApp(OverviewExportOZPriceAnalyzerApp):
-    """v0.5.16: explicit full-report result and clearer financial headings."""
+class ReportTotalsOZPriceAnalyzerApp(OverviewColumnSettingsOZPriceAnalyzerApp):
+    """v0.5.17: report totals, revenue shares and configurable Overview columns."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._install_report_total_kpi()
+        self._install_revenue_share_kpis()
         self._clarify_financial_headings()
         self.after_idle(self._refresh_report_total_kpi)
+        self.after_idle(self._refresh_revenue_share_kpis)
 
     def _install_report_total_kpi(self) -> None:
         self.kpi_frame.columnconfigure(6, weight=1)
@@ -31,7 +34,7 @@ class ReportTotalsOZPriceAnalyzerApp(OverviewExportOZPriceAnalyzerApp):
             except (TypeError, ValueError):
                 continue
 
-        self.kpi_vars["report_total"] = self.kpi_vars.get("report_total") or __import__("tkinter").StringVar(
+        self.kpi_vars["report_total"] = self.kpi_vars.get("report_total") or tk.StringVar(
             master=self,
             value="—",
         )
@@ -48,6 +51,46 @@ class ReportTotalsOZPriceAnalyzerApp(OverviewExportOZPriceAnalyzerApp):
             style="Kpi.TLabel",
         ).grid(row=1, column=0, sticky="w", pady=(5, 0))
 
+    def _install_revenue_share_kpis(self) -> None:
+        for child in self.kpi_frame.winfo_children():
+            try:
+                row = int(child.grid_info().get("row", -1))
+            except (TypeError, ValueError):
+                continue
+            if row == 2:
+                child.grid_configure(row=3)
+            elif row == 3:
+                child.grid_configure(row=4)
+
+        share_frame = ttk.Frame(self.kpi_frame)
+        share_frame.grid(row=2, column=0, columnspan=7, sticky="ew", pady=(10, 4))
+        for column in range(4):
+            share_frame.columnconfigure(column, weight=1)
+
+        self.revenue_share_kpi_vars = {}
+        cards = (
+            ("commission_share", "Средняя комиссия, % от выручки"),
+            ("logistics_share", "Логистика, % от выручки"),
+            ("points_share", "Баллы, % от выручки"),
+            ("net_margin", "Чистая прибыль, % от выручки"),
+        )
+        for index, (key, title) in enumerate(cards):
+            variable = tk.StringVar(master=self, value="—")
+            self.revenue_share_kpi_vars[key] = variable
+            card = ttk.Frame(share_frame, style="Card.TFrame", padding=(16, 12))
+            card.grid(
+                row=0,
+                column=index,
+                sticky="nsew",
+                padx=(0 if index == 0 else 5, 0 if index == len(cards) - 1 else 5),
+            )
+            ttk.Label(card, text=title, style="CardMuted.TLabel").grid(
+                row=0, column=0, sticky="w"
+            )
+            ttk.Label(card, textvariable=variable, style="Kpi.TLabel").grid(
+                row=1, column=0, sticky="w", pady=(4, 0)
+            )
+
     def _clarify_financial_headings(self) -> None:
         self.overview_tree.heading("profit_unit", text="Финрезультат Ozon на ед.")
         self.overview_tree.heading(
@@ -61,6 +104,7 @@ class ReportTotalsOZPriceAnalyzerApp(OverviewExportOZPriceAnalyzerApp):
     def _populate_overview(self) -> None:
         super()._populate_overview()
         self._refresh_report_total_kpi()
+        self._refresh_revenue_share_kpis()
 
     def _refresh_report_total_kpi(self) -> None:
         variable = self.kpi_vars.get("report_total")
@@ -71,6 +115,19 @@ class ReportTotalsOZPriceAnalyzerApp(OverviewExportOZPriceAnalyzerApp):
             variable.set("—")
             return
         variable.set(_money(report_total_value(calculation)))
+
+    def _refresh_revenue_share_kpis(self) -> None:
+        variables = getattr(self, "revenue_share_kpi_vars", None)
+        if not variables:
+            return
+        calculation = self.overview_calculation
+        if calculation is None:
+            for variable in variables.values():
+                variable.set("—")
+            return
+        shares = calculation.revenue_shares()
+        for key, variable in variables.items():
+            variable.set(_percent(shares[key]))
 
 
 def run_app() -> None:

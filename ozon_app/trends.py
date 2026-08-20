@@ -15,6 +15,10 @@ class TrendPoint:
     revenue: float
     net_profit: float
     unallocated: float
+    commission_share: float
+    logistics_share: float
+    points_share: float
+    net_margin: float
 
     def value(self, metric: str) -> float:
         if metric == "units":
@@ -25,6 +29,14 @@ class TrendPoint:
             return self.net_profit
         if metric == "unallocated":
             return self.unallocated
+        if metric == "commission_share":
+            return self.commission_share
+        if metric == "logistics_share":
+            return self.logistics_share
+        if metric == "points_share":
+            return self.points_share
+        if metric == "net_margin":
+            return self.net_margin
         raise KeyError(f"Неизвестный показатель: {metric}")
 
 
@@ -38,6 +50,10 @@ def build_trend_points(runs: list[RunSummary]) -> list[TrendPoint]:
             revenue=run.revenue,
             net_profit=run.net_profit,
             unallocated=run.unallocated_total,
+            commission_share=run.commission_share,
+            logistics_share=run.logistics_share,
+            points_share=run.points_share,
+            net_margin=run.net_margin,
         )
         for run in runs
     ]

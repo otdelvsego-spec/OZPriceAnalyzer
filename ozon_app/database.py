@@ -651,14 +651,34 @@ class Database:
         with self.read() as db:
             rows = db.execute(
                 """
-                SELECT id, created_at, period_start, period_end, source_count,
-                       units, revenue, net_profit, unallocated_total, status
-                       , report_name
-                FROM runs
+                SELECT r.id, r.created_at, r.period_start, r.period_end, r.source_count,
+                       r.units, r.revenue, r.net_profit, r.unallocated_total, r.status,
+                       r.report_name,
+                       CASE WHEN r.revenue = 0 THEN 0
+                            ELSE -COALESCE(p.commission, 0) / r.revenue
+                       END AS commission_share,
+                       CASE WHEN r.revenue = 0 THEN 0
+                            ELSE -COALESCE(p.logistics, 0) / r.revenue
+                       END AS logistics_share,
+                       CASE WHEN r.revenue = 0 THEN 0
+                            ELSE COALESCE(p.points, 0) / r.revenue
+                       END AS points_share,
+                       CASE WHEN r.revenue = 0 THEN 0
+                            ELSE r.net_profit / r.revenue
+                       END AS net_margin
+                FROM runs AS r
+                LEFT JOIN (
+                    SELECT run_id,
+                           SUM(commission) AS commission,
+                           SUM(logistics + reverse_logistics) AS logistics,
+                           SUM(points) AS points
+                    FROM product_results
+                    GROUP BY run_id
+                ) AS p ON p.run_id = r.id
                 ORDER BY
-                    COALESCE(period_start, period_end, substr(created_at, 1, 10)) ASC,
-                    COALESCE(period_end, period_start, substr(created_at, 1, 10)) ASC,
-                    id ASC
+                    COALESCE(r.period_start, r.period_end, substr(r.created_at, 1, 10)) ASC,
+                    COALESCE(r.period_end, r.period_start, substr(r.created_at, 1, 10)) ASC,
+                    r.id ASC
                 """
             ).fetchall()
         return [RunSummary(**dict(row)) for row in rows]

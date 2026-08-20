@@ -6,7 +6,17 @@ from ozon_app.models import RunSummary
 from ozon_app.trends import build_trend_points, chart_bounds
 
 
-def summary(run_id: int, start: str, revenue: float, net: float = 0) -> RunSummary:
+def summary(
+    run_id: int,
+    start: str,
+    revenue: float,
+    net: float = 0,
+    *,
+    commission_share: float = 0,
+    logistics_share: float = 0,
+    points_share: float = 0,
+    net_margin: float = 0,
+) -> RunSummary:
     return RunSummary(
         id=run_id,
         created_at=f"{start} 12:00:00",
@@ -18,6 +28,10 @@ def summary(run_id: int, start: str, revenue: float, net: float = 0) -> RunSumma
         net_profit=net,
         unallocated_total=-run_id,
         status="Готов",
+        commission_share=commission_share,
+        logistics_share=logistics_share,
+        points_share=points_share,
+        net_margin=net_margin,
     )
 
 
@@ -39,6 +53,24 @@ class TrendTests(unittest.TestCase):
         self.assertGreater(maximum, 75)
         self.assertLessEqual(minimum, 0)
         self.assertGreaterEqual(maximum, 0)
+
+    def test_percentage_metrics_are_available_for_chart_and_table(self) -> None:
+        point = build_trend_points([
+            summary(
+                1,
+                "2026-03-01",
+                100,
+                commission_share=0.21,
+                logistics_share=0.12,
+                points_share=0.08,
+                net_margin=0.19,
+            )
+        ])[0]
+
+        self.assertAlmostEqual(point.value("commission_share"), 0.21)
+        self.assertAlmostEqual(point.value("logistics_share"), 0.12)
+        self.assertAlmostEqual(point.value("points_share"), 0.08)
+        self.assertAlmostEqual(point.value("net_margin"), 0.19)
 
 
 if __name__ == "__main__":

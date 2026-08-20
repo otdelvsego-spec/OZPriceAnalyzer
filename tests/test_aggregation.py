@@ -86,6 +86,15 @@ class AggregationTests(unittest.TestCase):
         self.assertEqual(combined.realization_revenue, 150)
         self.assertEqual(combined.realization_units, 3)
         self.assertEqual(combined.totals()["net_profit"], 326)
+        self.assertEqual(
+            combined.revenue_shares(),
+            {
+                "commission_share": 0.0,
+                "logistics_share": 0.0,
+                "points_share": 0.0,
+                "net_margin": 326 / 1400,
+            },
+        )
 
     def test_rejects_empty_selection(self) -> None:
         with self.assertRaisesRegex(ValueError, "не выбраны"):

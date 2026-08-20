@@ -171,17 +171,28 @@ class _DetachedTableWindow:
             rows.append((iid, tuple(item.get("values", ())), tuple(item.get("tags", ()))))
         return tuple(rows)
 
+    def _source_display_columns(self) -> tuple[str, ...]:
+        configured = self.source.cget("displaycolumns")
+        if configured in ("#all", ("#all",)):
+            return tuple(str(column) for column in self.source.cget("columns"))
+        if isinstance(configured, (tuple, list)):
+            return tuple(str(column) for column in configured)
+        return tuple(str(column) for column in self.source.tk.splitlist(configured))
+
     def refresh(self, *, force: bool = False) -> None:
         if self._closed or not self.window.winfo_exists():
             return
-        signature = self._rows_signature()
+        display_columns = self._source_display_columns()
+        rows = self._rows_signature()
+        signature = (display_columns, rows)
         if not force and signature == self._signature:
             return
 
         selected = tuple(self.tree.selection())
         yview = self.tree.yview()
+        self.tree.configure(displaycolumns=display_columns)
         self.tree.delete(*self.tree.get_children(""))
-        for iid, values, tags in signature:
+        for iid, values, tags in rows:
             self.tree.insert("", "end", iid=str(iid), values=values, tags=tags)
         self.owner._configure_value_tags(self.tree)
 

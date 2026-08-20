@@ -7,7 +7,12 @@ from .controls_always_visible import ControlsAlwaysVisibleOZPriceAnalyzerApp
 
 
 def _tree_columns(tree: ttk.Treeview) -> tuple[str, ...]:
-    return tuple(str(column) for column in tree.cget("columns"))
+    configured = tree.cget("displaycolumns")
+    if configured in ("#all", ("#all",)):
+        return tuple(str(column) for column in tree.cget("columns"))
+    if isinstance(configured, (tuple, list)):
+        return tuple(str(column) for column in configured)
+    return tuple(str(column) for column in tree.tk.splitlist(configured))
 
 
 class _HeadingTooltipManager:

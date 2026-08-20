@@ -42,6 +42,16 @@ TREND_METRICS = {
     "Чистая прибыль": "net_profit",
     "Продажи, шт.": "units",
     "Нераспределенные доходы / расходы": "unallocated",
+    "Средняя комиссия, % от выручки": "commission_share",
+    "Логистика, % от выручки": "logistics_share",
+    "Баллы, % от выручки": "points_share",
+    "Чистая прибыль, % от выручки": "net_margin",
+}
+TREND_PERCENT_METRICS = {
+    "commission_share",
+    "logistics_share",
+    "points_share",
+    "net_margin",
 }
 CATEGORY_ALL = "Все категории"
 CATEGORY_EMPTY = "Без категории"
@@ -55,6 +65,48 @@ SORT_METRICS = (
 )
 SORT_ASCENDING = "По возрастанию (А-Я)"
 SORT_DESCENDING = "По убыванию (Я-А)"
+
+
+OVERVIEW_COLUMN_SPECS = (
+    ("article", "Артикул", 120),
+    ("name", "Наименование", 230),
+    ("category", "Категория", 190),
+    ("unit_cost", "Итого с/с", 125),
+    ("material", "Материал", 125),
+    ("labor", "Трудозатраты", 125),
+    ("material_sold", "Материал проданного", 125),
+    ("labor_sold", "Трудозатраты проданного", 125),
+    ("cost_sold", "С/с проданного", 125),
+    ("profitability", "Доходность", 125),
+    ("net_unit", "Чистая прибыль на ед.", 125),
+    ("profit_unit", "Прибыль от продаж на ед.", 125),
+    ("net_total", "Чистая прибыль всего", 125),
+    ("profit_total", "Прибыль от продаж всего", 125),
+    ("avg_price", "Средняя цена", 125),
+    ("tax", "Налог", 125),
+    ("taxable", "Налогооблагаемый доход", 125),
+    ("units", "Продажи", 125),
+    ("revenue", "Выручка с баллами", 125),
+    ("revenue_no_points", "Выручка без баллов", 125),
+    ("partner", "Программы партнеров", 125),
+    ("points", "Баллы", 125),
+    ("commission", "Комиссия Ozon", 125),
+    ("processing", "Обработка отправления", 125),
+    ("delivery", "Доставка до ПВЗ", 125),
+    ("logistics", "Логистика", 125),
+    ("reverse", "Обратная логистика", 125),
+    ("returns", "Возвраты/отмены", 125),
+    ("acquiring", "Эквайринг", 125),
+    ("stars", "Звездные товары", 125),
+    ("packaging", "Упаковка и материалы", 125),
+    ("compensation", "Компенсации Ozon", 125),
+    ("other", "Прочие начисления", 125),
+    ("financial_result", "Финрезультат Ozon", 125),
+    ("commission_share", "Средняя комиссия, % от выручки", 205),
+    ("logistics_share", "Логистика, % от выручки", 190),
+    ("points_share", "Баллы, % от выручки", 175),
+    ("net_margin", "Чистая прибыль, % от выручки", 215),
+)
 
 
 class OZPriceAnalyzerApp(tk.Tk):
@@ -290,24 +342,11 @@ class OZPriceAnalyzerApp(tk.Tk):
             row=0, column=10, sticky="e"
         )
 
-        columns = [
-            "article", "name", "category", "unit_cost", "material", "labor", "material_sold", "labor_sold", "cost_sold",
-            "profitability", "net_unit", "profit_unit", "net_total", "profit_total", "avg_price", "tax",
-            "taxable", "units", "revenue", "revenue_no_points", "partner", "points", "commission", "processing",
-            "delivery", "logistics", "reverse", "returns", "acquiring", "stars", "packaging", "compensation",
-            "other", "financial_result",
-        ]
-        headings = [
-            "Артикул", "Наименование", "Категория", "Итого с/с", "Материал", "Трудозатраты", "Материал проданного",
-            "Трудозатраты проданного", "С/с проданного", "Доходность", "Чистая прибыль на ед.",
-            "Прибыль от продаж на ед.", "Чистая прибыль всего", "Прибыль от продаж всего", "Средняя цена",
-            "Налог", "Налогооблагаемый доход", "Продажи", "Выручка с баллами", "Выручка без баллов",
-            "Программы партнеров", "Баллы", "Комиссия Ozon", "Обработка отправления", "Доставка до ПВЗ",
-            "Логистика", "Обратная логистика", "Возвраты/отмены", "Эквайринг", "Звездные товары",
-            "Упаковка и материалы", "Компенсации Ozon", "Прочие начисления", "Финрезультат Ozon",
-        ]
+        columns = [column for column, _heading, _width in OVERVIEW_COLUMN_SPECS]
+        headings = [heading for _column, heading, _width in OVERVIEW_COLUMN_SPECS]
+        widths = [width for _column, _heading, width in OVERVIEW_COLUMN_SPECS]
         self.overview_tree = self._create_tree(
-            self.overview_tab, columns, headings, row=3, widths=[120, 230, 190] + [125] * 31
+            self.overview_tab, columns, headings, row=3, widths=widths
         )
 
     def _build_sources_tab(self) -> None:
@@ -578,13 +617,19 @@ class OZPriceAnalyzerApp(tk.Tk):
         )
         self.trend_tree = self._create_tree(
             self.trend_tab,
-            ["run", "period", "units", "revenue", "revenue_change", "net", "net_change", "unallocated"],
+            [
+                "run", "period", "units", "revenue", "revenue_change", "net",
+                "net_change", "unallocated", "commission_share", "logistics_share",
+                "points_share", "net_margin",
+            ],
             [
                 "№ отчета", "Период", "Продажи", "Выручка", "Изменение выручки",
                 "Чистая прибыль", "Изменение прибыли", "Нераспределенные",
+                "Средняя комиссия, % от выручки", "Логистика, % от выручки",
+                "Баллы, % от выручки", "Чистая прибыль, % от выручки",
             ],
             row=5,
-            widths=[80, 230, 110, 150, 170, 150, 170, 170],
+            widths=[80, 230, 110, 150, 170, 150, 170, 170, 210, 190, 175, 215],
             height=8,
         )
 
@@ -1467,6 +1512,10 @@ class OZPriceAnalyzerApp(tk.Tk):
                     _money(point.net_profit),
                     _signed_money(profit_change) if profit_change is not None else "—",
                     _money(point.unallocated),
+                    _percent(point.commission_share),
+                    _percent(point.logistics_share),
+                    _percent(point.points_share),
+                    _percent(point.net_margin),
                 ),
                 tags=(tag,),
             )
@@ -3505,6 +3554,10 @@ def _result_values(result: ProductResult, tax_rate: float) -> tuple[object, ...]
         _money(result.compensation),
         _money(result.other),
         _money(result.financial_result),
+        _percent(result.commission_share()),
+        _percent(result.logistics_share()),
+        _percent(result.points_share()),
+        _percent(result.net_margin(tax_rate)),
     )
 
 
@@ -3730,6 +3783,8 @@ def _comparison_kpi(metric: ComparisonMetric, money: bool) -> str:
 def _axis_value(value: float, metric: str) -> str:
     if metric == "units":
         return _number(value)
+    if metric in TREND_PERCENT_METRICS:
+        return _percent(value)
     absolute = abs(value)
     if absolute >= 1_000_000:
         return f"{value / 1_000_000:.1f} млн"
@@ -3739,7 +3794,11 @@ def _axis_value(value: float, metric: str) -> str:
 
 
 def _trend_value(value: float, metric: str) -> str:
-    return _number(value) if metric == "units" else _money(value)
+    if metric == "units":
+        return _number(value)
+    if metric in TREND_PERCENT_METRICS:
+        return _percent(value)
+    return _money(value)
 
 
 def _short_period(value: str) -> str:

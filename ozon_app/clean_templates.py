@@ -99,6 +99,8 @@ def _build_report_template(output: Path) -> None:
         "Обратная логистика", "Возвраты/отмены", "Эквайринг", "Звездные товары",
         "Упаковка и материалы", "Компенсации Ozon", "Прочие начисления",
         "Финрезультат Ozon",
+        "Средняя комиссия, % от выручки", "Логистика, % от выручки",
+        "Баллы, % от выручки", "Чистая прибыль, % от выручки",
     ]
     for column, title in enumerate(actual_headers, start=1):
         ws.cell(6, column, title)
@@ -132,7 +134,7 @@ def _build_report_template(output: Path) -> None:
     for row in range(7, 29):
         for column in list(range(3, 17)) + list(range(18, 34)) + list(range(38, 52)):
             ws.cell(row, column).number_format = "#,##0.00"
-        for column in (9, 39, 41, 44):
+        for column in (9, 34, 35, 36, 37, 39, 41, 44):
             ws.cell(row, column).number_format = "0.00%"
 
     for column in range(1, 52):
